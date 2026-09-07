@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# 获取当前暂存区中被修改的文件列表（只包括 .c/.cpp/.h/.hpp 文件）
+files=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(c|cpp|h|hpp)$')
+
+# 如果没有匹配文件，跳过
+[ -z "$files" ] && exit 0
+
+# 检查 clang-format-diff 是否存在
+if ! command -v clang-format-diff-12 >/dev/null 2>&1; then
+    echo "clang-format-diff not found. Please install it first."
+    exit 1
+fi
+
+echo "Running clang-format-diff on staged C/C++ files..."
+
+# 对每个文件应用 clang-format-diff
+for file in $files; do
+    # 忽略已删除的文件
+    [ ! -f "$file" ] && continue
+
+    # 获取当前暂存区与工作区的 diff
+    git diff --cached "$file" | clang-format-diff-12 -p1 -i
+
+    # 重新添加到暂存区（否则修改后提交的是旧版本）
+    git add "$file"
+done
+
+echo "clang-format-diff applied successfully."
+
+exit 0
+

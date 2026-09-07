@@ -1,0 +1,2089 @@
+#!/usr/bin/env python3
+"""
+仓库管理脚本 - Python 实现
+
+repos.sh 的功能更丰富、更便捷的替代品
+支持克隆、拉取、运行命令、复现提交和应用补丁。
+"""
+
+import argparse
+import os
+import sys
+import subprocess
+import threading
+import signal
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+# import shlex
+import xml.etree.ElementTree as ET
+import re
+import shutil
+import colorama
+from email.header import decode_header
+from email.utils import parseaddr
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple, Set
+from dataclasses import dataclass, field
+from functools import lru_cache
+
+# 初始化 colorama 以支持彩色输出
+colorama.init(autoreset=True)
+
+# ANSI 颜色代码
+class Colors:
+    YELLOW = colorama.Fore.YELLOW + colorama.Style.BRIGHT
+    RED = colorama.Fore.RED
+    BLUE = colorama.Fore.BLUE + colorama.Style.BRIGHT
+    GREEN = colorama.Fore.GREEN + colorama.Style.BRIGHT
+    NC = colorama.Style.RESET_ALL
+
+# 状态表情符号
+OK_STATUS = "✅"
+FAIL_STATUS = "❌"
+DEFAULT_CLONE_MAX_WORKERS = 10
+INTERRUPTED_EXIT_CODE = 130
+
+_active_processes_lock = threading.Lock()
+_active_processes: Set[subprocess.Popen] = set()
+_shutdown_event = threading.Event()
+logger = logging.getLogger("repos")
+
+
+class ReposLogFormatter(logging.Formatter):
+    """为 clone 生命周期日志提供更明显的配色。"""
+    CLONE_START_COLOR = colorama.Fore.CYAN + colorama.Style.BRIGHT
+    CLONE_END_COLOR = colorama.Fore.GREEN + colorama.Style.BRIGHT
+    WARN_COLOR = colorama.Fore.YELLOW + colorama.Style.BRIGHT
+    RESET = colorama.Style.RESET_ALL
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        if getattr(record, "clone_event", False):
+            phase = getattr(record, "clone_phase", "")
+            color = self.CLONE_START_COLOR if phase == "start" else self.CLONE_END_COLOR
+            return f"{color}{message}{self.RESET}"
+        if record.levelno >= logging.WARNING:
+            return f"{self.WARN_COLOR}{message}{self.RESET}"
+        return message
+
+
+def log_clone_event(phase: str, message: str, *args):
+    logger.info(message, *args, extra={"clone_event": True, "clone_phase": phase})
+
+
+def setup_logging():
+    """初始化线程安全日志输出。"""
+    handler = logging.StreamHandler()
+    formatter = ReposLogFormatter(
+        "[%(asctime)s] [%(threadName)s] %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+    logger.handlers = []
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+@dataclass
+class Config:
+    """脚本全局配置"""
+    xml_file: Optional[str] = None
+    gitver_txt: Optional[str] = None
+    download: bool = False
+    run: bool = False
+    run_command: List[str] = field(default_factory=list)
+    normal: bool = False
+    reproduce: bool = False
+    applypatch: bool = False
+    force: bool = False
+    remote_url: Optional[str] = None
+    remote_name: Optional[str] = None
+    default_revision: Optional[str] = None
+    script_dir: str = ""
+
+    # 颜色配置（可以禁用）
+    use_colors: bool = True
+    quiet: bool = False
+
+    def colored(self, text: str, color: str) -> str:
+        """如果启用颜色，返回带颜色的文本"""
+        if self.use_colors:
+            return f"{color}{text}{Colors.NC}"
+        return text
+
+    def info(self, *args, **kwargs):
+        """quiet=False 时才输出"""
+        if not self.quiet:
+            print(*args, **kwargs)
+
+
+# 全局配置实例
+config = Config()
+
+
+def qprint(*args, **kwargs):
+    """quiet 模式下的条件打印"""
+    if not config.quiet:
+        print(*args, **kwargs)
+
+
+class RepoProject:
+    """表示清单中的单个项目
+       name: gerrit/github 中的项目完整路径，如 "vendor/sophgo/project-name"
+       path: 本地路径，斜杠分隔，最后一级为本地文件夹名，如 "vendor/project-name"
+       revision: 分支或标签，默认使用 XML 中定义的 default revision
+       soft_link: 设为 "no" 时不创建软链接
+       sync-s: 设为 "true" 时需要同步子模块
+    """
+    name: str
+    path: str
+    revision: Optional[str]
+    remote_url: Optional[str]
+    soft_link: str
+    sync_submodule: bool
+
+    def __init__(self, element: ET.Element, default_revision: str, remote_url: str):
+        self.name = element.get("name", "")
+        self.path = element.get("path", self.name)
+        self.revision = element.get("revision") or default_revision
+        self.remote_url = remote_url
+        self.soft_link = element.get("soft_link", "")
+        self.sync_submodule = element.get("sync-s", "false").lower() == "true"
+
+    @property
+    def folder_name(self) -> str:
+        """获取本地文件夹名称（path 的最后一部分）"""
+        return self.path.split("/")[-1]
+
+    @property
+    def save_name(self) -> str:
+        """获取版本文件里使用的标准仓库名（name 的最后一部分）"""
+        return self.name.split("/")[-1]
+
+    @property
+    def txt_names(self) -> list:
+        """按优先级返回版本文件里可能出现的仓库名。"""
+        candidates = [self.save_name, self.name, self.folder_name, self.path]
+        seen = set()
+        ordered = []
+        for item in candidates:
+            if item and item not in seen:
+                seen.add(item)
+                ordered.append(item)
+        return ordered
+
+    @property
+    def clone_url(self) -> str:
+        """获取完整的克隆 URL"""
+        return f"{self.remote_url}{self.name}.git"
+
+
+def print_usage():
+    """打印使用信息"""
+    print(f"""
+{Colors.BLUE}仓库管理脚本{Colors.NC}
+管理多个 git 仓库的克隆、状态检查、版本保存与复现。
+
+{Colors.YELLOW}配置文件查找顺序:{Colors.NC}
+  1) 脚本目录/repo_config（优先）
+  2) ../manifest/repo_config（回退）
+  {{
+    "bsp": {{ "xml": "../manifest/bsp.xml", "txt": "../manifest/bsp_version.txt" }},
+    "app": {{ "xml": "../manifest/app.xml", "txt": "../manifest/app_version.txt" }}
+  }}
+  路径相对于配置文件所在目录
+
+{Colors.YELLOW}基本用法:{Colors.NC}
+  {sys.argv[0]} [选项] <命令>
+
+{Colors.YELLOW}核心命令:{Colors.NC}
+  --gitclone              克隆所有仓库（按配置文件）
+  --save [txt]            保存所有仓库当前 commit_id
+  --reproduce             复现仓库到指定 commit（按 txt 文件）
+  -c, --check-env         检查 clone/分支/commit/patch/submodule 是否完全同步
+  --check-commit          检查仓库当前 commit 是否与 txt 文件一致
+  --applypatch            应用补丁（按 patches / patches_private / patches_public 规则）
+  -r, --run <cmd>         在每个仓库执行命令
+  --release [dir]         正向发布 release（读取 manifest/release_config.json）
+  --release-reverse [dir] 逆向同步 release（读取 manifest/release_config.json）
+
+{Colors.YELLOW}筛选选项:{Colors.NC}
+  --app                   仅操作 APP 仓库
+  --bsp                   仅操作 BSP 仓库
+
+{Colors.YELLOW}克隆选项:{Colors.NC}
+  --normal                完整克隆（所有分支，默认 shallow）
+  --username USER         指定远程仓库用户名（优先于 gitconfig）
+  --force                 强制执行；用于 applypatch 跳过确认直接 reset
+
+{Colors.YELLOW}输出选项:{Colors.NC}
+  --no-color              禁用彩色输出
+  -q, --quiet             静默模式（无差异时不输出）
+
+{Colors.YELLOW}快捷命令（用于 --run）:{Colors.NC}
+  st                      查看仓库同步状态（本地/远程差异）
+  lp                      仅检查本地推送状态
+  release                 显示仓库发布信息
+
+{Colors.YELLOW}使用示例:{Colors.NC}
+  {sys.argv[0]} --gitclone --reproduce               # 克隆并复现（默认深圳服务器）
+  {sys.argv[0]} --applypatch                         # 应用补丁
+  {sys.argv[0]} --applypatch --force                 # 应用补丁前不确认，直接 reset 并应用
+  {sys.argv[0]} --run st                             # 查看同步状态
+  {sys.argv[0]} --run git status                     # 所有仓库执行 git status
+  {sys.argv[0]} --save version.txt                   # 保存为 bsp_version.txt, app_version.txt
+  {sys.argv[0]} --check-env / -c                     # 检查仓库完整同步状态
+  {sys.argv[0]} --app --run st                       # 仅查看 APP 仓库状态
+  {sys.argv[0]} --bsp --run lp                       # 仅检查 BSP 本地推送
+  {sys.argv[0]} -h, --help                           # 显示此帮助信息
+""")
+
+
+def run_cmd(cmd: List[str], cwd: Optional[str] = None, check: bool = True,
+            capture_output: bool = True, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    """运行命令并返回结果"""
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            check=check,
+            capture_output=capture_output,
+            text=True,
+            env=env
+        )
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"{Colors.RED}命令失败: {' '.join(cmd)}{Colors.NC}")
+        print(f"{Colors.RED}错误: {e.stderr}{Colors.NC}")
+        raise
+
+
+def run_cmd_stream(cmd: List[str], cwd: Optional[str] = None,
+                   env: Optional[Dict[str, str]] = None) -> int:
+    """运行命令并继承终端输出，支持 Ctrl+C 时集中终止。"""
+    if _shutdown_event.is_set():
+        return INTERRUPTED_EXIT_CODE
+
+    process = subprocess.Popen(cmd, cwd=cwd, env=env)
+    with _active_processes_lock:
+        _active_processes.add(process)
+
+    try:
+        return process.wait()
+    finally:
+        with _active_processes_lock:
+            _active_processes.discard(process)
+
+
+def terminate_active_processes():
+    """终止所有正在运行的子进程，先 terminate 再 kill。"""
+    with _active_processes_lock:
+        processes = [p for p in _active_processes if p.poll() is None]
+
+    for process in processes:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+
+    deadline = time.time() + 2.0
+    for process in processes:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            continue
+
+    for process in processes:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
+
+def handle_sigint(signum, frame):
+    """一次 Ctrl+C 立即停止所有并发子进程。"""
+    del signum, frame
+    if _shutdown_event.is_set():
+        return
+    _shutdown_event.set()
+    logger.warning("检测到 Ctrl+C，正在终止所有进行中的任务...")
+    terminate_active_processes()
+    raise KeyboardInterrupt
+
+
+def get_username(cli_username: Optional[str] = None) -> str:
+    """获取 git 用户名（命令行优先，其次 gitconfig）"""
+    if cli_username:
+        return cli_username
+
+    try:
+        result = run_cmd(["git", "config", "--global", "user.name"], capture_output=True)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return os.getlogin()
+
+
+def parse_remote_from_xml(xml_file: str) -> tuple:
+    """从 XML 文件解析远程 URL 和名称"""
+    with open(xml_file, 'r') as f:
+        content = f.read()
+
+    # 提取远程 fetch URL
+    remote_match = re.search(r'<remote\s+.*?fetch="([^"]*)"', content)
+    remote_fetch = remote_match.group(1) if remote_match else ""
+
+    # 提取远程名称
+    name_match = re.search(r'<remote\s+.*?name="([^"]*)"', content)
+    remote_name = name_match.group(1) if name_match else "origin"
+
+    # 提取默认分支
+    default_match = re.search(r'<default\s+.*?revision="([^"]*)"', content)
+    default_revision = default_match.group(1) if default_match else "master"
+
+    return remote_fetch, remote_name, default_revision
+
+
+def modify_remote_url(url: str, username: str = "") -> str:
+    """修改远程 URL（默认使用深圳服务器）"""
+    # 默认将 10.132.3.76 替换为 10.80.65.11
+    url = re.sub(r'ssh://10.132.3.76:', r'ssh://10.80.65.11:', url)
+
+    if not username:
+        return url
+
+    if re.match(r'ssh://[^/@]+@', url):
+        return re.sub(r'ssh://[^/@]+@', f'ssh://{username}@', url, count=1)
+
+    if url.startswith("ssh://"):
+        return re.sub(r'^ssh://', f'ssh://{username}@', url, count=1)
+
+    return url
+
+
+def parse_projects_from_xml(xml_file: str, remote_url: str, default_revision: str, username: str = "") -> List[RepoProject]:
+    """从 XML 清单解析所有项目"""
+    projects = []
+    try:
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+
+        # 移除命名空间（处理 name 属性）
+        for elem in root.iter():
+            if elem.tag.startswith('{'):
+                elem.tag = elem.tag.split('}', 1)[1]
+
+        for element in root.findall('project'):
+            if element.get('name'):
+                project_remote = modify_remote_url(element.get("remote_url") or remote_url, username)
+                projects.append(RepoProject(element, default_revision, project_remote))
+
+    except ET.ParseError as e:
+        print(config.colored(f"错误: XML 解析失败: {e}", Colors.RED))
+    except FileNotFoundError:
+        print(config.colored(f"错误: 文件不存在: {xml_file}", Colors.RED))
+
+    return projects
+
+
+@lru_cache(maxsize=32)
+def _load_commit_index(txt_file: str) -> dict:
+    """加载版本文件中的 project_name -> commit_id 索引。"""
+    index = {}
+    current_project = None
+
+    try:
+        with open(txt_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                match = re.match(r'^project_name:\s*(.+?)\s*$', line)
+                if match:
+                    current_project = match.group(1)
+                    continue
+
+                match = re.match(r'^commit_id:\s*([0-9a-fA-F]+)', line)
+                if match and current_project:
+                    commit_id = match.group(1)
+                    index[current_project] = commit_id
+                    index.setdefault(current_project.lower(), commit_id)
+                    current_project = None
+    except FileNotFoundError:
+        pass
+
+    return index
+
+
+def get_commit_id_from_txt(project: RepoProject, txt_file: str) -> Optional[str]:
+    """从文本文件中提取项目的提交 ID。"""
+    commit_index = _load_commit_index(txt_file)
+    for project_name in project.txt_names:
+        commit_id = commit_index.get(project_name)
+        if commit_id:
+            return commit_id
+        commit_id = commit_index.get(project_name.lower())
+        if commit_id:
+            return commit_id
+    return None
+
+
+def sort_patch_files(patch_files: List[Path]) -> List[Path]:
+    """按补丁序号和文件名排序。"""
+    def sort_key(p: Path) -> Tuple[int, str]:
+        name = p.stem
+        match = re.match(r'^(\d{4})', name)
+        if match:
+            return (int(match.group(1)), name)
+        return (9999, name)
+
+    return sorted(patch_files, key=sort_key)
+
+
+def resolve_patch_dirs(script_dir: str) -> List[Path]:
+    """按约定选择补丁目录：三个目录都可选，按存在情况取用。"""
+    base_dir = Path(script_dir).parent
+    patches_dir = base_dir / "patches"
+    private_dir = base_dir / "patches_private"
+    public_dir = base_dir / "patches_public"
+
+    dirs = []
+    if patches_dir.exists():
+        dirs.append(patches_dir)
+    if private_dir.exists():
+        dirs.append(private_dir)
+    elif public_dir.exists():
+        dirs.append(public_dir)
+
+    return dirs
+
+
+def collect_patch_files(patch_dirs: List[Path], repo_name: str) -> List[Path]:
+    """收集同一仓库在多个补丁目录下的 patch 文件。"""
+    patch_files: List[Path] = []
+    for patch_dir in patch_dirs:
+        if not patch_dir.exists():
+            continue
+        patch_files.extend(
+            patch_dir.glob(f"[0-9][0-9][0-9][0-9]-{repo_name}--*.patch")
+        )
+    return sort_patch_files(patch_files)
+
+
+def normalize_spaces(value: str) -> str:
+    """合并多余空白并去除首尾空格。"""
+    return re.sub(r'\s+', ' ', value.strip())
+
+
+def decode_rfc2047_header(value: str) -> str:
+    """解码 RFC 2047 头部编码（如 =?UTF-8?...?=）。"""
+    try:
+        decoded_parts = decode_header(value)
+    except Exception:
+        return value
+
+    chunks: List[str] = []
+    for part, enc in decoded_parts:
+        if isinstance(part, bytes):
+            encoding = enc or "utf-8"
+            try:
+                chunks.append(part.decode(encoding, errors="replace"))
+            except LookupError:
+                chunks.append(part.decode("utf-8", errors="replace"))
+        else:
+            chunks.append(part)
+    return "".join(chunks)
+
+
+def normalize_from_field(value: str) -> str:
+    """规范化 From 字段，重点比较姓名和邮箱。"""
+    v = normalize_spaces(decode_rfc2047_header(value))
+    name, email = parseaddr(v)
+    if not email:
+        return v.lower()
+
+    normalized_name = normalize_spaces(name).strip().strip('"').strip("'").lower()
+    return f"{normalized_name} <{email.strip().lower()}>"
+
+
+def normalize_subject_field(value: str) -> str:
+    """规范化 Subject，去掉 [] 片段并忽略开头多余冒号。"""
+    v = normalize_spaces(decode_rfc2047_header(value))
+    v = re.sub(r'\[[^\]]*\]', '', v)
+    v = normalize_spaces(v)
+    # 兼容某些补丁标题写成 ": xxx" 或 "：xxx"
+    v = re.sub(r'^[：:]\s*', '', v)
+    return normalize_spaces(v)
+
+
+def parse_patch_headers_from_file(patch_file: Path) -> Optional[Tuple[str, str, str]]:
+    """从 patch 文件提取并规范化 From/Date/Subject。"""
+    from_value = None
+    date_value = None
+    subject_value = None
+    current_header = None
+
+    try:
+        with patch_file.open('r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if line.startswith("diff --git "):
+                    break
+
+                if line.startswith("From: "):
+                    from_value = line[len("From: "):].strip()
+                    current_header = "from"
+                    continue
+                if line.startswith("Date: "):
+                    date_value = line[len("Date: "):].strip()
+                    current_header = "date"
+                    continue
+                if line.startswith("Subject: "):
+                    subject_value = line[len("Subject: "):].strip()
+                    current_header = "subject"
+                    continue
+
+                # RFC 头部续行：以空格或 TAB 开头
+                if line.startswith(" ") or line.startswith("\t"):
+                    continuation = line.strip()
+                    if not continuation:
+                        continue
+                    if current_header == "from" and from_value is not None:
+                        from_value = f"{from_value} {continuation}"
+                    elif current_header == "date" and date_value is not None:
+                        date_value = f"{date_value} {continuation}"
+                    elif current_header == "subject" and subject_value is not None:
+                        subject_value = f"{subject_value} {continuation}"
+                    continue
+
+                # 遇到空行后，不再处理续行
+                if not line.strip():
+                    current_header = None
+    except OSError:
+        return None
+
+    if not (from_value and date_value and subject_value):
+        return None
+
+    return (
+        normalize_from_field(from_value),
+        normalize_spaces(date_value),
+        normalize_subject_field(subject_value),
+    )
+
+
+def get_commit_headers(repo_path: str, commit_id: str) -> Optional[Tuple[str, str, str]]:
+    """从 commit 提取并规范化 From/Date/Subject。"""
+    result = run_cmd(
+        ["git", "show", "-s", "--format=%an%x00%ae%x00%aD%x00%s", commit_id],
+        cwd=repo_path,
+        check=False
+    )
+    if result.returncode != 0:
+        return None
+
+    raw = (result.stdout or "").rstrip("\n")
+    parts = raw.split("\x00")
+    if len(parts) != 4:
+        return None
+
+    author_name, author_email, author_date, subject = parts
+    from_value = f"\"{author_name}\" <{author_email}>"
+    return (
+        normalize_from_field(from_value),
+        normalize_spaces(author_date),
+        normalize_subject_field(subject),
+    )
+
+
+def cmd_st(cwd: str, project: RepoProject):
+    """获取仓库的 git 日志状态（参考原 repos.sh）"""
+    # 获取当前分支名称
+    result = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd)
+    current_branch = result.stdout.strip()
+
+    # 获取默认远程仓库名称
+    result = run_cmd(["git", "symbolic-ref", "-q", "HEAD"], cwd=cwd, check=False)
+    branch_ref = result.stdout.strip() if result.stdout else ""
+
+    if not branch_ref:
+        qprint(config.colored("当前分支没有追踪远程分支。", Colors.YELLOW))
+        return
+
+    # 获取上游分支
+    result = run_cmd(["git", "for-each-ref", "--format=%(upstream:short)", branch_ref],
+                    cwd=cwd, check=False)
+    remote = result.stdout.strip() if result.stdout else ""
+
+    if not remote:
+        qprint(config.colored("当前分支没有追踪远程分支。", Colors.YELLOW))
+        return
+
+    remote_name = remote.split("/")[0]
+
+    # 检查本地是否有未推送的提交
+    cmd = ["git", "log", f"{remote}..HEAD", "--color", "--pretty=format:%h - %s (%cr) <%an>"]
+    result = run_cmd(cmd, cwd=cwd, check=False)
+    local_commits = result.stdout if result.stdout else ""
+
+    # 检查远程是否有未拉取的提交
+    run_cmd(["git", "fetch", remote_name], cwd=cwd, check=False)
+    cmd = ["git", "log", f"HEAD..{remote}", "--color", "--pretty=format:%h - %s (%cr) <%an>"]
+    result = run_cmd(cmd, cwd=cwd, check=False)
+    remote_commits = result.stdout if result.stdout else ""
+
+    # quiet 模式下：无差异则完全跳过不输出
+    if config.quiet and not local_commits.strip() and not remote_commits.strip():
+        return
+
+    print(f"{Colors.BLUE}Executing: 'st', Current directory: {project.path} ({project.folder_name}) {Colors.NC}")
+
+    # 用 strip 后是否为空来判断
+    if local_commits.strip():
+        print(config.colored(f"存在未同步到远程仓库的提交 ({FAIL_STATUS}):", Colors.YELLOW))
+        if not local_commits.endswith("\n"):
+            print(local_commits)
+        else:
+            print(local_commits, end="")
+    else:
+        qprint(config.colored(f"当前分支已经全部同步到远程仓库 ({OK_STATUS})。", Colors.GREEN))
+
+    if remote_commits.strip():
+        print(config.colored(f"远程仓库存在未拉取的提交 ({FAIL_STATUS}):", Colors.RED))
+        if not remote_commits.endswith("\n"):
+            print(remote_commits)
+        else:
+            print(remote_commits, end="")
+    else:
+        qprint(config.colored(f"远程仓库的提交已经全部拉取到本地 ({OK_STATUS})。", Colors.GREEN))
+
+    print(f"\n{Colors.BLUE}{'='*70}{Colors.NC}")
+
+
+def cmd_lp(cwd: str, project: RepoProject):
+    """仅检查本地推送"""
+    result = run_cmd(["git", "symbolic-ref", "-q", "HEAD"], cwd=cwd, check=False)
+    branch_ref = result.stdout.strip() if result.stdout else ""
+
+    if not branch_ref:
+        qprint(config.colored("当前分支没有追踪远程分支。", Colors.YELLOW))
+        return
+
+    result = run_cmd(["git", "for-each-ref", "--format=%(upstream:short)", branch_ref],
+                    cwd=cwd, check=False)
+    remote = result.stdout.strip() if result.stdout else ""
+
+    if not remote:
+        qprint(config.colored("当前分支没有追踪远程分支。", Colors.YELLOW))
+        return
+
+    result = run_cmd(["git", "log", f"{remote}..HEAD", "--pretty=format:%h - %s (%cr) <%an>"],
+                    cwd=cwd, capture_output=True, check=False)
+    local_commits = result.stdout if result.stdout else ""
+
+    # quiet 模式下：无差异则完全跳过不输出
+    if config.quiet and not local_commits.strip():
+        return
+
+    print(f"{Colors.BLUE}Executing: 'lp', Current directory: {project.path} ({project.folder_name}) {Colors.NC}")
+
+    if local_commits:
+        print(config.colored(f"本地存在未同步到远程仓库的提交 ({FAIL_STATUS}):", Colors.YELLOW))
+        print(local_commits)
+    else:
+        qprint(config.colored(f"当前分支已经全部同步到远程仓库 ({OK_STATUS})。", Colors.GREEN))
+
+    print(f"\n{Colors.BLUE}{'='*70}{Colors.NC}")
+
+
+def check_uncommitted_changes(cwd: str) -> bool:
+    """检查是否有已跟踪文件的未提交更改，返回 (是否有更改, 文件列表)"""
+    result = run_cmd(["git", "status", "--porcelain"], cwd=cwd, check=False)
+    lines = [line for line in result.stdout.strip().split('\n') if line and not line.startswith('??')]
+    return bool(lines), lines
+
+
+def print_uncommitted_files(lines: List[str]):
+    """打印未提交的文件列表"""
+    for line in lines:
+        parts = line.split(' ', 1)
+        status = parts[0]
+        filename = parts[1] if len(parts) > 1 else ''
+        status_text = {"M": "修改", "A": "新增", "D": "删除", "R": "重命名"}.get(status.strip(), status.strip())
+        print(f"  [{status_text}] {filename}")
+
+
+def cmd_release(cwd: str, project: RepoProject):
+    """显示仓库的发布信息"""
+    print(f"{Colors.BLUE}Executing: 'release', Current directory: {project.name} ({project.folder_name}) {Colors.NC}")
+
+    # 从远程获取仓库名称
+    result = run_cmd(["git", "remote", "-v"], cwd=cwd)
+    repo_name = result.stdout.split("/")[-1].split(".git")[0] if result.stdout else "unknown"
+
+    # 获取分支
+    result = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd)
+    branch = result.stdout.strip()
+
+    # 获取提交
+    result = run_cmd(["git", "log", "--pretty=oneline", "-n", "5"], cwd=cwd)
+
+    print(f"project_name: {repo_name}")
+    print(f"branch_name: {branch}")
+    print("commit_id:")
+    print(result.stdout)
+    print(f"{Colors.BLUE}{'='*70}{Colors.NC}")
+
+
+def run_command_in_repos(projects: List[RepoProject], command: List[str]):
+    """在所有仓库中执行命令"""
+    for project in projects:
+        path = Path.cwd() / project.path
+
+        if not path.exists():
+            qprint(f"  跳过: {project.path} (目录不存在)")
+            continue
+
+        if not (path / ".git").exists():
+            qprint(f"  跳过: {project.path} (非 git 仓库)")
+            continue
+
+        # 支持快捷命令
+        if command[0] == "st":
+            cmd_st(str(path), project)
+        elif command[0] == "lp":
+            cmd_lp(str(path), project)
+        elif command[0] == "release":
+            cmd_release(str(path), project)
+        else:
+            print(f"{Colors.BLUE}Executing: 'release', Current directory: {project.path} ({project.folder_name}) {Colors.NC}")
+            run_cmd(command, cwd=str(path), check=False, capture_output=False)
+
+
+def update_submodules_if_needed(path: Path, project: RepoProject) -> bool:
+    """按 manifest 配置同步子模块（递归）。"""
+    if not project.sync_submodule:
+        return True
+
+    print(config.colored(f"  同步子模块: {project.path} (GIT_LFS_SKIP_SMUDGE=1)", Colors.YELLOW))
+    submodule_env = os.environ.copy()
+    submodule_env["GIT_LFS_SKIP_SMUDGE"] = "1"
+    result = run_cmd(
+        ["git", "submodule", "update", "--init", "--recursive"],
+        cwd=str(path),
+        check=False,
+        capture_output=False,
+        env=submodule_env
+    )
+    if result.returncode != 0:
+        print(config.colored(f"  错误: 子模块同步失败: {project.path}", Colors.RED))
+        return False
+    return True
+
+
+def git_clone(project: RepoProject, hook_policy: str = "none"):
+    """克隆单个仓库"""
+    path = Path.cwd() / project.path
+    log_clone_event("start", "START clone: %s -> %s", project.name, project.path)
+
+    if path.exists():
+        print(config.colored(f"警告: 项目已存在: {path}", Colors.YELLOW))
+        log_clone_event("end", "END clone(skip): %s", project.name)
+        return update_submodules_if_needed(path, project)
+
+    # 构建克隆命令
+    cmd = ["git", "clone", project.clone_url, str(path)]
+
+    if not config.normal:
+        cmd.extend(["--single-branch", "--depth", "2000"])
+        cmd.extend(["-b", project.revision])
+    else:
+        cmd.extend(["-b", project.revision])
+
+    print(f"正在克隆 {project.name}...")
+    # print(f"  clone cmd: {shlex.join(cmd)}")
+    return_code = run_cmd_stream(cmd)
+    if return_code != 0:
+        if return_code == INTERRUPTED_EXIT_CODE or _shutdown_event.is_set():
+            print(config.colored(f"克隆 {project.name} 已中断", Colors.YELLOW))
+        else:
+            print(config.colored(f"克隆 {project.name} 失败", Colors.RED))
+        log_clone_event("end", "END clone(fail): %s", project.name)
+        return False
+
+    if _shutdown_event.is_set():
+        print(config.colored(f"克隆 {project.name} 已中断", Colors.YELLOW))
+        log_clone_event("end", "END clone(interrupted): %s", project.name)
+        return False
+
+    # 按目标策略复制 hooks:
+    # - all: 复制全部 hooks
+    # - skip-pre-commit: 跳过 pre-commit，复制其它 hooks
+    # - none: 不复制 hooks
+    hooks_src = Path(config.script_dir) / "hooks"
+    if hook_policy != "none" and hooks_src.exists():
+        hooks_dst = path / ".git" / "hooks"
+        for hook_file in hooks_src.glob("*"):
+            if hook_file.is_file():
+                if hook_policy == "skip-pre-commit" and hook_file.name == "pre-commit":
+                    continue
+                shutil.copy2(hook_file, hooks_dst / hook_file.name)
+                print(f"  已复制 hook: {hook_file.name}")
+
+    # 修改远程 URL
+    git_config = path / ".git" / "config"
+    if git_config.exists():
+        content = git_config.read_text()
+        content = content.replace("10.80.65.11", "gerrit-ai.sophgo.vip")
+        git_config.write_text(content)
+
+    # 创建软链接
+    if project.soft_link.lower() != "no" and str(path) != str(Path.cwd() / project.folder_name):
+        symlink_path = Path.cwd() / project.folder_name
+        if symlink_path.exists() or symlink_path.is_symlink():
+            symlink_path.unlink()
+        symlink_path.symlink_to(project.path)
+        print(f"  已创建软链接: {project.folder_name} -> {project.path}")
+
+    ok = update_submodules_if_needed(path, project)
+    status = "ok" if ok else "submodule-fail"
+    log_clone_event("end", "END clone(%s): %s", status, project.name)
+    return ok
+
+
+def build_clone_batches(projects: List[RepoProject]) -> List[List[RepoProject]]:
+    """按路径层级构建克隆批次：父路径仓库先于子路径仓库。"""
+    if not projects:
+        return []
+
+    indexed_projects = list(enumerate(projects))
+    indegree = {idx: 0 for idx, _ in indexed_projects}
+    children: Dict[int, List[int]] = {idx: [] for idx, _ in indexed_projects}
+
+    for parent_idx, parent in indexed_projects:
+        parent_path = parent.path.strip("/")
+        if not parent_path:
+            continue
+        for child_idx, child in indexed_projects:
+            if parent_idx == child_idx:
+                continue
+            child_path = child.path.strip("/")
+            if not child_path:
+                continue
+            if child_path.startswith(parent_path + "/"):
+                children[parent_idx].append(child_idx)
+                indegree[child_idx] += 1
+
+    batches: List[List[RepoProject]] = []
+    ready = sorted([idx for idx, d in indegree.items() if d == 0], key=lambda i: projects[i].path)
+    processed = 0
+
+    while ready:
+        batch_indexes = ready
+        ready = []
+        batches.append([projects[i] for i in batch_indexes])
+        processed += len(batch_indexes)
+
+        for idx in batch_indexes:
+            for child_idx in children[idx]:
+                indegree[child_idx] -= 1
+                if indegree[child_idx] == 0:
+                    ready.append(child_idx)
+        ready.sort(key=lambda i: projects[i].path)
+
+    # 理论上不会有环；若异常则退回单批次，避免阻塞功能
+    if processed != len(projects):
+        return [projects]
+
+    return batches
+
+def reproduce_repo(project: RepoProject, txt_file: str):
+    """复现仓库到指定提交"""
+    # 使用统一的项目别名查找，避免 name/path/folder_name 混用
+    commit_id = get_commit_id_from_txt(project, txt_file)
+
+    if not commit_id:
+        print(f"警告: 未找到 {project.name} 的提交 ID")
+        return
+
+    path = Path.cwd() / project.path
+
+    if not path.exists():
+        print(config.colored(f"错误: 未找到项目: {path}", Colors.RED))
+        return
+
+    print(f"\n正在复现 {project.name} 到 {commit_id}")
+
+    # 检查是否有已跟踪文件的未提交更改
+    has_changes, lines = check_uncommitted_changes(str(path))
+    if has_changes:
+        print(config.colored(f"警告: {project.name} 存在未提交的更改:", Colors.YELLOW))
+        print_uncommitted_files(lines)
+        confirm = input(config.colored("\n执行 reproduce 将丢弃这些更改，是否继续? (y/n): ", Colors.YELLOW))
+        if confirm.lower() not in ['y', 'yes']:
+            print(f"跳过 {project.name}...")
+            return
+
+    result = run_cmd(["git", "reset", "--hard", commit_id], cwd=str(path), check=False)
+    if result.returncode != 0:
+        print(config.colored(f"重置 {project.name} 失败", Colors.RED))
+        return
+
+    # 对 sync-s=true 的仓库，reproduce 后同步子模块到目标提交
+    if not update_submodules_if_needed(path, project):
+        print(config.colored(
+            f"警告: {project.name} 子模块同步失败，请手动执行 `git submodule update --init --recursive`",
+            Colors.YELLOW
+        ))
+
+
+def save_commit_ids(projects: List[RepoProject], txt_file: str):
+    """保存所有仓库的 commit_id 到 txt 文件"""
+    txt_path = Path(txt_file).resolve()
+
+    print(f"\n{Colors.BLUE}正在保存 commit_id 到: {txt_path}{Colors.NC}")
+
+    lines = []
+    for project in projects:
+        path = Path.cwd() / project.path
+        if not path.exists():
+            print(f"  跳过: {project.path} (目录不存在)")
+            continue
+
+        if not (path / ".git").exists():
+            print(f"  跳过: {project.path} (非 git 仓库)")
+            continue
+
+        # 优先保存 HEAD 与上游分支的共同基线点（merge-base）；无上游时回退到本地 HEAD
+        commit_ref = "HEAD"
+        result = run_cmd(["git", "symbolic-ref", "-q", "HEAD"], cwd=str(path), check=False)
+        branch_ref = result.stdout.strip() if result.returncode == 0 and result.stdout else ""
+        if branch_ref:
+            result = run_cmd(
+                ["git", "for-each-ref", "--format=%(upstream:short)", branch_ref],
+                cwd=str(path),
+                check=False
+            )
+            upstream = result.stdout.strip() if result.returncode == 0 and result.stdout else ""
+            if upstream:
+                result = run_cmd(["git", "merge-base", "HEAD", upstream], cwd=str(path), check=False)
+                if result.returncode == 0 and result.stdout.strip():
+                    commit_ref = result.stdout.strip()
+
+        result = run_cmd(["git", "rev-parse", commit_ref], cwd=str(path), check=False)
+        if result.returncode != 0 or not result.stdout.strip():
+            print(f"  跳过: {project.path} (无法获取 commit)")
+            continue
+
+        commit_id = result.stdout.strip()
+
+        # 获取 commit message（第一行）
+        result = run_cmd(
+            ["git", "log", "-1", "--pretty=format:%s", commit_ref],
+            cwd=str(path),
+            check=False
+        )
+        commit_msg = result.stdout.strip() if result.returncode == 0 else ""
+
+        save_name = project.save_name
+        lines.append(f"project_name: {save_name}")
+        lines.append(f"commit_id: {commit_id} {commit_msg}")
+        lines.append("")
+
+        print(f"  ✓ {save_name}: {commit_id[:8]} ({commit_ref[:12] if commit_ref != 'HEAD' else 'HEAD'})")
+
+    # 写入文件
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+
+    print(f"\n{Colors.GREEN}已保存 {len(lines)//3} 个仓库到 {txt_path}{Colors.NC}")
+
+
+def check_commit_id(project: RepoProject, txt_file: str):
+    """检查仓库当前 commit 是否与 txt 文件中的一致，不一致时检查 commit 是否存在于历史中"""
+    path = Path.cwd() / project.path
+
+    if not path.exists():
+        print(config.colored(f"警告: 未找到仓库: {path}", Colors.YELLOW))
+        return
+
+    if not (path / ".git").exists():
+        print(config.colored(f"警告: 非 git 仓库: {path}", Colors.YELLOW))
+        return
+
+    # 获取 txt 中记录的 commit_id
+    expected_commit = get_commit_id_from_txt(project, txt_file)
+
+    if not expected_commit:
+        print(config.colored(f"错误: 未找到 {project.name} 的 commit_id", Colors.RED))
+        return
+
+    # 获取当前 commit_id
+    result = run_cmd(["git", "rev-parse", "HEAD"], cwd=str(path), check=False)
+    if result.returncode != 0:
+        print(config.colored(f"错误: 无法获取 {project.name} 的当前 commit", Colors.RED))
+        return
+
+    current_commit = result.stdout.strip()
+
+    # 提取完整的 commit_id（txt 中可能只保存了部分）
+    result = run_cmd(["git", "rev-parse", "--verify", expected_commit],
+                     cwd=str(path), check=False, capture_output=True)
+    if result.returncode == 0:
+        full_expected_commit = result.stdout.strip()
+    else:
+        full_expected_commit = expected_commit
+
+    # 一致时不输出任何内容
+    if current_commit == full_expected_commit:
+        return
+
+    # 不一致时输出
+    print(f"{Colors.BLUE}Executing: 'check-commit', Current directory: {project.path} ({project.folder_name}) {Colors.NC}")
+
+    result = run_cmd(["git", "merge-base", "--is-ancestor", full_expected_commit, "HEAD"],
+                     cwd=str(path), check=False, capture_output=True)
+    is_ancestor = result.returncode == 0
+
+    result = run_cmd(["git", "merge-base", "--is-ancestor", "HEAD", full_expected_commit],
+                     cwd=str(path), check=False, capture_output=True)
+    is_descendant = result.returncode == 0
+
+    if is_ancestor:
+        print(config.colored(f"存在未同步到远程仓库的提交 ({FAIL_STATUS}):", Colors.YELLOW))
+        cmd = ["git", "log", f"{full_expected_commit}..HEAD", "--color",
+               "--pretty=format:%h - %s (%cr) <%an>"]
+        result = run_cmd(cmd, cwd=str(path), check=False)
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    elif is_descendant:
+        print(config.colored(f"远程仓库存在未拉取的提交 ({FAIL_STATUS}):", Colors.RED))
+        cmd = ["git", "log", f"HEAD..{full_expected_commit}", "--color",
+               "--pretty=format:%h - %s (%cr) <%an>"]
+        result = run_cmd(cmd, cwd=str(path), check=False)
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    else:
+        # commit 不在当前分支的历史中，可能在不同分支
+        result = run_cmd(["git", "branch", "-a", "--contains", full_expected_commit],
+                         cwd=str(path), check=False, capture_output=True)
+        branches = result.stdout.strip() if result.stdout.strip() else None
+
+        if branches:
+            print(config.colored(f"commit 不在不同分支 ({FAIL_STATUS}):", Colors.YELLOW))
+            for branch in branches.split("\n"):
+                print(f"  {branch.strip()}")
+        else:
+            print(config.colored(f"commit 不存在 ({FAIL_STATUS}):", Colors.RED))
+
+    print(f"\n{Colors.BLUE}{'='*70}{Colors.NC}")
+
+
+def expected_branches_from_revision(revision: Optional[str]) -> List[str]:
+    """将 revision 转为可接受的分支名列表；tag/commit 返回空列表。"""
+    def uniq(items: List[str]) -> List[str]:
+        seen = set()
+        out = []
+        for item in items:
+            if item and item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    if not revision:
+        return []
+
+    rev = revision.strip()
+    if not rev:
+        return []
+
+    if rev.startswith("refs/heads/"):
+        branch = rev[len("refs/heads/"):]
+        # 兼容历史克隆方式产生的本地分支名：heads/<branch>
+        return uniq([branch, f"heads/{branch}"])
+
+    if rev.startswith("refs/remotes/"):
+        # refs/remotes/origin/main -> main
+        parts = rev.split("/", 3)
+        if len(parts) >= 4:
+            branch = parts[3]
+            return [branch, f"remotes/{branch}", f"{parts[2]}/{branch}"]
+        return []
+
+    if rev.startswith("origin/"):
+        branch = rev.split("/", 1)[1]
+        return uniq([branch, f"heads/{branch}", rev])
+
+    # tag 或 commit_id 不做分支名匹配
+    if rev.startswith("refs/tags/") or rev.startswith("tags/"):
+        return []
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", rev):
+        return []
+
+    return uniq([rev, f"heads/{rev}"])
+
+
+def check_clone_and_branch(projects: List[RepoProject], target_name: str) -> List[str]:
+    """检查仓库是否已 clone，且当前分支是否符合 XML revision。"""
+    issues = []
+
+    for project in projects:
+        path = Path.cwd() / project.path
+        label = f"[{target_name}] {project.path} ({project.folder_name})"
+
+        if not path.exists():
+            issues.append(f"{label}: 仓库不存在，未完成 clone")
+            continue
+
+        if not (path / ".git").exists():
+            issues.append(f"{label}: 目录存在但不是 git 仓库")
+            continue
+
+        expected_branches = expected_branches_from_revision(project.revision)
+        if not expected_branches:
+            # 对非分支 revision（tag/commit）不做分支校验
+            continue
+
+        result = run_cmd(["git", "symbolic-ref", "--short", "-q", "HEAD"],
+                         cwd=str(path), check=False)
+        current_branch = result.stdout.strip() if result.stdout else ""
+
+        if not current_branch:
+            issues.append(
+                f"{label}: 当前为 detached HEAD，期望分支 {expected_branches[0]}"
+            )
+            continue
+
+        if current_branch not in expected_branches:
+            expected_branch = expected_branches[0]
+            branch_exists = False
+
+            # 本地分支存在
+            result = run_cmd(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{expected_branch}"],
+                cwd=str(path),
+                check=False
+            )
+            if result.returncode == 0:
+                branch_exists = True
+
+            # 远程跟踪分支存在（兼容 origin 与 heads/<branch> 的历史命名）
+            if not branch_exists:
+                candidates = [expected_branch]
+                if expected_branch.startswith("heads/"):
+                    candidates.append(expected_branch.split("/", 1)[1])
+                else:
+                    candidates.append(f"heads/{expected_branch}")
+
+                for branch_name in candidates:
+                    result = run_cmd(
+                        ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch_name}"],
+                        cwd=str(path),
+                        check=False
+                    )
+                    if result.returncode == 0:
+                        branch_exists = True
+                        break
+
+            if not branch_exists:
+                issues.append(f"{label}: 期望分支不存在: {expected_branch}")
+                continue
+
+            issues.append(
+                f"{label}: 当前分支 {current_branch}，期望分支 {expected_branch}"
+            )
+
+    return issues
+
+
+def check_expected_commits(projects: List[RepoProject], txt_file: str, target_name: str) -> List[str]:
+    """检查仓库是否包含 txt 中对应 commit，且当前 HEAD 历史包含该 commit。"""
+    issues = []
+
+    for project in projects:
+        path = Path.cwd() / project.path
+        label = f"[{target_name}] {project.path} ({project.folder_name})"
+
+        # 仓库不存在/非 git 的问题由 clone 检查阶段统一输出，这里跳过避免重复
+        if not path.exists() or not (path / ".git").exists():
+            continue
+
+        expected_commit = get_commit_id_from_txt(project, txt_file)
+
+        if not expected_commit:
+            issues.append(f"{label}: txt 未找到对应 commit_id 记录")
+            continue
+
+        result = run_cmd(
+            ["git", "rev-parse", "--verify", f"{expected_commit}^{{commit}}"],
+            cwd=str(path),
+            check=False
+        )
+        if result.returncode != 0:
+            issues.append(f"{label}: 仓库不存在 txt 指定 commit_id: {expected_commit}")
+            continue
+
+        full_expected_commit = result.stdout.strip()
+        result = run_cmd(
+            ["git", "merge-base", "--is-ancestor", full_expected_commit, "HEAD"],
+            cwd=str(path),
+            check=False
+        )
+        if result.returncode != 0:
+            issues.append(
+                f"{label}: 当前分支不包含 txt 指定 commit_id: {expected_commit}"
+            )
+
+    return issues
+
+
+def check_patch_sync(projects: List[RepoProject], txt_file: str, patch_dirs: List[Path], target_name: str) -> List[str]:
+    """先比数量，再按 From/Date/Subject（Subject 去 []）精确比对补丁。"""
+    issues = []
+
+    if not patch_dirs:
+        # 无补丁目录属正常情况（如仅含 repos+manifest 的轻量项目），跳过补丁检查
+        return issues
+
+    for project in projects:
+        path = Path.cwd() / project.path
+        label = f"[{target_name}] {project.path} ({project.folder_name})"
+
+        # 仓库不存在/非 git 的问题由 clone 检查阶段统一输出
+        if not path.exists() or not (path / ".git").exists():
+            continue
+
+        expected_commit = get_commit_id_from_txt(project, txt_file)
+        if not expected_commit:
+            # commit 映射问题由 check_expected_commits 输出
+            continue
+
+        result = run_cmd(
+            ["git", "rev-parse", "--verify", f"{expected_commit}^{{commit}}"],
+            cwd=str(path),
+            check=False
+        )
+        if result.returncode != 0:
+            # commit 不存在问题由 check_expected_commits 输出
+            continue
+
+        base_commit = result.stdout.strip()
+        result = run_cmd(
+            ["git", "merge-base", "--is-ancestor", base_commit, "HEAD"],
+            cwd=str(path),
+            check=False
+        )
+        if result.returncode != 0:
+            # 基线不在当前分支历史的问题由 check_expected_commits 输出
+            continue
+
+        repo_name = project.folder_name
+        patch_files = collect_patch_files(patch_dirs, repo_name)
+        expected_count = len(patch_files)
+
+        result = run_cmd(
+            ["git", "rev-list", "--reverse", f"{base_commit}..HEAD"],
+            cwd=str(path),
+            check=False
+        )
+        if result.returncode != 0:
+            issues.append(f"{label}: 无法获取基线之后提交列表")
+            continue
+
+        commit_ids = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        actual_count = len(commit_ids)
+
+        # 第一阶段：数量不一致直接报错
+        if actual_count != expected_count:
+            missing_count = max(expected_count - actual_count, 0)
+            extra_count = max(actual_count - expected_count, 0)
+            issues.append(
+                f"{label}: 补丁数量不同步，缺少 {missing_count} 笔，额外 {extra_count} 笔 "
+                f"(期望 {expected_count}，当前 {actual_count})"
+            )
+            continue
+
+        # 第二阶段：数量一致时，再精确对比 From/Date/Subject
+        expected_headers = []
+        parse_failed = False
+        for patch_file in patch_files:
+            headers = parse_patch_headers_from_file(patch_file)
+            if not headers:
+                issues.append(f"{label}: 无法解析补丁头信息(From/Date/Subject): {patch_file.name}")
+                parse_failed = True
+                break
+            expected_headers.append((patch_file.name, headers))
+
+        if parse_failed:
+            continue
+
+        actual_headers = []
+        for commit_id in commit_ids:
+            headers = get_commit_headers(str(path), commit_id)
+            if not headers:
+                issues.append(f"{label}: 无法解析提交头信息(From/Date/Subject): {commit_id[:12]}")
+                parse_failed = True
+                break
+            actual_headers.append((commit_id, headers))
+
+        if parse_failed:
+            continue
+
+        mismatch_index = None
+        for i in range(expected_count):
+            if expected_headers[i][1] != actual_headers[i][1]:
+                mismatch_index = i
+                break
+
+        if mismatch_index is None:
+            continue
+
+        expected_file, (exp_from, exp_date, exp_subject) = expected_headers[mismatch_index]
+        actual_commit, (act_from, act_date, act_subject) = actual_headers[mismatch_index]
+        issues.append(
+            f"{label}: 补丁信息不一致（第 {mismatch_index + 1} 笔）。\n"
+            f"期望: [{expected_file}]\n"
+            f"  From: {exp_from}\n"
+            f"  Date: {exp_date}\n"
+            f"  Subject: {exp_subject}\n"
+            f"实际: [{actual_commit[:12]}]\n"
+            f"  From: {act_from}\n"
+            f"  Date: {act_date}\n"
+            f"  Subject: {act_subject}"
+        )
+
+    return issues
+
+
+def check_submodule_sync(projects: List[RepoProject], target_name: str) -> List[str]:
+    """检查 manifest 中 sync-s=true 的仓库子模块是否已正确同步。"""
+    issues = []
+
+    for project in projects:
+        if not project.sync_submodule:
+            continue
+
+        path = Path.cwd() / project.path
+        label = f"[{target_name}] {project.path} ({project.folder_name})"
+
+        # 仓库不存在/非 git 的问题由 clone 检查阶段统一输出
+        if not path.exists() or not (path / ".git").exists():
+            continue
+
+        result = run_cmd(
+            ["git", "submodule", "status", "--recursive"],
+            cwd=str(path),
+            check=False
+        )
+        if result.returncode != 0:
+            err = (result.stderr or "").strip()
+            if err:
+                issues.append(f"{label}: 子模块状态检查失败: {err}")
+            else:
+                issues.append(f"{label}: 子模块状态检查失败")
+            continue
+
+        lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+        if not lines:
+            # sync-s=true 但当前仓库无子模块记录，按通过处理（兼容历史配置差异）
+            continue
+
+        sub_issues = []
+        for line in lines:
+            status = line[0]
+            payload = line[1:].strip()
+            parts = payload.split()
+            sub_path = parts[1] if len(parts) >= 2 else payload
+
+            if status == "-":
+                sub_issues.append(f"{sub_path}: 未初始化/未拉取")
+            elif status == "+":
+                sub_issues.append(f"{sub_path}: 提交与父仓库记录不一致")
+            elif status == "U":
+                sub_issues.append(f"{sub_path}: 存在冲突")
+
+            if "dirty" in payload:
+                sub_issues.append(f"{sub_path}: 存在未提交修改(dirty)")
+
+        if sub_issues:
+            detail = "\n".join(sub_issues)
+            issues.append(f"{label}: 子模块不同步\n{detail}")
+
+    return issues
+
+
+def check_sync_sh(script_dir: str) -> List[str]:
+    """若脚本目录存在 sync.sh，则执行 sync.sh -c 并检查返回码。"""
+    issues = []
+    sync_script = Path(script_dir) / "sync.sh"
+
+    if not sync_script.exists():
+        return issues
+
+    print(config.colored(f"\n检测到 {sync_script}，执行 `sync.sh -c` ...", Colors.BLUE))
+    result = run_cmd(
+        ["bash", str(sync_script), "-c"],
+        cwd=str(Path.cwd()),
+        check=False,
+        capture_output=False
+    )
+    if result.returncode != 0:
+        issues.append(f"[GLOBAL] sync.sh -c 执行失败 (exit={result.returncode})")
+
+    return issues
+
+
+def apply_patches(projects: List[RepoProject], patch_dirs: List[Path], txt_file: str,
+                  applied_repos: Optional[set] = None, force: bool = False):
+    """向仓库应用补丁（按 projects 遍历）"""
+    txt_file = Path(txt_file).resolve()
+
+    if applied_repos is None:
+        applied_repos = set()
+
+    if not patch_dirs:
+        print(config.colored("提示: 未找到补丁目录，跳过补丁应用", Colors.YELLOW))
+        return
+
+    if not txt_file.exists():
+        print(config.colored(f"错误: 未找到 git 版本文件: {txt_file}", Colors.RED))
+        return
+
+    for project in projects:
+        # 使用 folder_name 作为 repo_name（与 patch 文件名对应）
+        repo_name = project.folder_name
+
+        # 跳过已处理过的仓库
+        if repo_name in applied_repos:
+            continue
+        applied_repos.add(repo_name)
+
+        path = Path.cwd() / project.path
+
+        if not path.exists():
+            print(config.colored(f"警告: 未找到仓库: {path}", Colors.YELLOW))
+            continue
+
+        # 获取期望的提交
+        # 优先使用 name 查找，因为 txt 中可能记录完整的仓库名
+        expected_commit = get_commit_id_from_txt(project, str(txt_file))
+        if not expected_commit:
+            continue
+
+        # 应用补丁 - 格式: 序号-repo--*.patch (如 0001-sophcam--fix-bug.patch)
+        patch_files = collect_patch_files(patch_dirs, repo_name)
+        if not patch_files:
+            continue
+
+        # 获取当前提交
+        result = run_cmd(["git", "rev-parse", "HEAD"], cwd=str(path))
+        current_commit = result.stdout.strip()
+
+        # 检查是否有已跟踪文件的未提交更改
+        has_changes, lines = check_uncommitted_changes(str(path))
+
+        needs_reset = False
+
+        print(f"{Colors.BLUE}\n================ 正在为 {repo_name} 应用补丁{Colors.NC}")
+
+        if has_changes:
+            print(config.colored("警告: 仓库有未提交的更改:", Colors.YELLOW))
+            print_uncommitted_files(lines)
+            needs_reset = True
+
+        if current_commit != expected_commit:
+            print(config.colored("警告: 提交不匹配", Colors.YELLOW))
+            print(f"  当前: {current_commit}")
+            print(f"  期望: {expected_commit}")
+            needs_reset = True
+
+        if needs_reset:
+            if force:
+                print(config.colored("已启用 --force，跳过确认，直接 reset 并应用补丁", Colors.YELLOW))
+            else:
+                confirm = input(config.colored("应用补丁？这将丢弃本地更改 (y/n): ", Colors.YELLOW))
+                if confirm.lower() not in ['y', 'yes']:
+                    print("跳过...")
+                    continue
+
+            # 重置到期望的提交
+            run_cmd(["git", "reset", "--hard", expected_commit], cwd=str(path), check=False)
+
+        for patch_file in patch_files:
+            print(f"  正在应用: {patch_file.name}")
+            result = run_cmd(["git", "am", "--ignore-whitespace", str(patch_file)],
+                            cwd=str(path), check=False)
+            if result.returncode != 0:
+                print(config.colored(f"应用 {patch_file.name} 失败，尝试使用 --reject", Colors.YELLOW))
+                run_cmd(["git", "am", "--abort"], cwd=str(path), check=False)
+                result = run_cmd(["git", "am", "--reject", "--ignore-whitespace", str(patch_file)],
+                                cwd=str(path), check=False)
+                if result.returncode != 0:
+                    print(config.colored(f"应用 {patch_file.name} 失败", Colors.RED))
+                    run_cmd(["git", "am", "--abort"], cwd=str(path), check=False)
+
+    print(f"\n{Colors.GREEN}补丁应用完成{Colors.NC}")
+
+
+def main():
+    """主函数"""
+    global config
+    setup_logging()
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    if len(sys.argv) < 2:
+        print_usage()
+        sys.exit(1)
+
+    # 解析参数
+    parser = argparse.ArgumentParser(add_help=False, usage=argparse.SUPPRESS)
+    parser.add_argument("--gitclone", action="store_true")
+    parser.add_argument("-r", "--run", nargs=argparse.REMAINDER, metavar="CMD...")
+    parser.add_argument("--reproduce", action="store_true")
+    parser.add_argument("--applypatch", action="store_true")
+    parser.add_argument("-c", "--check-env", action="store_true")
+    parser.add_argument("--check-commit", action="store_true")
+    parser.add_argument("--save", nargs="?", const="", metavar="TXT")
+    parser.add_argument("--release", nargs="?", const="__default__", metavar="DIR",
+                        help="正向发布 release（可选指定输出目录）")
+    parser.add_argument("--release-reverse", nargs="?", const="__default__", metavar="DIR",
+                        help="逆向同步 release（可选指定输入目录）")
+    parser.add_argument("--username", type=str, help="指定远程仓库用户名（优先于 gitconfig）")
+    parser.add_argument("--normal", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-q", "--quiet", action="store_true")
+    parser.add_argument("--app", action="store_true")
+    parser.add_argument("--bsp", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.help:
+        print_usage()
+        sys.exit(0)
+
+    if args.no_color:
+        config.use_colors = False
+
+    # ── --release ──────────────────────────────────────────────────
+    if args.release is not None:
+        release_dir = args.release if args.release != "__default__" else None
+        _cmd_release(release_dir)
+        sys.exit(0)
+    if args.release_reverse is not None:
+        release_dir = args.release_reverse if args.release_reverse != "__default__" else None
+        _cmd_release_reverse(release_dir)
+        sys.exit(0)
+
+    # 设置脚本目录
+    script_path = os.path.abspath(__file__)
+    config.script_dir = os.path.dirname(script_path)
+
+    # 检查 .git 目录
+    if (not args.force and not args.reproduce and not args.applypatch
+            and args.save is None and not args.run):
+        if os.path.isdir(".git"):
+            print(config.colored("警告: 当前目录包含 .git", Colors.YELLOW))
+            sys.exit(1)
+
+    # 加载配置文件
+    config_data, config_dir = load_config()
+    if not config_data:
+        print(config.colored("错误: 未找到配置文件 .repos_config", Colors.RED))
+        sys.exit(1)
+
+    # 获取用户名
+    username = get_username(args.username)
+    # print(f"用户名: {username}")
+
+    # 读取 bsp 和 app 配置
+    bsp_config = config_data.get("bsp", {})
+    app_config = config_data.get("app", {})
+
+    # 如果路径是相对的，相对于配置文件所在目录解析
+    def resolve_path(path: str) -> str:
+        if path and not os.path.isabs(path):
+            return str(config_dir / path) if config_dir else path
+        return path
+
+    bsp_config["xml"] = resolve_path(bsp_config.get("xml", ""))
+    bsp_config["txt"] = resolve_path(bsp_config.get("txt", ""))
+    app_config["xml"] = resolve_path(app_config.get("xml", ""))
+    app_config["txt"] = resolve_path(app_config.get("txt", ""))
+
+    # 确定要处理的目标列表
+    targets = []
+    if bsp_config:
+        targets.append(("BSP", bsp_config))
+    if app_config:
+        targets.append(("APP", app_config))
+
+    if not targets:
+        print(config.colored("错误: 配置文件中未找到 bsp 或 app 配置", Colors.RED))
+        sys.exit(1)
+
+    def get_filtered_targets():
+        """根据 --app/--bsp 参数筛选目标，默认返回所有目标"""
+        filtered = []
+        for name, cfg in targets:
+            if args.app and name != "APP":
+                continue
+            if args.bsp and name != "BSP":
+                continue
+            filtered.append((name, cfg))
+        return filtered
+
+    def should_skip_target_silently(name: str, cfg: Dict) -> bool:
+        """APP 未配置或未找到 xml 时静默跳过。"""
+        if name != "APP":
+            return False
+        xml_file = cfg.get("xml")
+        return (not xml_file) or (not os.path.exists(xml_file))
+
+    def process_target(name: str, cfg: Dict, action: str) -> bool:
+        """处理单个目标（BSP 或 APP）"""
+        if should_skip_target_silently(name, cfg):
+            return True
+
+        xml_file = cfg.get("xml")
+        txt_file = cfg.get("txt", "")
+
+        if not xml_file:
+            print(f"警告: {name} 配置中未指定 xml 文件")
+            return False
+
+        if not os.path.exists(xml_file):
+            print(config.colored(f"错误: 未找到 XML 文件: {xml_file}", Colors.RED))
+            return False
+
+        print(f"\n{Colors.BLUE}=== {name} ({xml_file}) ==={Colors.NC}")
+
+        # 解析 XML
+        remote_fetch, config.remote_name, config.default_revision = parse_remote_from_xml(xml_file)
+        config.remote_url = modify_remote_url(remote_fetch, username)
+
+        print(f"远程: {config.remote_name}, 默认分支: {config.default_revision}")
+
+        projects = parse_projects_from_xml(xml_file, config.remote_url, config.default_revision, username)
+
+        # 执行操作
+        if action == "clone":
+            clone_batches = build_clone_batches(projects)
+            cpu_count = os.cpu_count() or 1
+            clone_max_workers = min(cpu_count, DEFAULT_CLONE_MAX_WORKERS)
+            worker_count = min(clone_max_workers, max(len(projects), 1))
+            print(f"并行克隆模式: 最大并发 {worker_count}，依赖分批 {len(clone_batches)} 层")
+            ok = True
+            for batch_idx, batch_projects in enumerate(clone_batches, start=1):
+                batch_workers = min(worker_count, len(batch_projects))
+                print(f"  第 {batch_idx}/{len(clone_batches)} 批: {len(batch_projects)} 个仓库，并发 {batch_workers}")
+                with ThreadPoolExecutor(max_workers=batch_workers) as executor:
+                    future_to_project = {
+                        executor.submit(
+                            git_clone,
+                            project,
+                            "all" if name == "APP" else "skip-pre-commit"
+                        ): project for project in batch_projects
+                    }
+                    for future in as_completed(future_to_project):
+                        project = future_to_project[future]
+                        try:
+                            if not future.result():
+                                ok = False
+                                print(config.colored(f"克隆任务失败: {project.name}", Colors.RED))
+                        except Exception as exc:
+                            ok = False
+                            print(config.colored(f"克隆任务异常: {project.name}, {exc}", Colors.RED))
+            return ok
+        elif action == "reproduce":
+            if txt_file:
+                for project in projects:
+                    reproduce_repo(project, txt_file)
+            return True
+        elif action == "save":
+            if txt_file:
+                save_commit_ids(projects, txt_file)
+            return True
+
+        return True
+
+    # 执行操作（对所有目标或指定目标）
+    if args.gitclone:
+        clone_ok = True
+        for name, cfg in get_filtered_targets():
+            if not process_target(name, cfg, "clone"):
+                clone_ok = False
+        if not clone_ok:
+            sys.exit(1)
+
+    if args.reproduce:
+        for name, cfg in get_filtered_targets():
+            process_target(name, cfg, "reproduce")
+
+    if args.check_commit:
+        for name, cfg in get_filtered_targets():
+            if should_skip_target_silently(name, cfg):
+                continue
+
+            xml_file = cfg.get("xml")
+            txt_file = cfg.get("txt", "")
+            if not xml_file or not txt_file or not os.path.exists(xml_file):
+                continue
+
+            print(f"\n{Colors.BLUE}=== {name} 检查 commit ==={Colors.NC}")
+
+            # 解析 XML 获取 projects
+            remote_fetch, remote_name, default_revision = parse_remote_from_xml(xml_file)
+            remote_url = modify_remote_url(remote_fetch, username)
+            projects = parse_projects_from_xml(xml_file, remote_url, default_revision, username)
+
+            for project in projects:
+                check_commit_id(project, txt_file)
+        sys.exit(0)
+
+    if args.check_env:
+        all_issues = []
+        for name, cfg in get_filtered_targets():
+            if should_skip_target_silently(name, cfg):
+                continue
+
+            xml_file = cfg.get("xml")
+            txt_file = cfg.get("txt", "")
+            if not xml_file:
+                all_issues.append(f"[{name}] 未配置 xml 文件")
+                continue
+
+            if not os.path.exists(xml_file):
+                all_issues.append(f"[{name}] XML 文件不存在: {xml_file}")
+                continue
+
+            if not txt_file:
+                all_issues.append(f"[{name}] 未配置 txt 文件")
+                continue
+
+            if not os.path.exists(txt_file):
+                all_issues.append(f"[{name}] txt 文件不存在: {txt_file}")
+                continue
+
+            print(f"\n{Colors.BLUE}=== {name} 检查环境状态 ==={Colors.NC}")
+            remote_fetch, remote_name, default_revision = parse_remote_from_xml(xml_file)
+            remote_url = modify_remote_url(remote_fetch, username)
+            projects = parse_projects_from_xml(xml_file, remote_url, default_revision, username)
+
+            target_issues = check_clone_and_branch(projects, name)
+            target_issues.extend(check_expected_commits(projects, txt_file, name))
+            patch_dirs = resolve_patch_dirs(config.script_dir)
+            target_issues.extend(check_patch_sync(projects, txt_file, patch_dirs, name))
+            target_issues.extend(check_submodule_sync(projects, name))
+            all_issues.extend(target_issues)
+
+        # 作为最后一步：若存在 sync.sh，则执行 sync.sh -c
+        all_issues.extend(check_sync_sh(config.script_dir))
+
+        if all_issues:
+            print(config.colored(f"\n环境检查失败，共发现 {len(all_issues)} 个问题：", Colors.RED))
+            for idx, issue in enumerate(all_issues, start=1):
+                lines = issue.splitlines() or [issue]
+                print(f"  {idx}. {lines[0]}")
+                for extra in lines[1:]:
+                    print(f"     {extra}")
+            print(config.colored("\n已停止后续操作。", Colors.RED))
+
+            has_clone_issue = any(
+                ("仓库不存在，未完成 clone" in issue) or
+                ("目录存在但不是 git 仓库" in issue) or
+                ("期望分支不存在" in issue)
+                for issue in all_issues
+            )
+            commit_issue_keys = (
+                "txt 指定 commit_id",
+                "txt 未找到对应 commit_id 记录",
+                "补丁数量不同步",
+                "补丁信息不一致",
+                "无法解析补丁头信息",
+                "无法解析提交头信息",
+            )
+            only_commit_issues = all(any(key in issue for key in commit_issue_keys) for issue in all_issues)
+            submodule_issue_keys = (
+                "子模块不同步",
+                "子模块状态检查失败",
+            )
+            only_submodule_issues = all(any(key in issue for key in submodule_issue_keys) for issue in all_issues)
+
+            if has_clone_issue:
+                print(config.colored(f"请先执行 `{sys.argv[0]} --gitclone` 拉取代码后重试。", Colors.YELLOW))
+            elif only_commit_issues:
+                print(config.colored("请先在对应仓库执行 `git fetch && git rebase` 更新到最新代码后重试。", Colors.YELLOW))
+            elif only_submodule_issues:
+                print(config.colored("请先在对应仓库执行 `git submodule update --init --recursive` 同步子模块后重试。", Colors.YELLOW))
+            else:
+                print(config.colored("请先修复以上分支/工作区问题后重试。", Colors.YELLOW))
+            sys.exit(1)
+
+        print(config.colored("\n环境检查通过：所有仓库均已 clone、分支正确、commit/patch/submodule 状态完全同步。", Colors.GREEN))
+        sys.exit(0)
+
+    if args.applypatch:
+        # 使用 set 记录已处理的仓库，避免 BSP/APP 重复处理相同仓库
+        applied_repos = set()
+        for name, cfg in get_filtered_targets():
+            if should_skip_target_silently(name, cfg):
+                continue
+
+            xml_file = cfg.get("xml")
+            txt_file = cfg.get("txt", "")
+            if not xml_file or not txt_file or not os.path.exists(xml_file):
+                continue
+
+            print(f"\n{Colors.BLUE}=== {name} 应用补丁 ==={Colors.NC}")
+
+            # 解析 XML 获取 projects
+            remote_fetch, remote_name, default_revision = parse_remote_from_xml(xml_file)
+            remote_url = modify_remote_url(remote_fetch, username)
+            projects = parse_projects_from_xml(xml_file, remote_url, default_revision, username)
+
+            patch_dirs = resolve_patch_dirs(config.script_dir)
+            apply_patches(projects, patch_dirs, txt_file, applied_repos, force=args.force)
+        sys.exit(0)
+
+    if args.save is not None:
+        # 如果指定了输出文件，添加后缀区分 bsp/app
+        custom_output = args.save if args.save else None
+        for name, cfg in get_filtered_targets():
+            if custom_output:
+                # 使用自定义文件名，如 --save version.txt -> bsp_version.txt, app_version.txt
+                lower_name = name.lower()
+                cfg = dict(cfg)  # 复制一份，不修改原配置
+                cfg["txt"] = f"{lower_name}_{custom_output}"
+            process_target(name, cfg, "save")
+        sys.exit(0)
+
+    # --run 在所有目标的所有仓库中执行命令
+    if args.run and args.run[0]:
+        command = args.run
+        for name, cfg in get_filtered_targets():
+            xml_file = cfg.get("xml")
+            if not xml_file or not os.path.exists(xml_file):
+                continue
+
+            # 解析远程配置
+            remote_fetch, remote_name, default_revision = parse_remote_from_xml(xml_file)
+            remote_url = modify_remote_url(remote_fetch, username)
+
+            projects = parse_projects_from_xml(xml_file, remote_url, default_revision, username)
+
+            if not projects:
+                print(f"警告: {name} 未找到任何项目")
+                continue
+
+            config.quiet = args.quiet
+            run_command_in_repos(projects, command)
+        sys.exit(0)
+
+
+def _cmd_release(release_dir):
+    """repos --release：读取 manifest/release_config.json 执行正向发布
+    release_dir=None 时仅生成本地 release 目录，不额外同步。
+    """
+    _run_release("forward", release_dir)
+
+
+def _cmd_release_reverse(release_dir):
+    """repos --release-reverse：读取 manifest/release_config.json 执行逆向同步
+    release_dir=None 时默认读取本地 release_output。
+    """
+    _run_release("reverse", release_dir)
+
+
+def _run_release(mode, release_dir):
+    """release 内核：mode=forward/reverse。"""
+    import json
+
+    SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    LOCAL_RLS = os.path.join(SRC_DIR, "release_output")
+
+    config_path = os.path.join(SRC_DIR, "manifest", "release_config.json")
+    if not os.path.exists(config_path):
+        print(config.colored(f"错误: 未找到 release 配置文件: {config_path}", Colors.RED))
+        sys.exit(1)
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+    table = cfg.get("entries", [])
+    print(f"{Colors.GREEN}✓ 已加载 release 配置: {config_path}{Colors.NC}")
+    print(f"  version: {cfg.get('version', 'unknown')}")
+    print(f"  entries: {len(table)}")
+    if mode == "reverse":
+        in_dir = os.path.abspath(release_dir) if release_dir else LOCAL_RLS
+        if not os.path.exists(in_dir):
+            print(config.colored(f"错误: 逆向输入目录不存在: {in_dir}", Colors.RED))
+            sys.exit(1)
+        print(f"  reverse input: {in_dir}")
+
+    RSYNC_OPTS = ["rsync", "-a", "--exclude=.git"]
+
+    def _run(cmd, **kwargs):
+        print(f"  $ {' '.join(cmd)}")
+        subprocess.run(cmd, check=True, **kwargs)
+
+    def _rsync(src, dst, excludes=None):
+        excludes = excludes or []
+        exclude_opts = [f"--exclude={item}" for item in excludes]
+        if os.path.isdir(src):
+            os.makedirs(dst, exist_ok=True)
+            # --delete 只作用于本条目声明的目录内部：src 里删了的文件会同步删除，
+            # 但目标目录里未被任何条目声明的其它顶层目录（客户自建）不受影响。
+            _run([*RSYNC_OPTS, "--delete", *exclude_opts, f"{src}/", f"{dst}/"])
+        elif os.path.isfile(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            _run([*RSYNC_OPTS, *exclude_opts, src, dst])
+
+    def _cpfl(src, dst, excludes=None):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.lexists(dst):
+            _run(["rm", "-rf", dst])
+        _run(["cp", "-rfL", src, dst])
+
+    OPS = {"rsync": _rsync, "cpfl": _cpfl}
+
+    def _parse_entry(entry):
+        src_rel = entry.get("src")
+        dst_rel = entry.get("dst")
+        if not src_rel or not dst_rel:
+            raise ValueError(f"release entry 必须显式配置 src/dst: {entry}")
+
+        direction = entry.get("dir", "↔")
+        forward = entry.get("forward")
+        reverse = entry.get("reverse")
+        if forward is None:
+            forward = direction in ("→", "↔")
+        if reverse is None:
+            reverse = direction in ("←", "↔")
+
+        op = entry.get("op", "rsync")
+        if op not in OPS:
+            raise ValueError(f"不支持的 op: {op}, entry={entry}")
+        excludes = entry.get("exclude", [])
+        if excludes is None:
+            excludes = []
+        if not isinstance(excludes, list) or any(not isinstance(item, str) for item in excludes):
+            raise ValueError(f"exclude 必须是字符串数组: {entry}")
+
+        return {
+            "src": src_rel,
+            "dst": dst_rel,
+            "forward": bool(forward),
+            "reverse": bool(reverse),
+            "op": op,
+            "exclude": excludes,
+        }
+
+    if mode == "forward":
+        # 输出目标：指定 release_dir 时直接发布到该目录，否则用本地 release_output。
+        # 每个 entry 各自同步到目标目录内对应路径；目录型 entry 内部做 --delete，
+        # 但目标目录里未被任何 entry 声明的顶层目录（客户自建）始终不受影响。
+        if release_dir:
+            rls = os.path.abspath(release_dir)
+            if not os.path.exists(rls):
+                ans = input(f"输出目录不存在: {rls}，是否创建? (y/N): ").strip().lower()
+                if ans not in ("y", "yes"):
+                    print("已取消")
+                    sys.exit(0)
+                os.makedirs(rls, exist_ok=True)
+            print(f"发布到指定目录: {rls}")
+        else:
+            rls = LOCAL_RLS
+            if os.path.exists(rls):
+                shutil.rmtree(rls)
+            print(f"创建发布目录: {rls}")
+            os.makedirs(rls, exist_ok=True)
+    else:
+        rls = None
+
+    for entry in table:
+        item = _parse_entry(entry)
+        if mode == "forward" and not item["forward"]:
+            continue
+        if mode == "reverse" and not item["reverse"]:
+            continue
+
+        if mode == "forward":
+            src_rel, dst_rel = item["src"], item["dst"]
+            src = os.path.join(SRC_DIR, src_rel)
+            dst = os.path.join(rls, dst_rel)
+        else:
+            src_rel, dst_rel = item["dst"], item["src"]
+            src = os.path.join(in_dir, src_rel)
+            dst = os.path.join(SRC_DIR, dst_rel)
+
+        op = item["op"]
+        excludes = item["exclude"]
+        if not os.path.exists(src):
+            print(f"  ⚠ 不存在，跳过: {src_rel}")
+            continue
+        if excludes:
+            print(f"  [{op}] {src_rel} → {dst_rel} (exclude={excludes})")
+        else:
+            print(f"  [{op}] {src_rel} → {dst_rel}")
+        OPS[op](src, dst, excludes)
+
+    if mode == "forward":
+        print(f"\n发布完成: {rls}")
+    else:
+        print(f"\n逆向同步完成: {in_dir}")
+
+
+def find_config_file() -> Optional[Path]:
+    """获取配置文件路径（优先脚本目录，其次 ../manifest）"""
+    script_path = os.path.abspath(__file__)
+    script_dir = os.path.dirname(script_path)
+    script_config = Path(script_dir) / "repo_config"
+    if script_config.is_file():
+        return script_config
+
+    manifest_config = Path(script_dir).parent / "manifest" / "repo_config"
+    if manifest_config.is_file():
+        return manifest_config
+
+    return script_config
+
+
+def load_config(config_file: Optional[str] = None) -> Tuple[Dict[str, Any], Optional[Path]]:
+    """从 JSON 文件加载配置，返回配置和配置所在目录"""
+    # 如果未指定文件，自动查找
+    if not config_file:
+        config_path = find_config_file()
+        if not config_path:
+            return {}, None
+    else:
+        config_path = Path(config_file).resolve()
+        if not config_path.exists():
+            print(config.colored(f"错误: 配置文件不存在: {config_path}", Colors.RED))
+            return {}, None
+
+    try:
+        import json
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_data = json.load(f)
+            print(f"{Colors.GREEN}✓ 已加载配置文件: {config_path}{Colors.NC}")
+            return config_data, config_path.parent
+    except json.JSONDecodeError as e:
+        print(config.colored(f"错误: 配置文件格式错误: {e}", Colors.RED))
+        return {}, None
+    except ImportError:
+        print(config.colored("错误: 需要安装 json 库（Python 3 已内置）", Colors.RED))
+        return {}, None
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}用户中断，退出{Colors.NC}")
+        sys.exit(1)

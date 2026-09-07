@@ -1,0 +1,6 @@
+{
+    "bsp": {
+        "xml": "../manifest/sdk-github-cv181x_v4.2.0.xml",
+        "txt": "../manifest/git_version_github_cv181x_2026-08-24.txt"
+    }
+}
