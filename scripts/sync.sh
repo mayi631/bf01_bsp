@@ -3,7 +3,7 @@
 set -e # 遇到错误立即退出
 
 # bf01 板卡目录同步脚本
-# 把 project-patches 中的板卡目录 cv1815ja_bf01_spinand 同步到 SDK 工作目录的
+# 把 bf01_bsp 中的板卡目录 cv1815ja_bf01_spinand 同步到 SDK 工作目录的
 # build/boards/cv181x/ 下（defconfig 菜单由 boards_scan.py 扫描该目录生成）。
 # 在 SDK 工作目录执行（与 bf01_bsp 软链接同级）。
 
@@ -19,10 +19,10 @@ show_help() {
     echo -e "${BLUE}用法: $0 [选项]${NC}"
     echo -e "${BLUE}选项:${NC}"
     echo -e "${BLUE}  -c, --check      检查是否已同步，不执行实际同步操作${NC}"
-    echo -e "${BLUE}  -r, --reverse    执行反向同步（从 SDK 到 project-patches）${NC}"
+    echo -e "${BLUE}  -r, --reverse    执行反向同步（从 SDK 到 bf01_bsp）${NC}"
     echo -e "${BLUE}  -h, --help       显示此帮助信息${NC}"
     echo -e ""
-    echo -e "${BLUE}默认行为: 执行正向同步（从 project-patches 到 SDK）${NC}"
+    echo -e "${BLUE}默认行为: 执行正向同步（从 bf01_bsp 到 SDK）${NC}"
 }
 
 # 检查目录是否已同步
