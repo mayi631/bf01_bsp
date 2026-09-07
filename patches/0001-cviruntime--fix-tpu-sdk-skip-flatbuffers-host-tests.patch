@@ -1,0 +1,32 @@
+From 051b63a171ac03289b0a65da921db1251456eb73 Mon Sep 17 00:00:00 2001
+From: zisen123 <46077464+zisen123@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 18:45:15 +0800
+Subject: [PATCH] [fix](tpu): skip flatbuffers host tests to fix gcc11+ build
+
+FLATBUFFERS_BUILD_TESTS=OFF avoids -Werror=class-memaccess in
+tests/test.cpp (std::memset on non-trivial type) with newer host
+compilers. install target does not depend on tests; flatc builds
+and works fine.
+
+[description ]:NA [root   cause]:NA [JIRA      ID]:NA [chip project]:cv181x [side effects]:NA [Affected *.ko/*.so/*.a] :NA
+
+Change-Id: Id9594bd330df043f0b34a4c6d0ad8fdbf6df4430
+---
+ build_tpu_sdk.sh | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/build_tpu_sdk.sh b/build_tpu_sdk.sh
+index f91079c..db42585 100755
+--- a/build_tpu_sdk.sh
++++ b/build_tpu_sdk.sh
+@@ -48,6 +48,7 @@ if [ ! -e $BUILD_PATH/build_flatbuffers_host ]; then
+ fi
+ pushd $BUILD_PATH/build_flatbuffers_host
+ cmake -G Ninja -DCMAKE_INSTALL_PREFIX=$FLATBUFFERS_HOST_PATH \
++    -DFLATBUFFERS_BUILD_TESTS=OFF \
+     $TOP_DIR/flatbuffers
+ cmake --build . --target install
+ test $? -ne 0 && echo "build flatbuffers failed !!" && popd && exit 1
+-- 
+2.25.1
+

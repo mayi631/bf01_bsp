@@ -1,9 +1,6 @@
 # bf01 补丁说明
 
-当前为空。
-
-CV1815J 外挂 DDR（256MB）支持已包含在 SDK 基线中
-（sophgo cv18xx-v4.2.x，weekly rls 2026.08.24），无需补丁。
-
-后续 bf01 专属改动以 patch 形式加入本目录，并通过
-`scripts/repos --applypatch` 应用。
+- 0001-cviruntime--fix-tpu-sdk-skip-flatbuffers-host-tests.patch：
+  TPU_REL=1 编译时 flatbuffers host tests 在 gcc11+ 报
+  -Werror=class-memaccess，跳过 tests（install 目标不依赖 tests，
+  flatc 正常产出）。已实测 TPU_REL=1 全链路 BUILD_ALL EXIT=0。
