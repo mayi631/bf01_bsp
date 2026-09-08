@@ -16,8 +16,9 @@ CV1815J 外挂 DDR 支持已包含在上述 SDK 基线中，无需额外补丁�
 - `manifest/repo_config`：`repos` 脚本配置
 - `patches/`：项目补丁（当前为空）
 - `scripts/repos`：仓库管理脚本
-- `scripts/sync.sh`：板卡目录同步脚本
+- `scripts/sync.sh`：板卡定制同步脚本（build 板卡目录 + cvi_alios 小核定制；ramdisk 板级 overlay 按需，未创建时自动跳过）
 - `build/boards/cv181x/cv1815ja_bf01_spinand/`：板卡配置
+- `cvi_alios/solutions/normboot/customization/cv1815ja_bf01_spinand/`：小核（RTSmart/alios）定制 pipeline，`defconfig` 已选中 `CONFIG_CV1815JA_BF01_SPINAND`
 
 ## 板卡目录说明（build/boards/cv181x/cv1815ja_bf01_spinand）
 
@@ -48,10 +49,10 @@ cd <sdk_workdir>
 脚本按 `sdk-github-cv181x_v4.2.0.xml` 从 github 拉取代码，
 并把每个仓库 checkout 到 `git_version_github_cv181x_2026-08-24.txt` 记录的 commit。
 
-## 同步板卡目录
+## 同步板卡定制
 
 ```bash
-./bf01_bsp/scripts/sync.sh          # 正向同步：bf01_bsp → SDK build/boards/cv181x/
+./bf01_bsp/scripts/sync.sh          # 正向同步：bf01_bsp → SDK（build 板卡目录 + cvi_alios 小核定制）
 ./bf01_bsp/scripts/sync.sh -c       # 检查是否已同步（repos --check-env 最后一步会调用）
 ./bf01_bsp/scripts/sync.sh -r       # 反向同步：SDK 改动回写 bf01_bsp
 ```
