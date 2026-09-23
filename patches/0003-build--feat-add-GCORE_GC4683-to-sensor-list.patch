@@ -1,0 +1,27 @@
+From 15ae1f8042e7b1f601ea2522ea14b5dd81d42ac4 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 23 Sep 2026 17:13:55 +0800
+Subject: [PATCH] feat(build): add GCORE_GC4683 to sensor_list.json
+
+Required so defconfig keeps CONFIG_SENSOR_GCORE_GC4683.
+
+Change-Id: I690dc9d9ccc0f6863839aa6634e518a458718def
+---
+ sensors/sensor_list.json | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/sensors/sensor_list.json b/sensors/sensor_list.json
+index 5c30a91..aebd83d 100644
+--- a/sensors/sensor_list.json
++++ b/sensors/sensor_list.json
+@@ -20,6 +20,7 @@
+ 		"GCORE_GC4023",
+ 		"GCORE_GC4653",
+ 		"GCORE_GC4663",
++		"GCORE_GC4683",
+ 		"OV_OG01A1B",
+ 		"OV_OG01A10",
+ 		"OV_OS02G10",
+-- 
+2.34.1
+

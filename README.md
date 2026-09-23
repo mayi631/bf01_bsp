@@ -7,14 +7,14 @@
 - NAND：**256MB**
 - SDK 基线：sophgo `cv18xx-v4.2.x` 分支，2026-08-24 快照（`weekly rls 2026.08.24`）
 
-CV1815J 外挂 DDR 支持已包含在上述 SDK 基线中，无需额外补丁（`patches/` 为空）。
+CV1815J 外挂 DDR 支持已包含在上述 SDK 基线中。
 
 ## 目录说明
 
 - `manifest/sdk-github-cv181x_v4.2.0.xml`：BSP 仓库清单（github `sophgo`，`cv18xx-v4.2.x` 分支，含 host-tools）
 - `manifest/git_version_github_cv181x_2026-08-24.txt`：版本快照（各仓 commit）
 - `manifest/repo_config`：`repos` 脚本配置
-- `patches/`：项目补丁（当前为空）
+- `patches/`：项目补丁（含 GC4683 驱动 / sensor_cfg / sensor_list）
 - `scripts/repos`：仓库管理脚本
 - `scripts/sync.sh`：板卡定制同步脚本（build 板卡目录 + cvi_alios 小核定制；ramdisk 板级 overlay 按需，未创建时自动跳过）
 - `build/boards/cv181x/cv1815ja_bf01_spinand/`：板卡配置
@@ -28,6 +28,20 @@ CV1815J 外挂 DDR 支持已包含在上述 SDK 基线中，无需额外补丁�
   ROOTFS 70M / SYSTEM 40M / CFG 4M / DATA 124M），留坏块管理余量
 - `config.json`：`C906B + SPINAND 256MB + External DDR3 256MB (CV1815JA_BF01)`
 - `linux/`、`u-boot/`、`rootfs_script/` 为指向 `default/` 的相对软链接
+- `cv1815ja_bf01_spinand_defconfig`：
+  - 启用 `CONFIG_SENSOR_GCORE_GC4683`，关闭 `CONFIG_SENSOR_GCORE_GC4653`
+  - `CONFIG_ALIOS_CUSTOMIZATION_PIPELINE="cv1815ja_bf01_spinand"`
+  - 启用 `CONFIG_TARGET_PACKAGE_ADBD`
+  - 关闭无 arm 包项：`PINMUX` / `LIBCRYPTO` / `OTASERVER`
+  - bring-up 阶段暂时关闭 `CONFIG_RTOS_INIT_MEDIA`（防 IPC 卡死）
+
+## AliOS customization 说明
+
+`cvi_alios/.../customization/cv1815ja_bf01_spinand/` 为 BF01 专用小核配置：
+
+- 单路 GC4683（IIC2 / addr `0x31` / CAM_MCLK0 / RST=XGPIOA[2] / PWR=XGPIOA[3]）
+- `package.yaml.turnkey`：`CONFIG_SNS0_TYPE: 26`
+- 由 `scripts/sync.sh` 同步到 SDK 同名路径
 
 ## 使用方式（在新建 SDK 目录执行）
 
@@ -57,13 +71,25 @@ cd <sdk_workdir>
 ./bf01_bsp/scripts/sync.sh -r       # 反向同步：SDK 改动回写 bf01_bsp
 ```
 
+同步范围：
+
+1. `build/boards/cv181x/cv1815ja_bf01_spinand`
+2. `cvi_alios/solutions/normboot/customization/cv1815ja_bf01_spinand`
+3. `ramdisk/rootfs/overlay/cv1815ja_bf01_spinand`（目录存在时才同步）
+
 ## 打补丁
 
 ```bash
 ./bf01_bsp/scripts/repos --applypatch
 ```
 
-当前 `patches/` 为空，正常执行无补丁可打。
+当前 `patches/` 含 GC4683 相关补丁（命名格式 `NNNN-仓库--说明.patch`）：
+
+- `0001-cviruntime--fix-tpu-sdk-skip-flatbuffers-host-tests.patch`
+- `0002-cvi_alios--feat-add-gcore-gc4683-sensor-support.patch`
+- `0003-build--feat-add-GCORE_GC4683-to-sensor-list.patch`
+
+> 注意：只跑 `sync.sh` 不够。必须先 `--applypatch`，否则缺 GC4683 枚举/驱动，编译 `custom_viparam.c` 会报 undeclared。
 
 ## 环境检查
 
