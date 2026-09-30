@@ -27,7 +27,16 @@ CV1815J 外挂 DDR 支持已包含在上述 SDK 基线中；GC4683 sensor 与 SP
   （fip 2.5M / 2nd 3M / BOOT 8M / MISC 384K / ENV+BAK 256K /
   ROOTFS 70M / SYSTEM 40M / CFG 4M / DATA 124M），留坏块管理余量
 - `config.json`：`C906B + SPINAND 256MB + External DDR3 256MB (CV1815JA_BF01)`
-- `linux/`、`u-boot/`、`rootfs_script/` 为指向 `default/` 的相对软链接
+- `linux/`、`u-boot/`、`rootfs_script/` 的配置为**板级实体文件**（非软链接）。
+  `default/` 下的同名文件由 cv181x 全系列板卡共用，bf01 的差异若走补丁修改会
+  波及所有板卡，因此统一放在板级文件里独立维护。初始内容取自 `default/`：
+  - `linux/cvitek_cv1815ja_bf01_spinand_defconfig` ← `default/linux/cv181x_wevb_spinor_spinand_arm_defconfig`
+  - `linux/cvitek_cv1815ja_bf01_spinand_fastboot_defconfig` ← `default/linux/cv181x_wevb_spinor_spinand_arm_fastboot_defconfig`
+  - `u-boot/cvitek_cv1815ja_bf01_spinand_defconfig` ← `default/u-boot/cv181x_wevb_arm_spinand_defconfig`（已启用 SPL，见该文件 commit）
+  - `rootfs_script/clean_rootfs.sh` ← `default/rootfs_script/clean_rootfs.sh`
+
+  ⚠️ 这几个文件是 `sync.sh` 软链接同步策略的例外：`bf01_bsp` 内不存在 `default/`，
+  软链接在本仓库会悬空，因此必须以实体文件形式提交，且不随 SDK 的 `default/` 更新。
 - `cv1815ja_bf01_spinand_fastboot_defconfig`：快速启动方案配置，`CONFIG_BOOT_TIME_OPTIMIZATION` / `CONFIG_NO_FB` / `CONFIG_NO_TP` / `CONFIG_UBOOT_SPL_CUSTOM` / `CONFIG_FASTBOOT=y`，不启用 sensor 与 `RTOS_INIT_MEDIA`
 
 ## ramdisk 板级 overlay
