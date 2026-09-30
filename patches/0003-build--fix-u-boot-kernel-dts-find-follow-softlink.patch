@@ -1,0 +1,41 @@
+From 52337cf1fcdc9c02085dfd8fc8697f12d7a509aa Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Wed, 30 Sep 2026 16:18:52 +0800
+Subject: [PATCH] fix:soft link
+
+Change-Id: Ic168fc01ddeca86a8e4eef3b6c8b7271b63d47ed
+---
+ Makefile | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 7c51a3b8..0db471fb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -177,10 +177,10 @@ u-boot-menuconfig: ${UBOOT_OUTPUT_CONFIG_PATH}
+ u-boot-dts:
+ 	$(call print_target)
+ ifeq ($(UBOOT_SRC), u-boot-2021.10)
+-	${Q}find ${BOARD_DTS_SEARCH_PATH} \
++	${Q}find -L ${BOARD_DTS_SEARCH_PATH} \
+ 		\( -path "*linux/*.dts*" -o -path "*dts_${ARCH}/*.dts*" \) \
+ 		-exec cp {} ${UBOOT_PATH}/arch/${ARCH}/dts/ \;
+-	${Q}find ${DTS_DEFATUL_PATHS} -name *.dts* -exec cp {} ${UBOOT_PATH}/arch/${ARCH}/dts/ \;
++	${Q}find -L ${DTS_DEFATUL_PATHS} -name *.dts* -exec cp {} ${UBOOT_PATH}/arch/${ARCH}/dts/ \;
+ endif
+ 
+ u-boot-build: memory-map
+@@ -410,8 +410,8 @@ kernel-dts: ${KERNEL_PATH}/${KERNEL_OUTPUT_FOLDER}
+ 	$(call print_target)
+ 	${Q}ln -snrf ${CVI_BOARD_MEMMAP_H_PATH} ${KERNEL_PATH}/scripts/dtc/include-prefixes/
+ 	${Q}find ${KERNEL_PATH}/arch/${ARCH}/boot/dts/${BRAND}/ -type l -delete
+-	${Q}find ${DTS_DEFATUL_PATHS} -name *.dts* -exec ln -sf {} ${KERNEL_PATH}/arch/${ARCH}/boot/dts/${BRAND}/ \;
+-	${Q}find ${BOARD_DTS_SEARCH_PATH} \
++	${Q}find -L ${DTS_DEFATUL_PATHS} -name *.dts* -exec ln -sf {} ${KERNEL_PATH}/arch/${ARCH}/boot/dts/${BRAND}/ \;
++	${Q}find -L ${BOARD_DTS_SEARCH_PATH} \
+ 		\( -path "*linux/*.dts*" -o -path "*dts_${ARCH}/*.dts*" \) \
+ 		-exec ln -sf {} ${KERNEL_PATH}/arch/${ARCH}/boot/dts/${BRAND}/ \;
+ 	${Q}$(MAKE) -j${NPROC} -C ${KERNEL_PATH}/${KERNEL_OUTPUT_FOLDER} dtbs
+-- 
+2.25.1
+

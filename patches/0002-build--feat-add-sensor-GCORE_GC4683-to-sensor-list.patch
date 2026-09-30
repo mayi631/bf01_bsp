@@ -1,0 +1,25 @@
+From 20873b5d97f00db651bfd6ae8250b3c38bae3480 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Wed, 30 Sep 2026 16:18:24 +0800
+Subject: [PATCH] feat:support gc4683
+
+Change-Id: I486a5c0c05428fc7e644667712c423e8cf17259b
+---
+ sensors/sensor_list.json | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/sensors/sensor_list.json b/sensors/sensor_list.json
+index 5c30a915..aebd83d5 100644
+--- a/sensors/sensor_list.json
++++ b/sensors/sensor_list.json
+@@ -20,6 +20,7 @@
+ 		"GCORE_GC4023",
+ 		"GCORE_GC4653",
+ 		"GCORE_GC4663",
++		"GCORE_GC4683",
+ 		"OV_OG01A1B",
+ 		"OV_OG01A10",
+ 		"OV_OS02G10",
+-- 
+2.25.1
+
