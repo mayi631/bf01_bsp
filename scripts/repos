@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 import re
 import shutil
+import tempfile
 import colorama
 from email.header import decode_header
 from email.utils import parseaddr
@@ -97,6 +98,7 @@ class Config:
     normal: bool = False
     reproduce: bool = False
     applypatch: bool = False
+    genpatch: bool = False
     force: bool = False
     remote_url: Optional[str] = None
     remote_name: Optional[str] = None
@@ -205,6 +207,7 @@ def print_usage():
   -c, --check-env         检查 clone/分支/commit/patch/submodule 是否完全同步
   --check-commit          检查仓库当前 commit 是否与 txt 文件一致
   --applypatch            应用补丁（按 patches / patches_private / patches_public 规则）
+  --genpatch              从工作区 baseline 之上的新增提交生成补丁到 patches/
   -r, --run <cmd>         在每个仓库执行命令
   --release [dir]         正向发布 release（读取 manifest/release_config.json）
   --release-reverse [dir] 逆向同步 release（读取 manifest/release_config.json）
@@ -231,6 +234,7 @@ def print_usage():
   {sys.argv[0]} --gitclone --reproduce               # 克隆并复现（默认深圳服务器）
   {sys.argv[0]} --applypatch                         # 应用补丁
   {sys.argv[0]} --applypatch --force                 # 应用补丁前不确认，直接 reset 并应用
+  {sys.argv[0]} --genpatch                           # 从 baseline 之上新增提交生成补丁到 patches/
   {sys.argv[0]} --run st                             # 查看同步状态
   {sys.argv[0]} --run git status                     # 所有仓库执行 git status
   {sys.argv[0]} --save version.txt                   # 保存为 bsp_version.txt, app_version.txt
@@ -1530,6 +1534,182 @@ def apply_patches(projects: List[RepoProject], patch_dirs: List[Path], txt_file:
     print(f"\n{Colors.GREEN}补丁应用完成{Colors.NC}")
 
 
+def gen_patches(projects: List[RepoProject], patch_dirs: List[Path], txt_file: str,
+                generated_repos: Optional[set] = None, force: bool = False):
+    """从工作区 baseline 之上的新增提交生成补丁（逐仓处理，安全第一）。
+
+    与 apply_patches 相对：只导出 baseline+已有补丁数之后的新增提交，
+    有任何冲突/不同步一律拒绝，绝不覆盖已有补丁、绝不 reset、绝不改工作区。
+    """
+    txt_file = Path(txt_file).resolve()
+
+    if generated_repos is None:
+        generated_repos = set()
+
+    # patches/ 目录用于落盘新补丁
+    patches_out_dir = None
+    for patch_dir in patch_dirs:
+        if patch_dir.name == "patches":
+            patches_out_dir = patch_dir
+            break
+    if patches_out_dir is None:
+        print(config.colored("错误: 未找到 patches/ 目录，无法落盘新补丁；请先创建 patches/ 目录", Colors.RED))
+        return
+
+    if not txt_file.exists():
+        print(config.colored(f"错误: 未找到 git 版本文件: {txt_file}", Colors.RED))
+        return
+
+    for project in projects:
+        # 使用 folder_name 作为 repo_name（与 patch 文件名对应）
+        repo_name = project.folder_name
+
+        # 跳过已处理过的仓库（BSP/APP 同仓只处理一次）
+        if repo_name in generated_repos:
+            continue
+        generated_repos.add(repo_name)
+
+        path = Path.cwd() / project.path
+
+        if not path.exists():
+            print(config.colored(f"警告: 未找到仓库: {path}", Colors.YELLOW))
+            continue
+
+        print(f"{Colors.BLUE}\n================ 正在为 {repo_name} 生成补丁{Colors.NC}")
+
+        # 取 baseline commit
+        base_commit = get_commit_id_from_txt(project, str(txt_file))
+        if not base_commit:
+            print(config.colored(f"错误: 版本文件中未找到 {repo_name} 的 baseline commit_id", Colors.RED))
+            continue
+
+        # baseline 必须存在
+        result = run_cmd(
+            ["git", "rev-parse", "--verify", f"{base_commit}^{{commit}}"],
+            cwd=str(path),
+            check=False
+        )
+        if result.returncode != 0:
+            print(config.colored(f"错误: baseline commit 不存在: {base_commit}", Colors.RED))
+            continue
+        base_commit = result.stdout.strip()
+
+        # baseline 必须在当前 HEAD 历史中
+        result = run_cmd(
+            ["git", "merge-base", "--is-ancestor", base_commit, "HEAD"],
+            cwd=str(path),
+            check=False
+        )
+        if result.returncode != 0:
+            print(config.colored(f"错误: baseline 不在当前分支历史中: {base_commit}", Colors.RED))
+            continue
+
+        # 工作区脏一律拒绝（不 reset，不理会 force）
+        has_changes, lines = check_uncommitted_changes(str(path))
+        if has_changes:
+            print(config.colored("错误: 仓库有未提交的更改，拒绝生成补丁", Colors.YELLOW))
+            print_uncommitted_files(lines)
+            continue
+
+        # 已有补丁与新增提交
+        patch_files = collect_patch_files(patch_dirs, repo_name)
+        existing_count = len(patch_files)
+
+        result = run_cmd(
+            ["git", "rev-list", "--reverse", f"{base_commit}..HEAD"],
+            cwd=str(path),
+            check=False
+        )
+        if result.returncode != 0:
+            print(config.colored("错误: 无法获取基线之后提交列表", Colors.RED))
+            continue
+
+        commit_ids = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        actual_count = len(commit_ids)
+
+        # ── 门禁 ──────────────────────────────────────────────
+        # 无新增提交可导出（正常情况，非错误）
+        if actual_count <= existing_count:
+            print(config.colored("无新增提交可导出", Colors.YELLOW))
+            continue
+
+        # actual > existing 且 existing>0：校验前 existing 个提交与已有补丁逐一精确匹配
+        if existing_count > 0:
+            expected_headers = []
+            parse_failed = False
+            for patch_file in patch_files:
+                headers = parse_patch_headers_from_file(patch_file)
+                if not headers:
+                    print(config.colored(f"错误: 无法解析补丁头信息(From/Date/Subject): {patch_file.name}", Colors.RED))
+                    parse_failed = True
+                    break
+                expected_headers.append((patch_file.name, headers))
+            if parse_failed:
+                continue
+
+            mismatch = False
+            for i in range(existing_count):
+                actual_headers = get_commit_headers(str(path), commit_ids[i])
+                if not actual_headers:
+                    print(config.colored(f"错误: 无法解析提交头信息(From/Date/Subject): {commit_ids[i][:12]}", Colors.RED))
+                    mismatch = True
+                    break
+                if expected_headers[i][1] != actual_headers:
+                    exp_file, (exp_from, exp_date, exp_subject) = expected_headers[i]
+                    act_from, act_date, act_subject = actual_headers
+                    print(config.colored(f"错误: 已有补丁与工作区不同步（第 {i + 1} 笔），拒绝生成", Colors.RED))
+                    print(f"期望: [{exp_file}]")
+                    print(f"  From: {exp_from}")
+                    print(f"  Date: {exp_date}")
+                    print(f"  Subject: {exp_subject}")
+                    print(f"实际: [{commit_ids[i][:12]}]")
+                    print(f"  From: {act_from}")
+                    print(f"  Date: {act_date}")
+                    print(f"  Subject: {act_subject}")
+                    mismatch = True
+                    break
+            if mismatch:
+                continue
+
+        # ── 导出只新增部分 ────────────────────────────────────
+        # 起点：第 existing_count 个提交的 hash（existing==0 时用 baseline）
+        start = commit_ids[existing_count - 1] if existing_count > 0 else base_commit
+
+        tmp_dir = tempfile.mkdtemp(prefix="repos_genpatch_")
+        generated = []
+        try:
+            result = run_cmd(
+                ["git", "format-patch", "--start-number", str(existing_count + 1),
+                 "-o", tmp_dir, f"{start}..HEAD"],
+                cwd=str(path),
+                check=False
+            )
+            if result.returncode != 0:
+                err = (result.stderr or "").strip()
+                print(config.colored(f"错误: git format-patch 失败: {err}", Colors.RED))
+                continue
+
+            produced = sorted(Path(tmp_dir).glob("*.patch"))
+            for src in produced:
+                # git 产出 NNNN-<slug>.patch，在首个 '-'（4 位数字之后）插入 <repo_name>--
+                name = src.name
+                dash = name.find("-")
+                if dash < 0:
+                    new_name = f"{name.rsplit('.patch', 1)[0]}-{repo_name}--.patch"
+                else:
+                    new_name = f"{name[:dash + 1]}{repo_name}--{name[dash + 1:]}"
+                dst = patches_out_dir / new_name
+                shutil.move(str(src), str(dst))
+                generated.append(new_name)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        if generated:
+            print(config.colored(f"已生成 {len(generated)} 笔补丁到 {patches_out_dir}:", Colors.GREEN))
+            for gname in generated:
+                print(f"  {gname}")
+
+
 def main():
     """主函数"""
     global config
@@ -1546,6 +1726,7 @@ def main():
     parser.add_argument("-r", "--run", nargs=argparse.REMAINDER, metavar="CMD...")
     parser.add_argument("--reproduce", action="store_true")
     parser.add_argument("--applypatch", action="store_true")
+    parser.add_argument("--genpatch", action="store_true")
     parser.add_argument("-c", "--check-env", action="store_true")
     parser.add_argument("--check-commit", action="store_true")
     parser.add_argument("--save", nargs="?", const="", metavar="TXT")
@@ -1850,6 +2031,29 @@ def main():
 
             patch_dirs = resolve_patch_dirs(config.script_dir)
             apply_patches(projects, patch_dirs, txt_file, applied_repos, force=args.force)
+        sys.exit(0)
+
+    if args.genpatch:
+        # 使用 set 记录已处理的仓库，避免 BSP/APP 重复处理相同仓库
+        generated_repos = set()
+        for name, cfg in get_filtered_targets():
+            if should_skip_target_silently(name, cfg):
+                continue
+
+            xml_file = cfg.get("xml")
+            txt_file = cfg.get("txt", "")
+            if not xml_file or not txt_file or not os.path.exists(xml_file):
+                continue
+
+            print(f"\n{Colors.BLUE}=== {name} 生成补丁 ==={Colors.NC}")
+
+            # 解析 XML 获取 projects
+            remote_fetch, remote_name, default_revision = parse_remote_from_xml(xml_file)
+            remote_url = modify_remote_url(remote_fetch, username)
+            projects = parse_projects_from_xml(xml_file, remote_url, default_revision, username)
+
+            patch_dirs = resolve_patch_dirs(config.script_dir)
+            gen_patches(projects, patch_dirs, txt_file, generated_repos, force=args.force)
         sys.exit(0)
 
     if args.save is not None:
