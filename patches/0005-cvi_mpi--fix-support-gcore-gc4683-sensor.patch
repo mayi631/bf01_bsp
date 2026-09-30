@@ -1,0 +1,87 @@
+From 667b91d67c2a110182b326e14d48034aa7c59a14 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Wed, 30 Sep 2026 18:04:12 +0800
+Subject: [PATCH] fix:sopport gc4683
+
+Change-Id: I26ecfce9be6f7920255e2ee6cb2ed2b3ddc39b4c
+---
+ sample/common/sample_common_isp.c | 11 +++++++++++
+ sample/common/sample_common_vi.c  | 16 ++++++++++++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/sample/common/sample_common_isp.c b/sample/common/sample_common_isp.c
+index b306d45..bb1c22c 100644
+--- a/sample/common/sample_common_isp.c
++++ b/sample/common/sample_common_isp.c
+@@ -517,6 +517,10 @@ CVI_S32 SAMPLE_COMM_ISP_GetIspAttrBySns(SNS_TYPE_E enSnsType, ISP_PUB_ATTR_S *ps
+ 	case GCORE_GC4653_MIPI_4M_30FPS_10BIT:
+ 	case GCORE_GC4663_MIPI_4M_30FPS_10BIT:
+ 	case GCORE_GC4663_MIPI_4M_30FPS_10BIT_WDR2TO1:
++	case GCORE_GC4683_MIPI_4M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
++	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
+ 		pstPubAttr->enBayer = BAYER_GRBG;
+ 		break;
+ #ifdef ARCH_CV182X
+@@ -766,6 +770,13 @@ CVI_VOID *SAMPLE_COMM_GetSnsObj(SNS_TYPE_E enSnsType)
+ 	case GCORE_GC4653_SLAVE_MIPI_4M_30FPS_10BIT:
+ 		return &stSnsGc4653_Slave_Obj;
+ #endif
++#if defined(SENSOR_GCORE_GC4683)
++	case GCORE_GC4683_MIPI_4M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
++	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
++		return &stSnsGc4683_Obj;
++#endif
+ #if defined(SENSOR_NEXTCHIP_N5)
+ 	case NEXTCHIP_N5_2M_25FPS_8BIT:
+ 	case NEXTCHIP_N5_1M_2CH_25FPS_8BIT:
+diff --git a/sample/common/sample_common_vi.c b/sample/common/sample_common_vi.c
+index 8cc1c8e..8a578e4 100644
+--- a/sample/common/sample_common_vi.c
++++ b/sample/common/sample_common_vi.c
+@@ -352,6 +352,10 @@ CVI_S32 SAMPLE_COMM_VI_GetDevAttrBySns(SNS_TYPE_E enSnsType, VI_DEV_ATTR_S *pstV
+ 	case GCORE_GC4653_MIPI_4M_30FPS_10BIT:
+ 	case GCORE_GC4663_MIPI_4M_30FPS_10BIT:
+ 	case GCORE_GC4663_MIPI_4M_30FPS_10BIT_WDR2TO1:
++	case GCORE_GC4683_MIPI_4M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
++	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
+ 		pstViDevAttr->enBayerFormat = BAYER_FORMAT_GR;
+ 		break;
+ 	default:
+@@ -371,6 +375,10 @@ CVI_S32 SAMPLE_COMM_VI_GetDevAttrBySns(SNS_TYPE_E enSnsType, VI_DEV_ATTR_S *pstV
+ 	case GCORE_GC4653_MIPI_4M_30FPS_10BIT:
+ 	case GCORE_GC4663_MIPI_4M_30FPS_10BIT:
+ 	case GCORE_GC4663_MIPI_4M_30FPS_10BIT_WDR2TO1:
++	case GCORE_GC4683_MIPI_4M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
++	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
+ 	case SONY_IMX675_MIPI_5M_30FPS_12BIT:
+ 	case SONY_IMX675_MIPI_5M_25FPS_12BIT_WDR2TO1:
+ 		pstViDevAttr->disEnableSbm = 1;
+@@ -1001,9 +1009,17 @@ CVI_S32 SAMPLE_COMM_VI_GetSizeBySensor(SNS_TYPE_E enMode, PIC_SIZE_E *penSize)
+ 	case GCORE_GC4653_MIPI_4M_30FPS_10BIT:
+ 	case GCORE_GC4663_MIPI_4M_30FPS_10BIT:
+ 	case GCORE_GC4663_MIPI_4M_30FPS_10BIT_WDR2TO1:
++	case GCORE_GC4683_MIPI_4M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
+ 	case CISTA_C4390_MIPI_4M_30FPS_10BIT:
+ 		*penSize = PIC_1440P;
+ 		break;
++	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
++		*penSize = PIC_1080P;
++		break;
++	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
++		*penSize = PIC_720P;
++		break;
+ 	case OV_OV4689_MIPI_4M_30FPS_10BIT:
+ 		*penSize = PIC_2688x1520;
+ 		break;
+-- 
+2.25.1
+
