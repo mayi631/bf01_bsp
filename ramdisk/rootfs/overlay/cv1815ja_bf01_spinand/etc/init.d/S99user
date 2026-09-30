@@ -1,0 +1,51 @@
+#!/bin/sh
+${CVI_SHOPTS}
+#
+# Start firmware
+#
+
+export USERDATAPATH=/mnt/data/
+export SYSTEMPATH=/system/
+
+case "$1" in
+  start)
+        echo "init mpp system..."
+        if [ -f $SYSTEMPATH/ko/loadsystemko.sh ]; then
+                sh $SYSTEMPATH/ko/loadsystemko.sh
+        fi
+
+        echo "Starting app..."
+        if [ -f $USERDATAPATH/auto.sh ]; then
+                usleep 30000
+                . $USERDATAPATH/auto.sh &
+                exit 1
+        fi
+        if [ -f $SYSTEMPATH/auto.sh ]; then
+                usleep 30000
+                . $SYSTEMPATH/auto.sh &
+        fi
+
+        # record alios log
+        # alios_cli -m 1 -c 0 2>&1 | logger -t alios -p local7.info &
+
+        # run app
+        # if [ -f $USERDATAPATH/bin/sophcam ]; then
+        #         chmod +x $USERDATAPATH/bin/sophcam
+        #         $USERDATAPATH/bin/sophcam </dev/null 2>&1 | logger -t sophcam &
+        # fi
+
+        # run wpa_supplicant after app start
+        # wpa_supplicant -D nl80211 -i wlan0 -c /etc/wpa_supplicant.conf -B
+        # ifconfig wlan0 down
+	    # wifi-daemon -l info | logger -t wifi &
+        ;;
+  stop)
+        ;;
+  restart|reload)
+        ;;
+  *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit $?
