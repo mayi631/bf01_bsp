@@ -3,19 +3,19 @@
  *
  * File Name: custom_viparam.c
  * Description:
- *   BF01 / GC4683 single-sensor VI params.
+ *   ....
  */
 #include "custom_param.h"
 
 PARAM_CLASSDEFINE(PARAM_SNS_CFG_S,SENSORCFG,CTX,Sensor)[] = {
     {
-        .s32Framerate = 60,
-        .enSnsType = GCORE_GC4683_MIPI_4M_60FPS_10BIT,
+        .s32Framerate = 30,
+        .enSnsType = GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1,
         .MipiDev = 0,
         .s32BusId = 3,
         .s8I2cDev = 3,
         .s32I2cAddr = 0x31,
-        .as16LaneId = {0, 1, 2, 3, 4},
+        .as16LaneId = {4, 0, 1, 2, 3},
         .as8PNSwap = {0, 0, 0, 0, 0},
         .bMclkEn = 1,
         .u8Mclk = RX_MAC_CLK_600M,
@@ -23,9 +23,9 @@ PARAM_CLASSDEFINE(PARAM_SNS_CFG_S,SENSORCFG,CTX,Sensor)[] = {
         .u8MclkCam = 0,
         .u8Orien = 0,
         .bHwSync = 0,
-        .u32Rst_port_idx = 0, /* GPIOA */
-        .u32Rst_pin = 2,      /* XGPIOA[2] */
-        .u32Rst_pol = OF_GPIO_ACTIVE_LOW,
+        .u32Rst_port_idx = 1,
+        .u32Rst_pin = 16,
+        .u32Rst_pol = 1,
         .u8Rotation = 0,
     },
 };
@@ -40,13 +40,13 @@ PARAM_CLASSDEFINE(PARAM_ISP_CFG_S,ISPCFG,CTX,ISP)[] = {
             .u32IspBinDataLen = 0,
         },
         .s8ByPassNum = 5,
-    },
+    }
 };
 
 PARAM_CLASSDEFINE(PARAM_CHN_CFG_S,CHNCFG,CTX,CHN)[] = {
     {
         .s32ChnId = 0,
-        .enWDRMode = WDR_MODE_NONE,
+        .enWDRMode = WDR_MODE_2To1_LINE,
         .bYuvBypassPath = 0,
         .f32Fps = -1,
         .u32Width = 2560,
@@ -55,13 +55,13 @@ PARAM_CLASSDEFINE(PARAM_CHN_CFG_S,CHNCFG,CTX,CHN)[] = {
         .enDynamicRange = DYNAMIC_RANGE_SDR8,
         .enVideoFormat = VIDEO_FORMAT_LINEAR,
         .enCompressMode = COMPRESS_MODE_TILE,
-    },
+    }
 };
 
 PARAM_CLASSDEFINE(PARAM_PIPE_CFG_S,PIPECFG,CTX,PIPE)[] = {
     {
         .pipe = {0, -1, -1, -1, -1, -1},
-    },
+    }
 };
 
 PARAM_VI_CFG_S g_stViCtx = {

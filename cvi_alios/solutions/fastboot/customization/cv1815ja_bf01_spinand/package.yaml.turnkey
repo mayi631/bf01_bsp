@@ -131,14 +131,12 @@ source_file:
   - customization/cv1815ja_bf01_spinand/pipeline/*.c
   - customization/cv1815ja_bf01_spinand/src/*.c
 
-
 ## 第五部分：配置信息
 # def_config:                              # 组件的可配置项
 #   CONFIG_DEBUG: y
 #   CONFIG_PARAM_NOT_CHECK: y
 #   CONFIG_CLI: y
 def_config:
-  CONFIG_CHIP_cv1815ja: 1
   AOS_COMP_CLI: 1
   CONFIG_DEBUG: 1
   CONFIG_DEBUG_MM: 1
@@ -167,9 +165,7 @@ def_config:
   USE_4K_ERASE_SECTION: 0
   CONFIG_SIMPLE_FONTMOD: 1
   CONFIG_SUPPORT_NORFLASH: 0
-  CONFIG_RTOS_INIT_MEDIA: 0
-  CONFIG_SENSOR_GCORE_GC4683: 1
-  CONFIG_SNS0_TYPE: 26
+  CONFIG_SNS0_TYPE: 11
   CONFIG_SNS1_TYPE: 0
   CONFIG_SNS2_TYPE: 0
   CONFIG_PANEL_HX8394: 1
