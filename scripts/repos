@@ -1930,6 +1930,7 @@ def main():
 
     if args.check_env:
         all_issues = []
+        no_txt_targets = []
         for name, cfg in get_filtered_targets():
             if should_skip_target_silently(name, cfg):
                 continue
@@ -1945,7 +1946,18 @@ def main():
                 continue
 
             if not txt_file:
-                all_issues.append(f"[{name}] 未配置 txt 文件")
+                # 未配置 git_version 快照：无法做 commit/patch 校验，降级为提示并输出同步状态
+                print(f"\n{Colors.BLUE}=== {name} 检查环境状态 ==={Colors.NC}")
+                print(config.colored(
+                    f"提示: [{name}] 当前未配置 git_version.txt，跳过 commit/patch 校验，改为输出同步状态。",
+                    Colors.YELLOW))
+                remote_fetch, remote_name, default_revision = parse_remote_from_xml(xml_file)
+                remote_url = modify_remote_url(remote_fetch, username)
+                projects = parse_projects_from_xml(xml_file, remote_url, default_revision, username)
+                all_issues.extend(check_clone_and_branch(projects, name))
+                all_issues.extend(check_submodule_sync(projects, name))
+                run_command_in_repos(projects, ["st"])
+                no_txt_targets.append(name)
                 continue
 
             if not os.path.exists(txt_file):
@@ -2008,6 +2020,10 @@ def main():
             sys.exit(1)
 
         print(config.colored("\n环境检查通过：所有仓库均已 clone、分支正确、commit/patch/submodule 状态完全同步。", Colors.GREEN))
+        if no_txt_targets:
+            print(config.colored(
+                f"注意: {'/'.join(no_txt_targets)} 未配置 git_version.txt，"
+                f"仅输出同步状态，未做 commit/patch 校验。", Colors.YELLOW))
         sys.exit(0)
 
     if args.applypatch:
