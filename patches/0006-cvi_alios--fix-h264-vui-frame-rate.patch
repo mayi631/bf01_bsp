@@ -1,0 +1,27 @@
+From 484273d4f559e88581acd889710750dde654290f Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Tue, 20 Oct 2026 10:07:02 +0800
+Subject: [PATCH] fix: correct H.264 VUI frame rate
+
+H.264 frame rate is time_scale / (2 * num_units_in_tick). Set time_scale to twice the target frame rate so a 15 fps encoder is announced as 15 fps instead of 7.5 fps.
+
+Rebuild the AliOS firmware and update the yoc partition to regenerate the cached SPS at startup.
+---
+ components/cvi_platform/media/src/media_video.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/components/cvi_platform/media/src/media_video.c b/components/cvi_platform/media/src/media_video.c
+index c759540..988f020 100644
+--- a/components/cvi_platform/media/src/media_video.c
++++ b/components/cvi_platform/media/src/media_video.c
+@@ -1411,8 +1411,8 @@ int MEDIA_VIDEO_VencChnInit(PARAM_VENC_CFG_S *pstVencCfg,int VencChn)
+         stH264Vui.stVuiTimeInfo.timing_info_present_flag = 1;
+         if (stH264Vui.stVuiTimeInfo.timing_info_present_flag) {
+             stH264Vui.stVuiTimeInfo.num_units_in_tick = 1;
+-            //265 fps = time_scale / num_units_in_tick
+-            stH264Vui.stVuiTimeInfo.time_scale = pstVecncChnCtx->stRcParam.u8DstFrameRate * 1;
++            // H.264 fps = time_scale / (2 * num_units_in_tick).
++            stH264Vui.stVuiTimeInfo.time_scale = pstVecncChnCtx->stRcParam.u8DstFrameRate * 2;
+         }
+ 
+         stH264Vui.stVuiVideoSignal.video_signal_type_present_flag = CVI_H26X_VIDEO_SIGNAL_TYPE_PRESENT_FLAG_DEFAULT;

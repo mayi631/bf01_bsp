@@ -23,6 +23,13 @@
   `sensor_cfg.c` 挂接 `stSnsGc4683_Obj`、`package.yaml` 加入编译条件。
   与 0002 的 `GCORE_GC4683` 配置项配套，两者需同时生效。
 
+- 0006-cvi_alios--fix-h264-vui-frame-rate.patch：
+  修正 `components/cvi_platform/media/src/media_video.c` 中 H.264 VUI 的
+  `time_scale`，按 `fps = time_scale / (2 * num_units_in_tick)` 设置，
+  避免编码 15 fps 时播放器将码流识别为 7.5 fps。
+  应用后需重新执行 `build_alios` 并更新板上的 `yoc` 分区，
+  使启动时缓存的 SPS 包含正确时序。
+
 本目录编号全局唯一且连续，从 0001 起按顺序递增，不区分仓库；
 补丁文件名仍保留 `<序号>-<repo>--<描述>.patch` 格式供 `repos --applypatch`
 按仓库过滤。
