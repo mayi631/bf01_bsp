@@ -17,7 +17,7 @@ PARAM_CLASSDEFINE(PARAM_VPSS_CHN_CFG_S,CHNCFG,GRP0,CHN)[] = {
             .enVideoFormat = VIDEO_FORMAT_LINEAR,
             .enPixelFormat = PIXEL_FORMAT_NV21,
             .stFrameRate = {
-                .s32SrcFrameRate = 30,
+                .s32SrcFrameRate = 25,
                 .s32DstFrameRate = 15,
             },
             .u32Depth = 0,
@@ -61,7 +61,7 @@ PARAM_CLASSDEFINE(PARAM_VPSS_CHN_CFG_S,CHNCFG,GRP0,CHN)[] = {
             .enVideoFormat = VIDEO_FORMAT_LINEAR,
             .enPixelFormat = PIXEL_FORMAT_NV21,
             .stFrameRate = {
-                .s32SrcFrameRate = 30,
+                .s32SrcFrameRate = 25,
                 .s32DstFrameRate = 15,
             },
             .u32Depth = 0,
@@ -105,7 +105,7 @@ PARAM_CLASSDEFINE(PARAM_VPSS_CHN_CFG_S,CHNCFG,GRP0,CHN)[] = {
             .enVideoFormat = VIDEO_FORMAT_LINEAR,
             .enPixelFormat = PIXEL_FORMAT_NV21,
             .stFrameRate = {
-                .s32SrcFrameRate = 30,
+                .s32SrcFrameRate = 25,
                 .s32DstFrameRate = 15,
             },
             .u32Depth = 0,

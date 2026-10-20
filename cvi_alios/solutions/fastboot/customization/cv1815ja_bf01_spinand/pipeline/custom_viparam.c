@@ -9,8 +9,8 @@
 
 PARAM_CLASSDEFINE(PARAM_SNS_CFG_S,SENSORCFG,CTX,Sensor)[] = {
     {
-        .s32Framerate = 30,
-        .enSnsType = GCORE_GC4683_MIPI_4M_60FPS_10BIT,
+        .s32Framerate = 25,
+        .enSnsType = GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1,
         .MipiDev = 0,
         .s32BusId = 3,
         .s8I2cDev = 3,
@@ -46,7 +46,7 @@ PARAM_CLASSDEFINE(PARAM_ISP_CFG_S,ISPCFG,CTX,ISP)[] = {
 PARAM_CLASSDEFINE(PARAM_CHN_CFG_S,CHNCFG,CTX,CHN)[] = {
     {
         .s32ChnId = 0,
-        .enWDRMode = WDR_MODE_NONE,
+        .enWDRMode = WDR_MODE_2To1_LINE,
         .bYuvBypassPath = 0,
         .f32Fps = -1,
         .u32Width = 2560,
