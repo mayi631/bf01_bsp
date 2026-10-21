@@ -1,0 +1,36 @@
+From f7590ba35b0a4b62af9af3516bbbcae1736bb6e4 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Wed, 21 Oct 2026 16:10:20 +0800
+Subject: [PATCH] fix:sys init failed
+
+---
+ solutions/fastboot/application/app_main.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/solutions/fastboot/application/app_main.c b/solutions/fastboot/application/app_main.c
+index 23fcb895..938cc932 100644
+--- a/solutions/fastboot/application/app_main.c
++++ b/solutions/fastboot/application/app_main.c
+@@ -21,6 +21,10 @@
+ #endif
+ 
+ extern void ipcm_driver_test_init(void);
++#if defined(CONFIG_CHIP_BIG_ARM) && CONFIG_CHIP_BIG_ARM
++/* The prebuilt IPCM library defaults to the RISC-V big core. */
++extern int ipcm_set_snd_cpu(int cpu_id);
++#endif
+ 
+ #define TAG "app"
+ 
+@@ -120,6 +124,11 @@ static int start_pwm(void)
+ 
+ int main(int argc, char *argv[])
+ {
++#if defined(CONFIG_CHIP_BIG_ARM) && CONFIG_CHIP_BIG_ARM
++	/* Select ARM CPU 0 before any IPC service can send a response. */
++	ipcm_set_snd_cpu(0);
++#endif
++
+ 	//board pinmux init
+ 	PLATFORM_IoInit();
+ 	PLATFORM_PanelInit();

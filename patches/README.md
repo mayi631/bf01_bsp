@@ -30,6 +30,11 @@
   应用后需重新执行 `build_alios` 并更新板上的 `yoc` 分区，
   使启动时缓存的 SPS 包含正确时序。
 
+- 0007-cvi_alios--fix-sys-init-failed.patch：
+  在 `CONFIG_CHIP_BIG_ARM` 配置下，`solutions/fastboot/application/app_main.c`
+  启动时调用 `ipcm_set_snd_cpu(0)`，将 IPCM 发送目标设为 ARM CPU 0。
+  修正预编译 IPCM 库默认使用 RISC-V 大核导致的系统初始化失败。
+
 本目录编号全局唯一且连续，从 0001 起按顺序递增，不区分仓库；
 补丁文件名仍保留 `<序号>-<repo>--<描述>.patch` 格式供 `repos --applypatch`
 按仓库过滤。
