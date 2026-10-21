@@ -1,0 +1,86 @@
+From d8875a58ea6c5ef770bc2c2ce9279d4283d77d3b Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 21 Oct 2026 18:34:15 +0800
+Subject: [PATCH] feat(osdrv/atbm6461): diagnose WSM startup polling and IRQ
+ progress
+
+Record startup control reads, polling counts, IRQ delivery and RX executions while firmwareReady is false. Do not process an invalid control-register value after a failed read.
+---
+ .../realtek/atbm6461/hal_apollo/apollo_sdio.c | 29 ++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+index 88561c65c79372b0d3529ad777a2f4cf14e674c0..54bcfe2e92c654a1ca12b9814f7ee26b685afa69 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+@@ -113,6 +113,9 @@ struct sbus_priv {
+ 	struct atbm_common	*core;
+ #ifdef LINUX_OS
+ 	unsigned long io_error_logged;
++	atomic_t startup_irq_count;
++	atomic_t startup_rx_count;
++	unsigned int startup_poll_count;
+ #endif
+ 	struct atbm_sdio_thread tx_thread;
+ 	struct atbm_sdio_thread rx_thread;
+@@ -311,6 +314,8 @@ static int atbm_sdio_irq_period(struct atbm_sdio_thread *thread)
+ 	struct sbus_priv *self = (struct sbus_priv *)thread->self;
+ 	struct atbm_common *hw_priv = self->core;
+ 	#ifdef LINUX_OS
++	int status;
++
+ 	printk_once("[atbm_log]:rx timeout\n");
+ 	
+ 	hw_priv->sbus_ops->lock(hw_priv->sbus_priv);
+@@ -321,7 +326,19 @@ static int atbm_sdio_irq_period(struct atbm_sdio_thread *thread)
+ 		ret = 1;
+ 		goto exit;
+ 	}
+-	atbm_bh_read_ctrl_reg_unlock(hw_priv, &ctrl_reg);	
++	status = atbm_bh_read_ctrl_reg_unlock(hw_priv, &ctrl_reg);
++	if (!hw_priv->wsm_caps.firmwareReady) {
++		self->startup_poll_count++;
++		if (self->startup_poll_count == 1 ||
++		    self->startup_poll_count % 33 == 0)
++			atbm_printk_err("WSM startup poll: ctrl=0x%04x err=%d polls=%u irqs=%d rx_runs=%d init_done=%d\n",
++				ctrl_reg, status, self->startup_poll_count,
++				atomic_read(&self->startup_irq_count),
++				atomic_read(&self->startup_rx_count),
++				hw_priv->init_done);
++	}
++	if (status)
++		goto exit;
+ 	if(ctrl_reg & ATBM_HIFREG_CONT_NEXT_LEN_MASK){
+ 		__set_current_state(TASK_RUNNING);
+ 		atbm_printk_err("%s:Miss\n",__func__);
+@@ -401,6 +418,9 @@ static int atbm_sdio_rx_thread(void *priv)
+ 			continue;
+ 		}
+ 		#endif
++		#ifdef LINUX_OS
++		atomic_inc(&self->startup_rx_count);
++		#endif
+ 		atbm_sdio_rx_bh(self->core);
+ 		#ifndef LINUX_OS
+ 		clear_bit(THREAD_WAKEUP, &self->rx_thread.flags);
+@@ -788,6 +808,9 @@ static void atbm_sdio_irq_handler(struct sdio_func *func)
+ 	struct sbus_priv *self = atbm_sdio_get_drvdata(func);
+ 
+ 	BUG_ON(!self);
++	#ifdef LINUX_OS
++	atomic_inc(&self->startup_irq_count);
++	#endif
+ 
+ 	if (is_pre_rmmod && (self->core->wsm_caps.firmwareVersion>=13549)){
+ 		return ;
+@@ -1354,6 +1377,10 @@ static int atbm_sdio_probe(struct sdio_func *func,
+ 	self->pdata = atbm_get_platform_data();
+ 	self->func = func;
+ 	self->wtd = &g_wtd;
++	#ifdef LINUX_OS
++	atomic_set(&self->startup_irq_count, 0);
++	atomic_set(&self->startup_rx_count, 0);
++	#endif
+ 	atbm_sdio_set_drvdata(func, self);
+ 	sdio_claim_host(func);
+ 	status = atbm_sdio_enable_func(func);
