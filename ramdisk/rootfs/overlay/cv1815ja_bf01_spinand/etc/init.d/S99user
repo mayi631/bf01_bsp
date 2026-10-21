@@ -14,6 +14,10 @@ case "$1" in
                 sh $SYSTEMPATH/ko/loadsystemko.sh
         fi
 
+        if [ -x /mnt/system/wifi/wifi.sh ]; then
+                /mnt/system/wifi/wifi.sh boot </dev/null >/run/atbm_wifi-boot.log 2>&1 &
+        fi
+
         echo "Starting app..."
         if [ -f $USERDATAPATH/auto.sh ]; then
                 usleep 30000
@@ -40,6 +44,9 @@ case "$1" in
 	    # wifi-daemon -l info | logger -t wifi &
         ;;
   stop)
+        if [ -x /mnt/system/wifi/wifi.sh ]; then
+                /mnt/system/wifi/wifi.sh shutdown
+        fi
         ;;
   restart|reload)
         ;;
