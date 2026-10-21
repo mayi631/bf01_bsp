@@ -1,0 +1,25 @@
+From 8a74ee49e668b472032a15c632eca88802372a4d Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 21 Oct 2026 18:34:14 +0800
+Subject: [PATCH] fix(osdrv/atbm6461): default optional secure boot to disabled
+
+Define the optional vendor secure-boot switch as zero when not provided, avoiding undefined-identifier build failures without enabling secure boot.
+---
+ extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_plat.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_plat.h b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_plat.h
+index 9fdd94ff077d33f8762e1c708c31f9c1dd99d4b4..799feddabe1c8bd40456395b45cbe175746d10ff 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_plat.h
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_plat.h
+@@ -83,6 +83,10 @@
+ // Software Secure Boot Feature for Wyze
+ // #define ATBM_SW_SECURE_BOOT_SUPPORT 1
+ 
++#ifndef ATBM_SW_SECURE_BOOT_SUPPORT
++#define ATBM_SW_SECURE_BOOT_SUPPORT 0
++#endif
++
+ #ifdef LINUX_OS
+ #include <linux/ioport.h>
+ #endif
