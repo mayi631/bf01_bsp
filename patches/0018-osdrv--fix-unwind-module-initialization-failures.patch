@@ -1,0 +1,80 @@
+From 629a8b131135f2519cf9be975ef8005cc1c96a86 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 21 Oct 2026 18:34:14 +0800
+Subject: [PATCH] fix(osdrv/atbm6461): unwind module initialization failures
+
+Propagate attribute/driver registration errors and release notifier, firmware, ioctl, RCU and memory resources on failed initialization. Do not unregister an unregistered SDIO driver.
+---
+ .../realtek/atbm6461/hal_apollo/apollo_sdio.c | 28 ++++++++++++++-----
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+index 0aa7338606b506f8fddd4ba03c50bf73b45d8a7b..2f909851524ee5f78b8719f5070bf259c2b29433 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+@@ -1538,7 +1538,7 @@ static int  atbm_sdio_init(void)
+ 
+ 	ret = atbm_sdio_register_driver(&sdio_driver);
+ 	if (ret)
+-		goto err_reg;
++		goto err_power;
+ #if ((ATBM_WIFI_PLATFORM != PLATFORM_ANKAI_RTOS) && (ATBM_WIFI_PLATFORM != 10) && (ATBM_WIFI_PLATFORM != PLATFORM_AMLOGIC_S805)\
+ 	&& (ATBM_WIFI_PLATFORM != PLATFORM_AMLOGIC_905))
+ 	if (!has_func_enable)
+@@ -1555,15 +1555,14 @@ static int  atbm_sdio_init(void)
+ 	&& (ATBM_WIFI_PLATFORM != PLATFORM_AMLOGIC_905))
+ 
+ err_on:
+-	if (pdata->power_ctrl)
+-		pdata->power_ctrl(pdata, false);
++	atbm_sdio_unregister_driver(&sdio_driver);
+ #endif
+ err_power:
++	if (pdata->power_ctrl)
++		pdata->power_ctrl(pdata, false);
+ 	if (pdata->clk_ctrl)
+ 		pdata->clk_ctrl(pdata, false);
+ err_clk:
+-	atbm_sdio_unregister_driver(&sdio_driver);
+-err_reg:
+ 	return ret;
+ }
+ 
+@@ -1592,6 +1591,8 @@ static
+ #endif
+ int __init apollo_sdio_module_init(void)
+ {
++	int ret;
++
+ 	printk("\nDRIVER VER: %s.\n", PRIV_VERSION);
+ 	#ifdef TIME_DEBUG
+ 	jiffies_update(1);
+@@ -1601,13 +1602,26 @@ int __init apollo_sdio_module_init(void)
+ 	#endif
+ 	ieee80211_atbm_mem_int();
+ 	ieee80211_atbm_skb_int();
+-	atbm_module_attribute_init();
++	ret = atbm_module_attribute_init();
++	if (ret)
++		goto err_attribute;
+ 	register_reboot_notifier(&atbm_reboot_nb);
+ 	atbm_init_firmware();
+ 	#ifdef TIME_DEBUG
+ 	jiffies_update(0);
+ 	#endif
+-	return atbm_sdio_init();
++	ret = atbm_sdio_init();
++	if (!ret)
++		return 0;
++	atbm_release_firmware();
++	unregister_reboot_notifier(&atbm_reboot_nb);
++	atbm_module_attribute_exit();
++err_attribute:
++	atbm_ioctl_free();
++	rcu_barrier();
++	ieee80211_atbm_mem_exit();
++	ieee80211_atbm_skb_exit();
++	return ret;
+ }
+ 
+ #ifdef LINUX_OS
