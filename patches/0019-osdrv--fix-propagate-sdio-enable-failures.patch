@@ -1,0 +1,61 @@
+From a9f98ecac3996e398f0e24d877e65801e330653f Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 21 Oct 2026 18:34:14 +0800
+Subject: [PATCH] fix(osdrv/atbm6461): check SDIO enable errors before core
+ probe
+
+Check sdio_enable_func() under the host lock, abort on failure and share the error-unwind path. Do not continue into firmware accesses after a failed function enable.
+---
+ .../realtek/atbm6461/hal_apollo/apollo_sdio.c | 24 ++++++++++++-------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+index 2f909851524ee5f78b8719f5070bf259c2b29433..a63c22d1f20f0a0d810c9a54b76d675d683bed72 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+@@ -1314,8 +1314,13 @@ static int atbm_sdio_probe(struct sdio_func *func,
+ 	self->wtd = &g_wtd;
+ 	atbm_sdio_set_drvdata(func, self);
+ 	sdio_claim_host(func);
+-	atbm_sdio_enable_func(func);
++	status = atbm_sdio_enable_func(func);
+ 	sdio_release_host(func);
++	if (status) {
++		atbm_printk_err("%s: enable function failed: %d\n", __func__, status);
++		goto err_disable;
++	}
++	atbm_printk_init("%s: SDIO function enabled\n", __func__);
+ 
+ 	//reset test start
+ 	//atbm_sdio_reset(self);
+@@ -1325,13 +1330,7 @@ static int atbm_sdio_probe(struct sdio_func *func,
+ 	status = atbm_core_probe(&atbm_sdio_sbus_ops,
+ 			      self, &func->dev, &self->core);
+ 	if (status) {
+-		sdio_claim_host(func);
+-		atbm_sdio_disable_func(func);
+-		sdio_release_host(func);
+-		atbm_sdio_set_drvdata(func, NULL);
+-		atbm_kfree(self);
+-		atomic_set(&g_wtd.wtd_probe, -1);
+-		//printk("[atbm_wtd]:set wtd_probe = -1\n");
++		goto err_disable;
+ 	}
+ 	else {
+ 		atomic_set(&g_wtd.wtd_probe, 1);
+@@ -1342,6 +1341,15 @@ static int atbm_sdio_probe(struct sdio_func *func,
+ 		#endif
+ 	}
+ 	return status;
++
++err_disable:
++	sdio_claim_host(func);
++	atbm_sdio_disable_func(func);
++	sdio_release_host(func);
++	atbm_sdio_set_drvdata(func, NULL);
++	atbm_kfree(self);
++	atomic_set(&g_wtd.wtd_probe, -1);
++	return status;
+ }
+ 
+ /* Disconnect Function to be called by SDIO stack when
