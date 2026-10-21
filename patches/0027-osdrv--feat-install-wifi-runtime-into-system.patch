@@ -1,0 +1,60 @@
+From 66a045b366925d6e5807da8d8441b34e82807def Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 21 Oct 2026 18:34:15 +0800
+Subject: [PATCH] feat(osdrv/atbm6461): install Wi-Fi runtime into the system
+ image
+
+Install rebuilt supplicant, CLI, controller and wifi.sh into system/wifi and link the rebuilt module under system/ko/3rd. Avoid usr/bin paths removed by the shrink-rootfs cleanup.
+---
+ Makefile                                  |  3 +++
+ extdrv/wireless/realtek/atbm6461/Makefile | 11 ++++++++++-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index e94ea8d0b593763b3f5d3aa4cde36bdbaa41be21..777c4e66a557cc24060bf512037a24455c0af87e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -157,6 +157,9 @@ tp:
+ wireless: prepare
+ 	@$(MAKE) -C extdrv/wireless KERNEL_DIR=$(KERNEL_DIR) CONFIG_ATBM6461_BF01=$(CONFIG_ATBM6461_BF01) all -j$(shell nproc)
+ 	@$(call MAKE_EXT_KO_CP, extdrv/wireless)
++ifeq ($(CONFIG_ATBM6461_BF01),y)
++	@$(MAKE) -C extdrv/wireless/realtek/atbm6461 INSTALL_DIR=$(INSTALL_DIR) runtime_install
++endif
+ 
+ wiegand-gpio:
+ 	@$(call MAKE_EXT_KO, extdrv/${@})
+diff --git a/extdrv/wireless/realtek/atbm6461/Makefile b/extdrv/wireless/realtek/atbm6461/Makefile
+index b59255c22785deae84381e6eacc4783c6ceb7b8c..204658f5acbe4dd4e63590297b2cf657c6399dac 100644
+--- a/extdrv/wireless/realtek/atbm6461/Makefile
++++ b/extdrv/wireless/realtek/atbm6461/Makefile
+@@ -3,12 +3,13 @@ KERNEL_DIR ?= $(KERDIR)
+ ARCH ?= arm
+ CROSS_COMPILE ?= arm-linux-gnueabihf-
+ WIFI_INSTALL_DIR ?= $(DRIVER_DIR)/driver_install
++ATBM_RUNTIME_DIR ?= $(abspath $(INSTALL_DIR)/../wifi)
+ 
+ ifeq ($(filter arm arm64,$(ARCH)),)
+ $(error ATBM6461 BF01 requires ARCH=arm or ARCH=arm64)
+ endif
+ 
+-.PHONY: all modules tools tools_install install clean
++.PHONY: all modules tools tools_install install runtime_install clean
+ 
+ all: modules tools
+ 
+@@ -25,6 +26,14 @@ install: all
+ 	install -d $(WIFI_INSTALL_DIR)
+ 	install -m 0644 $(DRIVER_DIR)/hal_apollo/atbm6461_wifi_sdio.ko $(WIFI_INSTALL_DIR)/
+ 
++runtime_install:
++	test -n "$(INSTALL_DIR)"
++	install -d $(ATBM_RUNTIME_DIR)
++	install -m 0755 $(WIFI_INSTALL_DIR)/atbm_iot_supplicant $(WIFI_INSTALL_DIR)/atbm_iot_cli $(ATBM_RUNTIME_DIR)/
++	install -m 0755 $(WIFI_INSTALL_DIR)/atbm_wifi_ctl $(ATBM_RUNTIME_DIR)/
++	install -m 0755 $(DRIVER_DIR)/tools/wifi.sh $(ATBM_RUNTIME_DIR)/
++	ln -sfn ../ko/3rd/atbm6461_wifi_sdio.ko $(ATBM_RUNTIME_DIR)/atbm6461_wifi_sdio.ko
++
+ clean:
+ 	$(MAKE) -C $(KERNEL_DIR) M=$(DRIVER_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) clean
+ 	$(MAKE) -C $(DRIVER_DIR) -f tools/Makefile WIFI_INSTALL_DIR=$(WIFI_INSTALL_DIR) clean
