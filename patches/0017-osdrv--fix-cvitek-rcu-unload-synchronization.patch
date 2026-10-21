@@ -1,0 +1,46 @@
+From 96775799147c4f0eab025240e1662f9f0c9709fb Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 21 Oct 2026 18:34:14 +0800
+Subject: [PATCH] fix(osdrv/atbm6461): synchronize CVITEK RCU teardown safely
+
+Use synchronize_rcu()/rcu_barrier() on CVITEK instead of waiting on the vendor completion that may not have been initialized when SDIO probe fails.
+---
+ extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+index 88b9bc1d9c7dbf94208242a2cc033e4d0dec75e4..0aa7338606b506f8fddd4ba03c50bf73b45d8a7b 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+@@ -508,6 +508,9 @@ static void atbm_wakeme_after_rcu(struct rcu_head *head)
+ 
+ static void atbm_asynchronize_rcu(void)
+ {
++#if (ATBM_WIFI_PLATFORM == PLATFORM_CVITEK)
++	synchronize_rcu();
++#else
+ 	static int init_cnt = 0;
+ 
+ 	if (init_cnt){
+@@ -516,6 +519,7 @@ static void atbm_asynchronize_rcu(void)
+ 		call_rcu(&atbm_rcu.head, atbm_wakeme_after_rcu);
+ 	}
+ 	init_cnt++;
++#endif
+ }
+ #endif
+ 
+@@ -1625,9 +1629,13 @@ void  apollo_sdio_module_exit(void)
+ 	atbm_module_attribute_exit();
+ 	#ifdef LINUX_OS
+ 	atbm_ioctl_free();
++#if (ATBM_WIFI_PLATFORM == PLATFORM_CVITEK)
++	rcu_barrier();
++#else
+ 	/* wait rcu sync complete */
+ 	wait_for_completion(&atbm_rcu.completion);
+ 	destroy_rcu_head_on_stack(&atbm_rcu.head);
++#endif
+ 	#endif
+ 	#ifdef TIME_DEBUG
+ 	jiffies_update(0);
