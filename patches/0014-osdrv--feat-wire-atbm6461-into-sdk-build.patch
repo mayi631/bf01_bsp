@@ -1,0 +1,74 @@
+From 757f6dd5410c7e59a0ed627cc80e2bae3e16a877 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 21 Oct 2026 18:34:14 +0800
+Subject: [PATCH] feat(osdrv/wireless): integrate optional BF01 ATBM6461 build
+
+Build the selected ATBM6461 module and vendor tools through build_osdrv. Preserve existing external-wireless selection and make cp_ext_wireless depend on a completed wireless build.
+---
+ Makefile                 |  9 +++++----
+ extdrv/wireless/Makefile | 12 +++++++++++-
+ 2 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index b4d191974e2212b5e1935731384439384f19a977..e94ea8d0b593763b3f5d3aa4cde36bdbaa41be21 100644
+--- a/Makefile
++++ b/Makefile
+@@ -75,7 +75,7 @@ $(info ** [ KO_LIST ] ** = $(KO_LIST))
+ 
+ $(info ** [ CVIARCH ] ** = $(CVIARCH))
+ 
+-ifeq (y, ${CONFIG_CP_EXT_WIRELESS})
++ifneq ($(filter y,$(CONFIG_CP_EXT_WIRELESS) $(CONFIG_ATBM6461_BF01)),)
+ KO_LIST += wireless
+ OTHERS += cp_ext_wireless
+ endif
+@@ -154,8 +154,9 @@ irrx:
+ tp:
+ 	$(call MAKE_EXT_KO, extdrv/${@})
+ 
+-wireless:
+-	@$(call MAKE_EXT_KO, extdrv/${@})
++wireless: prepare
++	@$(MAKE) -C extdrv/wireless KERNEL_DIR=$(KERNEL_DIR) CONFIG_ATBM6461_BF01=$(CONFIG_ATBM6461_BF01) all -j$(shell nproc)
++	@$(call MAKE_EXT_KO_CP, extdrv/wireless)
+ 
+ wiegand-gpio:
+ 	@$(call MAKE_EXT_KO, extdrv/${@})
+@@ -163,7 +164,7 @@ wiegand-gpio:
+ gyro_i2c:
+ 	@$(call MAKE_EXT_KO, extdrv/${@})
+ 
+-cp_ext_wireless:
++cp_ext_wireless: wireless
+ 	find extdrv/wireless -name '*.ko' -print -exec cp {} $(INSTALL_DIR)/3rd/ \;;
+ 
+ cp_ext_tp:
+diff --git a/extdrv/wireless/Makefile b/extdrv/wireless/Makefile
+index 579363de71181b5be52cb4c01871c7e2c751695f..102d4e6819345595152a8efa901a47695ceeb8f5 100644
+--- a/extdrv/wireless/Makefile
++++ b/extdrv/wireless/Makefile
+@@ -7,13 +7,23 @@ obj-$(CONFIG_WLAN_VENDOR_BROADCOM) += broadcom/
+ obj-$(CONFIG_WLAN_VENDOR_MEDIATEK) += mediatek/
+ obj-$(CONFIG_WLAN_VENDOR_ICOMMSEMI) += icommsemi/
+ 
++ifneq ($(KERNELRELEASE),)
++ifeq ($(CONFIG_ATBM6461_BF01),y)
++obj-m += realtek/atbm6461/
++endif
++endif
++
+ all:
+-	$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KERNEL_DIR) M=$(shell pwd) modules
++	$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) CONFIG_ATBM6461_BF01=$(CONFIG_ATBM6461_BF01) -C $(KERNEL_DIR) M=$(shell pwd) modules
++ifeq ($(CONFIG_ATBM6461_BF01),y)
++	$(MAKE) -C realtek/atbm6461 CROSS_COMPILE=$(CROSS_COMPILE) tools
++endif
+ 
+ strip:
+ 	$(CROSS_COMPILE)strip $(MODULE_NAME).ko --strip-unneeded
+ 
+ clean:
++	$(MAKE) -C realtek/atbm6461 -f tools/Makefile clean
+ #	$(MAKE) -C $(KSRC) M=$(shell pwd) clean
+ #	cd hal ; rm -fr */*/*/*.mod.c */*/*/*.mod */*/*/*.o */*/*/.*.cmd */*/*/*.ko
+ #	cd hal ; rm -fr */*/*.mod.c */*/*.mod */*/*.o */*/.*.cmd */*/*.ko
