@@ -1,0 +1,21 @@
+From 0a292f5b8fd23c0862f2b9244e6ab889144d59a5 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 21 Oct 2026 18:34:08 +0800
+Subject: [PATCH] fix(build/dts): retain the CV181x BGA Wi-Fi SDIO node
+
+Keep wifisd available for the BF01 board-level override instead of deleting it in the common BGA include. Pinmux, reset GPIO and clock policy remain board-owned.
+---
+ boards/default/dts/cv181x/cv181x_asic_bga.dtsi | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/boards/default/dts/cv181x/cv181x_asic_bga.dtsi b/boards/default/dts/cv181x/cv181x_asic_bga.dtsi
+index f5521d0c97635dec348741b762aafd9b12e9325e..ae07672c3cdb64c0c9b12ee701b7b4633df76f64 100644
+--- a/boards/default/dts/cv181x/cv181x_asic_bga.dtsi
++++ b/boards/default/dts/cv181x/cv181x_asic_bga.dtsi
+@@ -1,6 +1,5 @@
+ 
+ / {
+-	/delete-node/ wifi-sd@4320000;
+ 	/delete-node/ i2s@04110000;
+ 	/delete-node/ i2s@04120000;
+ 	/delete-node/ sound_ext1;
