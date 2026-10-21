@@ -1,0 +1,24 @@
+From 57695f0e1869b803933e1487be8698cc533dc178 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 21 Oct 2026 18:34:15 +0800
+Subject: [PATCH] fix(osdrv/atbm6461): demote repetitive SDIO TX command
+ logging
+
+Replace the unconditional cmd free/used message with the existing debug-level logger. Leave transmit behavior and error logging unchanged.
+---
+ extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
+index 1e1374b01c5f1a6eddcb1bebe54372574f903a4f..f0d862f6469a1e47a6824f5d3a2ee1c0e5f7e380 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
+@@ -546,7 +546,7 @@ xmit_continue:
+ 
+ 		if(wsm_txed(hw_priv, data)){
+ 			need_confirm = data;
+-			atbm_printk_always("%s:cmd free(%d),used(%d)\n",__func__,hw_priv->hw_bufs_free,hw_priv->hw_bufs_used);
++			atbm_printk_debug("%s:cmd free(%d),used(%d)\n",__func__,hw_priv->hw_bufs_free,hw_priv->hw_bufs_used);
+ 			break;
+ 		}else if(skb != NULL){
+ 			need_confirm = NULL;
