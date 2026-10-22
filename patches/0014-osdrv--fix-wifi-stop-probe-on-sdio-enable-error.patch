@@ -1,0 +1,48 @@
+From 9fb25a848fc5bbd0ea78b5437cfd541b6527889f Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Thu, 22 Oct 2026 09:52:58 +0800
+Subject: [PATCH] fix(osdrv/wifi): stop probe after SDIO function-enable
+ failure
+
+Problem: core probe continues after SDIO function enable fails.
+Fix: check the result under the host-lock lifecycle and use a shared failure cleanup path.
+Prerequisite: driver feature 0009 only; diagnostics are optional.
+---
+ .../realtek/atbm6461/hal_apollo/apollo_sdio.c | 22 +++++++++++++------
+ 1 file changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+index cab0bd50ec747ee51f207f52b03c7f9a499a5da7..a63c22d1f20f0a0d810c9a54b76d675d683bed72 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+@@ -1318,2 +1318,7 @@ static int atbm_sdio_probe(struct sdio_func *func,
+ 	sdio_release_host(func);
++	if (status) {
++		atbm_printk_err("%s: enable function failed: %d\n", __func__, status);
++		goto err_disable;
++	}
++	atbm_printk_init("%s: SDIO function enabled\n", __func__);
+ 
+@@ -1327,9 +1332,3 @@ static int atbm_sdio_probe(struct sdio_func *func,
+ 	if (status) {
+-		sdio_claim_host(func);
+-		atbm_sdio_disable_func(func);
+-		sdio_release_host(func);
+-		atbm_sdio_set_drvdata(func, NULL);
+-		atbm_kfree(self);
+-		atomic_set(&g_wtd.wtd_probe, -1);
+-		//printk("[atbm_wtd]:set wtd_probe = -1\n");
++		goto err_disable;
+ 	}
+@@ -1344,2 +1343,11 @@ static int atbm_sdio_probe(struct sdio_func *func,
+ 	return status;
++
++err_disable:
++	sdio_claim_host(func);
++	atbm_sdio_disable_func(func);
++	sdio_release_host(func);
++	atbm_sdio_set_drvdata(func, NULL);
++	atbm_kfree(self);
++	atomic_set(&g_wtd.wtd_probe, -1);
++	return status;
+ }
