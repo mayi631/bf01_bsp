@@ -1,0 +1,133 @@
+From 29b44f7fce2976d3c447643c84044abe3510f300 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Thu, 22 Oct 2026 09:52:59 +0800
+Subject: [PATCH] feat(osdrv/wifi): add optional SDIO and WSM startup
+ diagnostics
+
+Keep related transport/startup observability together: first transfer failure and CCCR state, startup polling, IRQ/RX counters and read-error guarding.
+
+Prerequisite: driver feature 0009 only. This is not a prerequisite for module error handling, firmware timeout handling or the STA service. Patches use narrow context and are replay-tested with each optional fix/service omitted.
+---
+ .../realtek/atbm6461/hal_apollo/apollo_sdio.c | 80 ++++++++++++++++++-
+ 1 file changed, 77 insertions(+), 3 deletions(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+index a63c22d1f20f0a0d810c9a54b76d675d683bed72..54bcfe2e92c654a1ca12b9814f7ee26b685afa69 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+@@ -113,2 +113,8 @@ struct sbus_priv {
+ 	struct atbm_common	*core;
++#ifdef LINUX_OS
++	unsigned long io_error_logged;
++	atomic_t startup_irq_count;
++	atomic_t startup_rx_count;
++	unsigned int startup_poll_count;
++#endif
+ 	struct atbm_sdio_thread tx_thread;
+@@ -310,2 +316,4 @@ static int atbm_sdio_irq_period(struct atbm_sdio_thread *thread)
+ 	#ifdef LINUX_OS
++	int status;
++
+ 	printk_once("[atbm_log]:rx timeout\n");
+@@ -320,3 +328,15 @@ static int atbm_sdio_irq_period(struct atbm_sdio_thread *thread)
+ 	}
+-	atbm_bh_read_ctrl_reg_unlock(hw_priv, &ctrl_reg);	
++	status = atbm_bh_read_ctrl_reg_unlock(hw_priv, &ctrl_reg);
++	if (!hw_priv->wsm_caps.firmwareReady) {
++		self->startup_poll_count++;
++		if (self->startup_poll_count == 1 ||
++		    self->startup_poll_count % 33 == 0)
++			atbm_printk_err("WSM startup poll: ctrl=0x%04x err=%d polls=%u irqs=%d rx_runs=%d init_done=%d\n",
++				ctrl_reg, status, self->startup_poll_count,
++				atomic_read(&self->startup_irq_count),
++				atomic_read(&self->startup_rx_count),
++				hw_priv->init_done);
++	}
++	if (status)
++		goto exit;
+ 	if(ctrl_reg & ATBM_HIFREG_CONT_NEXT_LEN_MASK){
+@@ -400,2 +420,5 @@ static int atbm_sdio_rx_thread(void *priv)
+ 		#endif
++		#ifdef LINUX_OS
++		atomic_inc(&self->startup_rx_count);
++		#endif
+ 		atbm_sdio_rx_bh(self->core);
+@@ -699,2 +722,27 @@ static int atbm_sdio_rev_giveback(struct sbus_priv *self,void *giveback)
+ 
++#ifdef LINUX_OS
++static void atbm_sdio_log_io_error(struct sbus_priv *self,
++				 const char *operation, unsigned int addr,
++				 int count, int status)
++{
++	struct mmc_host *host = self->func->card->host;
++	unsigned char io_enable, io_ready, bus_interface;
++	int enable_status, ready_status, interface_status;
++
++	if (test_and_set_bit(0, &self->io_error_logged))
++		return;
++
++	atbm_printk_err("SDIO first failure: %s fn=%u addr=0x%x len=%d err=%d clock=%u width=%u timing=%u blksz=%u\n",
++		operation, self->func->num, addr, count, status,
++		host->ios.clock, host->ios.bus_width, host->ios.timing,
++		self->func->cur_blksize);
++	io_enable = sdio_f0_readb(self->func, SDIO_CCCR_IOEx, &enable_status);
++	io_ready = sdio_f0_readb(self->func, SDIO_CCCR_IORx, &ready_status);
++	bus_interface = sdio_f0_readb(self->func, SDIO_CCCR_IF, &interface_status);
++	atbm_printk_err("SDIO CMD52 state: IOEx=0x%02x err=%d IORx=0x%02x err=%d IF=0x%02x err=%d\n",
++		io_enable, enable_status, io_ready, ready_status,
++		bus_interface, interface_status);
++}
++#endif
++
+ static int atbm_sdio_memcpy_fromio(struct sbus_priv *self,
+@@ -703,2 +751,4 @@ static int atbm_sdio_memcpy_fromio(struct sbus_priv *self,
+ {
++	int ret;
++
+ 	if(is_pre_rmmod && (self->core->wsm_caps.firmwareVersion>=13549)){
+@@ -706,3 +756,8 @@ static int atbm_sdio_memcpy_fromio(struct sbus_priv *self,
+ 	}
+-	return sdio_memcpy_fromio(self->func, dst, addr, count);
++	ret = sdio_memcpy_fromio(self->func, dst, addr, count);
++#ifdef LINUX_OS
++	if (ret < 0)
++		atbm_sdio_log_io_error(self, "CMD53 read", addr, count, ret);
++#endif
++	return ret;
+ }
+@@ -713,2 +768,4 @@ static int atbm_sdio_memcpy_toio(struct sbus_priv *self,
+ {
++	int ret;
++
+ 	if(is_pre_rmmod && (self->core->wsm_caps.firmwareVersion>=13549)){
+@@ -716,3 +773,8 @@ static int atbm_sdio_memcpy_toio(struct sbus_priv *self,
+ 	}
+-	return sdio_memcpy_toio(self->func, addr, (void *)src, count);
++	ret = sdio_memcpy_toio(self->func, addr, (void *)src, count);
++#ifdef LINUX_OS
++	if (ret < 0)
++		atbm_sdio_log_io_error(self, "CMD53 write", addr, count, ret);
++#endif
++	return ret;
+ }
+@@ -748,2 +810,5 @@ static void atbm_sdio_irq_handler(struct sdio_func *func)
+ 	BUG_ON(!self);
++	#ifdef LINUX_OS
++	atomic_inc(&self->startup_irq_count);
++	#endif
+ 
+@@ -1314,2 +1379,6 @@ static int atbm_sdio_probe(struct sdio_func *func,
+ 	self->wtd = &g_wtd;
++	#ifdef LINUX_OS
++	atomic_set(&self->startup_irq_count, 0);
++	atomic_set(&self->startup_rx_count, 0);
++	#endif
+ 	atbm_sdio_set_drvdata(func, self);
+@@ -1317,2 +1386,7 @@ static int atbm_sdio_probe(struct sdio_func *func,
+ 	status = atbm_sdio_enable_func(func);
++#ifdef LINUX_OS
++	if (status)
++		atbm_sdio_log_io_error(self, "enable_func CMD52",
++				       SDIO_CCCR_IOEx, 1, status);
++#endif
+ 	sdio_release_host(func);
