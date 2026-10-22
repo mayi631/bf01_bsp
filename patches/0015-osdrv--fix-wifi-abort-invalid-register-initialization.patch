@@ -1,0 +1,72 @@
+From ad84154f8fa19a083e6f949f2c3d6bf0d1b67bf0 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Thu, 22 Oct 2026 09:52:58 +0800
+Subject: [PATCH] fix(osdrv/wifi): abort firmware setup on register-access
+ errors
+
+Problem: firmware-interface initialization continues after failed register accesses and can unsubscribe an IRQ that was not subscribed.
+Fix: return the original error and unwind only valid setup stages.
+Prerequisite: driver feature 0009 only.
+---
+ .../realtek/atbm6461/hal_apollo/hwio_sdio.c   | 31 +++++++++----------
+ 1 file changed, 15 insertions(+), 16 deletions(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/hwio_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/hwio_sdio.c
+index 62213fea9d46e4e55ae17cc43c56d72e4e3528ce..360ff19917ae0f09ef3c26b7ff3f4a63913a50f6 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/hwio_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/hwio_sdio.c
+@@ -1301,2 +1301,7 @@ int atbm_after_load_firmware(struct atbm_common *hw_priv)
+ 	ret=atbm_ahb_read_32(hw_priv,0x161000ac,&val32);
++	if (ret < 0) {
++		atbm_printk_err("%s: AHB read 0x161000ac failed: %d\n",
++			       __func__, ret);
++		goto out;
++	}
+ 	val32&=0xFFFFF7F8;
+@@ -1305,6 +1310,5 @@ int atbm_after_load_firmware(struct atbm_common *hw_priv)
+ 	if(ret<0){
+-		atbm_dbg(ATBM_APOLLO_DBG_ERROR,
+-			"%s: enable_irq: can't read " \
+-			"config register.\n", __func__);
+-
++		atbm_printk_err("%s: AHB write 0x161000ac failed: %d\n",
++			       __func__, ret);
++		goto out;
+ 	}
+@@ -1347,3 +1351,3 @@ int atbm_after_load_firmware(struct atbm_common *hw_priv)
+ 				"config register.\n", __func__);
+-			goto unsubscribe;
++			goto out;
+ 		}
+@@ -1358,3 +1362,3 @@ int atbm_after_load_firmware(struct atbm_common *hw_priv)
+ 				"config register.\n", __func__);
+-			goto unsubscribe;
++			goto out;
+ 		}
+@@ -1381,3 +1385,3 @@ int atbm_after_load_firmware(struct atbm_common *hw_priv)
+ 				__func__);
+-			goto unsubscribe;
++			goto out;
+ 		}
+@@ -1389,3 +1393,3 @@ int atbm_after_load_firmware(struct atbm_common *hw_priv)
+ 				__func__);
+-			goto unsubscribe;
++			goto out;
+ 		}
+@@ -1394,3 +1398,5 @@ int atbm_after_load_firmware(struct atbm_common *hw_priv)
+ 		mdelay(10);
+-		atbm_reg_read_32(hw_priv, ATBM_HIFREG_CONFIG_REG_ID, &val32);
++		ret = atbm_reg_read_32(hw_priv, ATBM_HIFREG_CONFIG_REG_ID, &val32);
++		if (ret < 0)
++			goto out;
+ 		
+@@ -1418,9 +1424,2 @@ int atbm_after_load_firmware(struct atbm_common *hw_priv)
+ 
+-	unsubscribe:
+-		hw_priv->sbus_ops->irq_unsubscribe(hw_priv->sbus_priv);
+-		return ret;
+-
+ }
+-
+-
+-
