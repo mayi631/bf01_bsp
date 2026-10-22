@@ -1,0 +1,32 @@
+From ff3494d4e7808996359bbdb1562629a0e5b2362a Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Thu, 22 Oct 2026 09:52:57 +0800
+Subject: [PATCH] fix(cvi_mpi/sample): declare GC4683 modes used by VI and ISP
+
+Problem: patch 0005 references sensor modes and an object missing from sensor_cfg.h.
+Fix: add the four mode declarations and conditional sensor object declaration.
+Prerequisite: existing GC4683 sample support (0005), not Wi-Fi patches.
+---
+ sample/common/sensor_cfg.h | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/sample/common/sensor_cfg.h b/sample/common/sensor_cfg.h
+index 86f37c8560d38495a8256f23ba3f7a77229e3679..5d6479a5f48454495a52fea0f8bcbe986e7ab1a7 100644
+--- a/sample/common/sensor_cfg.h
++++ b/sample/common/sensor_cfg.h
+@@ -54,2 +54,5 @@ typedef enum _SNS_TYPE_E {
+ 	GCORE_GC4663_MIPI_4M_30FPS_10BIT,
++	GCORE_GC4683_MIPI_4M_60FPS_10BIT,
++	GCORE_GC4683_MIPI_2M_60FPS_10BIT,
++	GCORE_GC4683_MIPI_1M_120FPS_10BIT,
+ 	OV_OG01A1B_MIPI_2M_30FPS_10BIT,
+@@ -111,2 +114,3 @@ typedef enum _SNS_TYPE_E {
+ 	GCORE_GC4663_MIPI_4M_30FPS_10BIT_WDR2TO1,
++	GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1,
+ 	SMS_SC285SL_MIPI_2M_30FPS_10BIT_WDR2TO1,
+@@ -168,2 +172,5 @@ extern ISP_SNS_OBJ_S stSnsGc4663_Obj;
+ #endif
++#if CONFIG_SENSOR_GCORE_GC4683
++extern ISP_SNS_OBJ_S stSnsGc4683_Obj;
++#endif
+ #if CONFIG_SENSOR_OV_OG01A1B
