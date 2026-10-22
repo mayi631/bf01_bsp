@@ -1,0 +1,39 @@
+From 4900141681ff3014219a1bf6cd197d114b912d63 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Thu, 22 Oct 2026 09:52:58 +0800
+Subject: [PATCH] fix(osdrv/wifi): stop unsupported RHEA reset retries on
+ timeout
+
+Problem: startup timeout enters unsupported CPU-reset retries against independently booted IoT firmware.
+Fix: capture timeout status and return ETIMEDOUT without resetting that firmware.
+Prerequisite: driver feature 0009 only; startup diagnostics are not required.
+---
+ .../realtek/atbm6461/hal_apollo/main.c        | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
+index e775d6306cfe93fb705b74d1154057e1f02f0f9c..d3f444cc913185c8cac134506c99a0d17d38c4ed 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
+@@ -1621,2 +1621,21 @@ __wait_start_up:
+ 				atbm_printk_init("wait_event_interruptible_timeout wsm_startup_done timeout ERROR !!\n");
++				#if (PROJ_TYPE == RHEA) && defined(LINUX_OS) && defined(SDIO_BUS)
++				{
++					u32 startup_control = 0;
++					u32 startup_config = 0;
++					int control_status, config_status;
++
++					hw_priv->sbus_ops->lock(hw_priv->sbus_priv);
++					control_status = atbm_reg_read_unlock_32(hw_priv,
++						ATBM_HIFREG_CONTROL_REG_ID, &startup_control);
++					config_status = atbm_reg_read_unlock_32(hw_priv,
++						ATBM_HIFREG_CONFIG_REG_ID, &startup_config);
++					hw_priv->sbus_ops->unlock(hw_priv->sbus_priv);
++					atbm_printk_err("WSM startup timeout: ctrl=0x%08x err=%d config=0x%08x err=%d; stop without unsupported CPU reset\n",
++						startup_control, control_status,
++						startup_config, config_status);
++				}
++				err = -ETIMEDOUT;
++				goto err3;
++				#endif
+ 				#if (ATBM_WIFI_PLATFORM == PLATFORM_ANKAI_RTOS)
