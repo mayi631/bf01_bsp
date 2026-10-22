@@ -1,0 +1,34 @@
+From d0455cb643fdc7ea68c94985da4ab542e5a31ce1 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Thu, 22 Oct 2026 09:52:58 +0800
+Subject: [PATCH] fix(osdrv/wifi): keep the BF01 supplicant driver loaded
+
+Problem: the vendor supplicant can automatically unload an always-powered BF01 module.
+Fix: disable auto-rmmod only for BF01 builds; preserve other platform defaults.
+Prerequisite: driver feature 0009 only; standalone STA service is not required.
+---
+ extdrv/wireless/realtek/atbm6461/tools/Makefile | 2 +-
+ extdrv/wireless/realtek/atbm6461/tools/tools.c  | 4 ++++
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/tools/Makefile b/extdrv/wireless/realtek/atbm6461/tools/Makefile
+index cb041199f3e2e6120b3d2a0e1d996354096861b1..51fcd5bd85ad4e394091f065467db3b97ab1b5e5 100644
+--- a/extdrv/wireless/realtek/atbm6461/tools/Makefile
++++ b/extdrv/wireless/realtek/atbm6461/tools/Makefile
+@@ -3,3 +3,3 @@ include cv181x.config
+ WIFI_INSTALL_DIR ?= driver_install
+-TOOL_CFLAGS := -Itools -Ihal_apollo -DARES_B=10 -DHERA=11 -DRHEA=12 -DEROS=13 -DPROJ_TYPE=RHEA
++TOOL_CFLAGS := -Itools -Ihal_apollo -DARES_B=10 -DHERA=11 -DRHEA=12 -DEROS=13 -DPROJ_TYPE=RHEA -DATBM_BF01_ALWAYS_ON
+ 
+diff --git a/extdrv/wireless/realtek/atbm6461/tools/tools.c b/extdrv/wireless/realtek/atbm6461/tools/tools.c
+index 4cd49405aac4da941607a2787571123034e3e6ef..1e9bf3e5318062221d407dee971f5a83551d9fac 100644
+--- a/extdrv/wireless/realtek/atbm6461/tools/tools.c
++++ b/extdrv/wireless/realtek/atbm6461/tools/tools.c
+@@ -114,3 +114,7 @@ static char ap_key_mgmt_set = 0;
+ static char driver_can_rmmod = 0;
++#ifdef ATBM_BF01_ALWAYS_ON
++static char rmmod_auto = 0;
++#else
+ static char rmmod_auto = 1;
++#endif
+ static char driver_switch = 0;
