@@ -1,0 +1,27 @@
+From 4b3450b733346d1b9d12ff740d94be55cfbecf7e Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Thu, 22 Oct 2026 09:52:58 +0800
+Subject: [PATCH] feat(build/wifi): add BF01 ATBM6461 driver selection
+
+Add the board-scoped ATBM6461 option and external-wireless selection.
+Companion: osdrv driver feature 0009 and BF01 board defconfig in the same BSP hardware-enablement commit.
+---
+ Kconfig | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/Kconfig b/Kconfig
+index c48b1206b3093a6cd13a4bdad623b83633d272c6..4f9465a64757a22d71282d60b367a7ddebb140b9 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -297,2 +297,11 @@ config CP_EXT_WIRELESS
+ 
++config ATBM6461_BF01
++	bool "Build ATBM6461 IoT SDIO driver and tools for BF01"
++	depends on BOARD_bf01_spinand
++	select CP_EXT_WIRELESS if FLASH_SIZE_SHRINK
++	default n
++	help
++	  Build the external ATBM6461 FullMAC SDIO module and vendor tools.
++	  BF01 keeps the module powered and uses SDIO in-band interrupts.
++
+ config NO_FB

@@ -1,0 +1,19 @@
+From 0eacd80ab08e39f8c92d836a6e513bf16205f3fb Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Thu, 22 Oct 2026 09:52:58 +0800
+Subject: [PATCH] fix(build/dts): preserve the CV181x Wi-Fi SDIO host
+
+Keep the common BGA wifisd node available for board-level enablement.
+Companion: BF01 DTS, reset hog, pinmux and network configuration in the same BSP hardware-enablement commit.
+---
+ boards/default/dts/cv181x/cv181x_asic_bga.dtsi | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/boards/default/dts/cv181x/cv181x_asic_bga.dtsi b/boards/default/dts/cv181x/cv181x_asic_bga.dtsi
+index f5521d0c97635dec348741b762aafd9b12e9325e..ae07672c3cdb64c0c9b12ee701b7b4633df76f64 100644
+--- a/boards/default/dts/cv181x/cv181x_asic_bga.dtsi
++++ b/boards/default/dts/cv181x/cv181x_asic_bga.dtsi
+@@ -2,3 +2,2 @@
+ / {
+-	/delete-node/ wifi-sd@4320000;
+ 	/delete-node/ i2s@04110000;
