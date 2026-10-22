@@ -1,0 +1,21 @@
+From b0e2a0588941d381780c08b4a189388245d77c09 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Thu, 22 Oct 2026 09:52:59 +0800
+Subject: [PATCH] fix(osdrv/wifi): demote repetitive SDIO TX buffer logging
+
+Problem: unconditional cmd free/used messages flood the console every second.
+Fix: use the existing debug logger without changing transmit behavior or error logging.
+Prerequisite: driver feature 0009 only.
+---
+ extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
+index 1e1374b01c5f1a6eddcb1bebe54372574f903a4f..f0d862f6469a1e47a6824f5d3a2ee1c0e5f7e380 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
+@@ -548,3 +548,3 @@ xmit_continue:
+ 			need_confirm = data;
+-			atbm_printk_always("%s:cmd free(%d),used(%d)\n",__func__,hw_priv->hw_bufs_free,hw_priv->hw_bufs_used);
++			atbm_printk_debug("%s:cmd free(%d),used(%d)\n",__func__,hw_priv->hw_bufs_free,hw_priv->hw_bufs_used);
+ 			break;
