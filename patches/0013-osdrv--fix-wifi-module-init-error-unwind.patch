@@ -1,0 +1,64 @@
+From 86d0c8305635cebfd4d1b894b90926261aff11da Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Thu, 22 Oct 2026 09:52:58 +0800
+Subject: [PATCH] fix(osdrv/wifi): unwind failed ATBM6461 module initialization
+
+Problem: failed attribute or SDIO driver initialization leaks resources or unregisters a driver that was never registered.
+Fix: propagate errors and unwind only the successfully initialized resources.
+Prerequisite: driver feature 0009 only; no diagnostics or STA service dependency.
+---
+ .../realtek/atbm6461/hal_apollo/apollo_sdio.c | 28 ++++++++++++++-----
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+index dd011374c29c9481a7fd0ab57fd8d5dccb46a155..cab0bd50ec747ee51f207f52b03c7f9a499a5da7 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+@@ -1540,3 +1540,3 @@ static int  atbm_sdio_init(void)
+ 	if (ret)
+-		goto err_reg;
++		goto err_power;
+ #if ((ATBM_WIFI_PLATFORM != PLATFORM_ANKAI_RTOS) && (ATBM_WIFI_PLATFORM != 10) && (ATBM_WIFI_PLATFORM != PLATFORM_AMLOGIC_S805)\
+@@ -1557,6 +1557,7 @@ static int  atbm_sdio_init(void)
+ err_on:
+-	if (pdata->power_ctrl)
+-		pdata->power_ctrl(pdata, false);
++	atbm_sdio_unregister_driver(&sdio_driver);
+ #endif
+ err_power:
++	if (pdata->power_ctrl)
++		pdata->power_ctrl(pdata, false);
+ 	if (pdata->clk_ctrl)
+@@ -1564,4 +1565,2 @@ err_power:
+ err_clk:
+-	atbm_sdio_unregister_driver(&sdio_driver);
+-err_reg:
+ 	return ret;
+@@ -1594,2 +1593,4 @@ int __init apollo_sdio_module_init(void)
+ {
++	int ret;
++
+ 	printk("\nDRIVER VER: %s.\n", PRIV_VERSION);
+@@ -1603,3 +1604,5 @@ int __init apollo_sdio_module_init(void)
+ 	ieee80211_atbm_skb_int();
+-	atbm_module_attribute_init();
++	ret = atbm_module_attribute_init();
++	if (ret)
++		goto err_attribute;
+ 	register_reboot_notifier(&atbm_reboot_nb);
+@@ -1609,3 +1612,14 @@ int __init apollo_sdio_module_init(void)
+ 	#endif
+-	return atbm_sdio_init();
++	ret = atbm_sdio_init();
++	if (!ret)
++		return 0;
++	atbm_release_firmware();
++	unregister_reboot_notifier(&atbm_reboot_nb);
++	atbm_module_attribute_exit();
++err_attribute:
++	atbm_ioctl_free();
++	rcu_barrier();
++	ieee80211_atbm_mem_exit();
++	ieee80211_atbm_skb_exit();
++	return ret;
+ }
