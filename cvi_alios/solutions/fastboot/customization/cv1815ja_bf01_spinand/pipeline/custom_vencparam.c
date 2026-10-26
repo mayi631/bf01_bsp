@@ -170,7 +170,35 @@ PARAM_CLASSDEFINE(PARAM_VENC_CHN_CFG_S,VENCCFG,CTX,VENC)[] = {
             .u8QpMapEn = CVI_FALSE, /* RW = , Range:[0, 1]  enable qpmap.*/
             .u8ChangePos = DEF_26X_CHANGE_POS, //VBR使用
         },
-    }
+    },
+    {
+        .stChnParam = {
+            .bEnable = 1,
+            .u8VencChn = 3,
+            .enBindMode = VENC_BIND_DISABLE,
+            .astChn[0] = {
+                .enModId = CVI_ID_VPSS,
+                .s32DevId = 1,
+                .s32ChnId = 0,
+            },
+            .astChn[1] = {
+                .enModId = CVI_ID_VENC,
+                .s32DevId = 0,
+                .s32ChnId = 3,
+            },
+            .u16Width = 2560,
+            .u16Height = 1440,
+            .u8EsBufQueueEn = 0,
+            .u16EnType = PT_JPEG,
+            .u32BitStreamBufSize = 4 * 1024 * 1024,
+            .StreamTo = 0x10,
+        },
+        .stRcParam = {
+            .u16RcMode = VENC_RC_MODE_MJPEGCBR,
+            .s16Quality = 85,
+            .s16MCUPerECS = 0,
+        },
+    },
 };
 
 PARAM_CLASSDEFINE(PARAM_ROI_PARAM_S,ROICFG,CTX,VENC)[] = {
@@ -188,7 +216,7 @@ PARAM_CLASSDEFINE(PARAM_ROI_PARAM_S,ROICFG,CTX,VENC)[] = {
 };
 
 PARAM_VENC_CFG_S  g_stVencCtx = {
-    .s32VencChnCnt = 3,
+    .s32VencChnCnt = 4,
     .pstVencChnCfg = PARAM_CLASS(VENCCFG,CTX,VENC),
     .s8RoiNumber = 0,
     .pstRoiParam = PARAM_CLASS(ROICFG,CTX,VENC),

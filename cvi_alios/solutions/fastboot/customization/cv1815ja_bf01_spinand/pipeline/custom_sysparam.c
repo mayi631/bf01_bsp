@@ -65,6 +65,14 @@ PARAM_CLASSDEFINE(PARAM_VB_CFG_S,VBPOOL,CTX,VB)[] = {
         .enCmpMode = COMPRESS_MODE_NONE,
         .u8VbBlkCnt = 4,
     },
+    {
+        .u16width = 2560,
+        .u16height = 1440,
+        .fmt = PIXEL_FORMAT_NV21,
+        .enBitWidth = DATA_BITWIDTH_8,
+        .enCmpMode = COMPRESS_MODE_NONE,
+        .u8VbBlkCnt = 3,
+    },
 };
 
 PARAM_SYS_CFG_S  g_stSysCtx = {
@@ -76,7 +84,7 @@ PARAM_SYS_CFG_S  g_stSysCtx = {
     .stSwitchCfg.bMipiSwitchPull = 1,
     .stSwitchCfg.u32SwitchPipe0 = 0,
     .stSwitchCfg.u32SwitchPipe1 = 3,
-    .u8VbPoolCnt = 4,
+    .u8VbPoolCnt = 5,
     .pstVbPool = PARAM_CLASS(VBPOOL,CTX,VB),
     .stVIVPSSMode.aenMode[0] = VI_OFFLINE_VPSS_OFFLINE,
     .stVIVPSSMode.aenMode[1] = VI_OFFLINE_VPSS_OFFLINE,
