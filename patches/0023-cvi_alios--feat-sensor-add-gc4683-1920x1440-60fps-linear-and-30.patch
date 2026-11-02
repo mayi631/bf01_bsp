@@ -1,0 +1,1307 @@
+From 1b8cece536ec1ee3ee9ac671dfacbc410024f073 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Sat, 31 Oct 2026 16:18:52 +0800
+Subject: [PATCH] feat(sensor): add gc4683 1920x1440 60fps linear and 30fps WDR
+ modes
+
+[description ]:
+- Add SNS_TYPE GCORE_GC4683_MIPI_3M_60FPS_10BIT and
+  GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1 to sensor_cfg with type names,
+  getSnsObj/getPicSize(1920x1440)/getDevAttr(BAYER_GR, disEnableSbm) entries.
+- Add GC4683_MODE_1920X1440P60 and GC4683_MODE_1920X1440P30_WDR with the
+  vendor register sequences release_liner_v4.0.0_01 (1920x1440 60fps raw10
+  linear) and release_raw10_hdr_v4.0.0_04 (1920x1440 30fps raw10 HDR),
+  VTS 1600 / HTS 550 for both modes.
+- Add the 1920x1440 AEC register tables (16-step linear, 14-step WDR LEF/SEF)
+  and gain tables from the vendor AEC files; select gain/register tables per
+  image mode instead of the fixed 2560x1440 tables, and take u32MaxAgain from
+  the mode table.
+- Reserve GC4683_1920X1440P30_WDR_SEXP_GUARD (80 lines) on the 3M WDR short
+  exposure limit (u16SexpMaxReg, stExp[0].u16Max, cmos_fps_set u32Sexp_MAX)
+  so the SEF readout ends at least 88 lines before the next SOF.
+- cmos_set_image_mode matches 1920x1440 before the 2560x1440 range check,
+  rejects fps outside the mode table, and refreshes u32FLStd/au32FL on mode
+  switch; cmos_set_wdr_mode maps 1920x1440 linear <-> WDR.
+- Behavior impact: BF01 (cv1815ja_bf01_spinand) can run GC4683 at
+  1920x1440 60fps linear or 1920x1440 30fps WDR2TO1 selected by SNS_TYPE;
+  existing 2560x1440/1080p/720p modes are unchanged.
+
+[root   cause]:
+- The driver only provided 2560x1440, 1920x1080 and 1280x720 sequences, so a
+  1920x1440 request fell into the 2560x1440 mode via GC4683_RES_IS_1440P and
+  the sensor streamed the wrong window; its AEC/gain tables also did not
+  match the vendor 1920x1440 release.
+- In 1920x1440 line-interleaved WDR the SEF readout trails the LEF by T1
+  lines; with Sexp_MAX = VTS - 1440 - 8 the SEF ends only 8 lines (~166 us
+  at 30fps) before the next SOF once AE reaches the limit. cv181x VI in HDR
+  mode requires equal FE ch0/ch1 frame counts before BE/Post; the late SEF
+  drops one ch1 frame, the counters never realign and
+  _vi_event_handler_thread times out permanently (stall after ~18 frames).
+
+[JIRA      ID]:CV180X181X-4655
+[chip project]:181x
+[side effects]:
+- Only the two new GC4683 modes and the shared table-selection helper are
+  affected; other GC4683 modes keep their original tables and limits.
+- Verified on BF01 hardware: 1920x1440 30fps WDR (VIDevFPS=VIFPS=30, FE
+  ch0/ch1/BE/Post in sync to 2354 frames) and 1920x1440 60fps linear
+  (VIFPS=60, 4718 frames), 0 vi_event_handler timeout, 0 frame-height
+  errors, 0 CSI errors, boot burst capture 3/3. Register sequences and AEC
+  tables verified against the vendor files item by item.
+- No new issues observed.
+
+[Affected *.ko/*.so/*.a] :yoc.bin (BF01 fastboot small-core image); no *.ko/*.so
+
+Change-Id: I64dae146b3b39ee191a9544e74d05c55fb221991
+---
+ .../cvi_sensor/gcore_gc4683/gc4683_cmos.c     | 199 ++++--
+ .../cvi_sensor/gcore_gc4683/gc4683_cmos_ex.h  |  28 +
+ .../gcore_gc4683/gc4683_cmos_param.h          | 117 ++++
+ .../gcore_gc4683/gc4683_sensor_ctl.c          | 608 ++++++++++++++++++
+ components/cvi_sensor/sensor_cfg/sensor_cfg.c |  15 +-
+ components/cvi_sensor/sensor_cfg/sensor_cfg.h |   2 +
+ 6 files changed, 923 insertions(+), 46 deletions(-)
+
+diff --git a/components/cvi_sensor/gcore_gc4683/gc4683_cmos.c b/components/cvi_sensor/gcore_gc4683/gc4683_cmos.c
+index b68074e153651bb3ea4be0b1ed194f2869b93116..be0de037c8ec4849a4a95f022659b4e45811714d 100644
+--- a/components/cvi_sensor/gcore_gc4683/gc4683_cmos.c
++++ b/components/cvi_sensor/gcore_gc4683/gc4683_cmos.c
+@@ -122,6 +122,7 @@ static CVI_S32 cmos_get_wdr_size(VI_PIPE ViPipe, ISP_SNS_ISP_INFO_S *pstIspCfg);
+ #define GC4683_RES_IS_1440P(w, h)      ((w) <= 2560 && (h) <= 1440)
+ #define GC4683_RES_IS_720P(w, h)      ((w) == 1280 && (h) == 720)
+ #define GC4683_RES_IS_1080P(w, h)	 ((w) == 1920 && (h) == 1080)
++#define GC4683_RES_IS_1920X1440(w, h) ((w) == 1920 && (h) == 1440)
+ 
+ static CVI_S32 cmos_get_ae_default(VI_PIPE ViPipe, AE_SENSOR_DEFAULT_S *pstAeSnsDft)
+ {
+@@ -163,7 +164,7 @@ static CVI_S32 cmos_get_ae_default(VI_PIPE ViPipe, AE_SENSOR_DEFAULT_S *pstAeSns
+ 		pstAeSnsDft->au8HistThresh[2] = 0x60;
+ 		pstAeSnsDft->au8HistThresh[3] = 0x80;
+ 
+-		pstAeSnsDft->u32MaxAgain = 149344;
++		pstAeSnsDft->u32MaxAgain = g_astGc4683_mode[pstSnsState->u8ImgMode].stAgain[0].u32Max;
+ 		pstAeSnsDft->u32MinAgain = 1024;
+ 		pstAeSnsDft->u32MaxAgainTarget = pstAeSnsDft->u32MaxAgain;
+ 		pstAeSnsDft->u32MinAgainTarget = pstAeSnsDft->u32MinAgain;
+@@ -274,6 +275,8 @@ static CVI_S32 cmos_fps_set(VI_PIPE ViPipe, CVI_FLOAT f32Fps, AE_SENSOR_DEFAULT_
+ 	if (pstSnsState->enWDRMode == WDR_MODE_2To1_LINE) {
+ 		GC4683_STATE_S *pstState = GC4683_STATE_GET_CTX(ViPipe);
+ 		pstState->u32Sexp_MAX = u32VMAX - 1440 - 8;
++		if (pstSnsState->u8ImgMode == GC4683_MODE_1920X1440P30_WDR)
++			pstState->u32Sexp_MAX -= GC4683_1920X1440P30_WDR_SEXP_GUARD;
+ 	}
+ 
+ 	pstAeSnsDft->f32Fps = f32Fps;
+@@ -410,10 +413,93 @@ static CVI_U32 gain_table_wdr[14] = {
+ };
+ 
+ 
++/* Supplier AEC tables for the 1920x1440 modes; gains use the ISP 1024 scale. */
++
++static const CVI_U32 regValTable_linear_1920x1440[16][9] = {
++	{0x00, 0x02, 0x00, 0x03, 0xe0, 0x23, 0x23, 0x01, 0x00},
++	{0x00, 0x03, 0x00, 0x03, 0xe0, 0x24, 0x24, 0x01, 0x18},
++	{0x00, 0x00, 0x01, 0x03, 0xe8, 0x29, 0x29, 0x02, 0x04},
++	{0x00, 0x00, 0x00, 0x00, 0xe0, 0x23, 0x23, 0x02, 0x27},
++	{0x00, 0x01, 0x00, 0x00, 0xe0, 0x23, 0x23, 0x03, 0x28},
++	{0x00, 0x02, 0x00, 0x00, 0xe0, 0x23, 0x23, 0x05, 0x08},
++	{0x00, 0x03, 0x00, 0x00, 0xe0, 0x24, 0x24, 0x07, 0x04},
++	{0x00, 0x00, 0x01, 0x00, 0xe8, 0x29, 0x29, 0x0A, 0x27},
++	{0x00, 0x01, 0x01, 0x00, 0xe8, 0x2a, 0x2a, 0x0E, 0x2D},
++	{0x00, 0x02, 0x01, 0x00, 0xe8, 0x2b, 0x2b, 0x14, 0x2F},
++	{0x00, 0x03, 0x01, 0x00, 0xe8, 0x2c, 0x2c, 0x1C, 0x24},
++	{0x00, 0x04, 0x01, 0x00, 0xe8, 0x2e, 0x2e, 0x27, 0x3D},
++	{0x00, 0x05, 0x01, 0x00, 0xe8, 0x30, 0x30, 0x36, 0x12},
++	{0x00, 0x06, 0x01, 0x00, 0xe8, 0x32, 0x32, 0x4A, 0x16},
++	{0x04, 0xb6, 0x01, 0x00, 0xe8, 0x34, 0x34, 0x68, 0x22},
++	{0x08, 0x06, 0x01, 0x00, 0xe8, 0x37, 0x37, 0x93, 0x28},
++};
++
++static const CVI_U32 regValTable_WDR_LEF_1920x1440[14][8] = {
++	{0x00, 0x02, 0x00, 0x03, 0x23, 0x23, 0x01, 0x00},
++	{0x00, 0x03, 0x00, 0x03, 0x24, 0x24, 0x01, 0x18},
++	{0x00, 0x00, 0x01, 0x03, 0x29, 0x29, 0x02, 0x04},
++	{0x00, 0x00, 0x00, 0x00, 0x23, 0x23, 0x02, 0x27},
++	{0x00, 0x01, 0x00, 0x00, 0x23, 0x23, 0x03, 0x28},
++	{0x00, 0x02, 0x00, 0x00, 0x23, 0x23, 0x05, 0x08},
++	{0x00, 0x03, 0x00, 0x00, 0x24, 0x24, 0x07, 0x04},
++	{0x00, 0x00, 0x01, 0x00, 0x29, 0x29, 0x0A, 0x27},
++	{0x00, 0x01, 0x01, 0x00, 0x2a, 0x2a, 0x0E, 0x2D},
++	{0x00, 0x02, 0x01, 0x00, 0x2b, 0x2b, 0x14, 0x2F},
++	{0x00, 0x03, 0x01, 0x00, 0x2c, 0x2c, 0x1C, 0x24},
++	{0x00, 0x04, 0x01, 0x00, 0x2e, 0x2e, 0x27, 0x3D},
++	{0x00, 0x05, 0x01, 0x00, 0x30, 0x30, 0x36, 0x12},
++	{0x00, 0x06, 0x01, 0x00, 0x32, 0x32, 0x4A, 0x16},
++};
++
++static const CVI_U32 regValTable_WDR_SEF_1920x1440[14][7] = {
++	{0x00, 0x02, 0x33, 0x23, 0x23, 0x01, 0x00},
++	{0x00, 0x03, 0x33, 0x24, 0x24, 0x01, 0x18},
++	{0x10, 0x00, 0x33, 0x29, 0x29, 0x02, 0x04},
++	{0x00, 0x00, 0x30, 0x23, 0x23, 0x02, 0x27},
++	{0x00, 0x01, 0x30, 0x23, 0x23, 0x03, 0x28},
++	{0x00, 0x02, 0x30, 0x23, 0x23, 0x05, 0x08},
++	{0x00, 0x03, 0x30, 0x24, 0x24, 0x07, 0x04},
++	{0x10, 0x00, 0x30, 0x29, 0x29, 0x0A, 0x27},
++	{0x10, 0x01, 0x30, 0x2a, 0x2a, 0x0E, 0x2D},
++	{0x10, 0x02, 0x30, 0x2b, 0x2b, 0x14, 0x2F},
++	{0x10, 0x03, 0x30, 0x2c, 0x2c, 0x1C, 0x24},
++	{0x10, 0x04, 0x30, 0x2e, 0x2e, 0x27, 0x3D},
++	{0x10, 0x05, 0x30, 0x30, 0x30, 0x36, 0x12},
++	{0x10, 0x06, 0x30, 0x32, 0x32, 0x4A, 0x16},
++};
++
++static const CVI_U32 gain_table_1920x1440[16] = {
++	1024, 1408, 2112, 2688, 3728, 5264, 7248, 10864,
++	15056, 21248, 29248, 40928, 55584, 76144, 107056, 151168
++};
++
++static const CVI_U32 gain_table_wdr_1920x1440[14] = {
++	1024, 1392, 1968, 2704, 3696, 5216, 7184,
++	10944, 14928, 20928, 28864, 40624, 55504, 76080
++};
++
++static const CVI_U32 *gc4683_get_gain_table(const ISP_SNS_STATE_S *pstSnsState, int *total)
++{
++	if (pstSnsState->u8ImgMode == GC4683_MODE_1920X1440P60) {
++		*total = sizeof(gain_table_1920x1440) / sizeof(CVI_U32);
++		return gain_table_1920x1440;
++	}
++	if (pstSnsState->u8ImgMode == GC4683_MODE_1920X1440P30_WDR) {
++		*total = sizeof(gain_table_wdr_1920x1440) / sizeof(CVI_U32);
++		return gain_table_wdr_1920x1440;
++	}
++	if (pstSnsState->enWDRMode == WDR_MODE_2To1_LINE) {
++		*total = sizeof(gain_table_wdr) / sizeof(CVI_U32);
++		return gain_table_wdr;
++	}
++	*total = sizeof(gain_table) / sizeof(CVI_U32);
++	return gain_table;
++}
++
+ static CVI_S32 cmos_again_calc_table(VI_PIPE ViPipe, CVI_U32 *pu32AgainLin, CVI_U32 *pu32AgainDb)
+ {
+ 	ISP_SNS_STATE_S *pstSnsState = CVI_NULL;
+-	CVI_U32 *table;
++	const CVI_U32 *table;
+ 	int i, total;
+ 	CVI_U32 pregain;
+ 
+@@ -423,13 +509,7 @@ static CVI_S32 cmos_again_calc_table(VI_PIPE ViPipe, CVI_U32 *pu32AgainLin, CVI_
+ 	GC4683_SENSOR_GET_CTX(ViPipe, pstSnsState);
+ 	CMOS_CHECK_POINTER(pstSnsState);
+ 
+-	if (pstSnsState->enWDRMode == WDR_MODE_2To1_LINE) {
+-		table = gain_table_wdr;
+-		total = sizeof(gain_table_wdr) / sizeof(CVI_U32);
+-	} else {
+-		table = gain_table;
+-		total = sizeof(gain_table) / sizeof(CVI_U32);
+-	}
++	table = gc4683_get_gain_table(pstSnsState, &total);
+ 
+ 	if (*pu32AgainLin >= table[total - 1]) {
+ 		*pu32AgainLin = *pu32AgainDb = table[total - 1];
+@@ -473,27 +553,36 @@ static CVI_S32 cmos_gains_update(VI_PIPE ViPipe, CVI_U32 *pu32Again, CVI_U32 *pu
+ 	CVI_U32 u32Again;
+ 	CVI_U32 u32Dgain;
+ 	int i, total;
++	const CVI_U32 *gainTable;
+ 
+ 	GC4683_SENSOR_GET_CTX(ViPipe, pstSnsState);
+ 	CMOS_CHECK_POINTER(pstSnsState);
+ 	CMOS_CHECK_POINTER(pu32Again);
+ 	CMOS_CHECK_POINTER(pu32Dgain);
+ 	pstSnsRegsInfo = &pstSnsState->astSyncInfo[0].snsCfg;
++	gainTable = gc4683_get_gain_table(pstSnsState, &total);
+ 
+ 	if (pstSnsState->enWDRMode == WDR_MODE_2To1_LINE) {
+-		int total_wdr = sizeof(gain_table_wdr) / sizeof(CVI_U32);
++		int total_wdr = total;
++		const CVI_U32 (*regTableLE)[8] = regValTable_WDR_LEF;
++		const CVI_U32 (*regTableSE)[7] = regValTable_WDR_SEF;
+ 		CVI_U32 u32Again_SE, u32Again_LE;
+ 		CVI_U32 u32Dgain_SE, u32Dgain_LE;
+ 
++		if (pstSnsState->u8ImgMode == GC4683_MODE_1920X1440P30_WDR) {
++			regTableLE = regValTable_WDR_LEF_1920x1440;
++			regTableSE = regValTable_WDR_SEF_1920x1440;
++		}
++
+ 		/* Short exposure gain - index 0 */
+ 		u32Again_SE = pu32Again[0];
+-		if (u32Again_SE < gain_table_wdr[total_wdr - 1]) {
++		if (u32Again_SE < gainTable[total_wdr - 1]) {
+ 			for (i = 1; i < total_wdr; i++) {
+-				if (u32Again_SE < gain_table_wdr[i])
++				if (u32Again_SE < gainTable[i])
+ 					break;
+ 			}
+ 			i--;
+-			u32Dgain_SE = (u32Again_SE * 1024) / gain_table_wdr[i];
++			u32Dgain_SE = (u32Again_SE * 1024) / gainTable[i];
+ 			u32Again_SE = i;
+ 		} else {
+ 			u32Again_SE = total_wdr - 1;
+@@ -503,13 +592,13 @@ static CVI_S32 cmos_gains_update(VI_PIPE ViPipe, CVI_U32 *pu32Again, CVI_U32 *pu
+ 		if (u16Mode == SNS_GAIN_MODE_WDR_2F) {
+ 			/* Long exposure gain - index 1 */
+ 			u32Again_LE = pu32Again[1];
+-			if (u32Again_LE < gain_table_wdr[total_wdr - 1]) {
++			if (u32Again_LE < gainTable[total_wdr - 1]) {
+ 				for (i = 1; i < total_wdr; i++) {
+-					if (u32Again_LE < gain_table_wdr[i])
++					if (u32Again_LE < gainTable[i])
+ 						break;
+ 				}
+ 				i--;
+-				u32Dgain_LE = (u32Again_LE * 1024) / gain_table_wdr[i];
++				u32Dgain_LE = (u32Again_LE * 1024) / gainTable[i];
+ 				u32Again_LE = i;
+ 			} else {
+ 				u32Again_LE = total_wdr - 1;
+@@ -522,55 +611,58 @@ static CVI_S32 cmos_gains_update(VI_PIPE ViPipe, CVI_U32 *pu32Again, CVI_U32 *pu
+ 		}
+ 
+ 		/* LE analog gain */
+-		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_H].u32Data = regValTable_WDR_LEF[u32Again_LE][0];
+-		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_L].u32Data = regValTable_WDR_LEF[u32Again_LE][1];
+-		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_PGA].u32Data = regValTable_WDR_LEF[u32Again_LE][2];
+-		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_MAG1].u32Data = regValTable_WDR_LEF[u32Again_LE][3];
+-		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_MAG2].u32Data = regValTable_WDR_LEF[u32Again_LE][4];
+-		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_MAG3].u32Data = regValTable_WDR_LEF[u32Again_LE][5];
+-		pstSnsRegsInfo->astI2cData[WDR2_LCOL_AGAIN_H].u32Data = regValTable_WDR_LEF[u32Again_LE][6];
+-		pstSnsRegsInfo->astI2cData[WDR2_LCOL_AGAIN_L].u32Data = regValTable_WDR_LEF[u32Again_LE][7];
++		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_H].u32Data = regTableLE[u32Again_LE][0];
++		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_L].u32Data = regTableLE[u32Again_LE][1];
++		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_PGA].u32Data = regTableLE[u32Again_LE][2];
++		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_MAG1].u32Data = regTableLE[u32Again_LE][3];
++		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_MAG2].u32Data = regTableLE[u32Again_LE][4];
++		pstSnsRegsInfo->astI2cData[WDR2_LAGAIN_MAG3].u32Data = regTableLE[u32Again_LE][5];
++		pstSnsRegsInfo->astI2cData[WDR2_LCOL_AGAIN_H].u32Data = regTableLE[u32Again_LE][6];
++		pstSnsRegsInfo->astI2cData[WDR2_LCOL_AGAIN_L].u32Data = regTableLE[u32Again_LE][7];
+ 		/* LE digital gain */
+ 		pstSnsRegsInfo->astI2cData[WDR2_LDGAIN_H].u32Data = (u32Dgain_LE >> 8);
+ 		pstSnsRegsInfo->astI2cData[WDR2_LDGAIN_L].u32Data = (u32Dgain_LE & 0xFF);
+ 
+ 		/* SE analog gain */
+-		pstSnsRegsInfo->astI2cData[WDR2_SAGAIN_H].u32Data = regValTable_WDR_SEF[u32Again_SE][0];
+-		pstSnsRegsInfo->astI2cData[WDR2_SAGAIN_L].u32Data = regValTable_WDR_SEF[u32Again_SE][1];
+-		pstSnsRegsInfo->astI2cData[WDR2_SAGAIN_MAG1].u32Data = regValTable_WDR_SEF[u32Again_SE][2];
+-		pstSnsRegsInfo->astI2cData[WDR2_SAGAIN_MAG2].u32Data = regValTable_WDR_SEF[u32Again_SE][3];
+-		pstSnsRegsInfo->astI2cData[WDR2_SAGAIN_MAG3].u32Data = regValTable_WDR_SEF[u32Again_SE][4];
+-		pstSnsRegsInfo->astI2cData[WDR2_SCOL_AGAIN_H].u32Data = regValTable_WDR_SEF[u32Again_SE][5];
+-		pstSnsRegsInfo->astI2cData[WDR2_SCOL_AGAIN_L].u32Data = regValTable_WDR_SEF[u32Again_SE][6];
++		pstSnsRegsInfo->astI2cData[WDR2_SAGAIN_H].u32Data = regTableSE[u32Again_SE][0];
++		pstSnsRegsInfo->astI2cData[WDR2_SAGAIN_L].u32Data = regTableSE[u32Again_SE][1];
++		pstSnsRegsInfo->astI2cData[WDR2_SAGAIN_MAG1].u32Data = regTableSE[u32Again_SE][2];
++		pstSnsRegsInfo->astI2cData[WDR2_SAGAIN_MAG2].u32Data = regTableSE[u32Again_SE][3];
++		pstSnsRegsInfo->astI2cData[WDR2_SAGAIN_MAG3].u32Data = regTableSE[u32Again_SE][4];
++		pstSnsRegsInfo->astI2cData[WDR2_SCOL_AGAIN_H].u32Data = regTableSE[u32Again_SE][5];
++		pstSnsRegsInfo->astI2cData[WDR2_SCOL_AGAIN_L].u32Data = regTableSE[u32Again_SE][6];
+ 		/* SE digital gain */
+ 		pstSnsRegsInfo->astI2cData[WDR2_SDGAIN_H].u32Data = (u32Dgain_SE >> 8);
+ 		pstSnsRegsInfo->astI2cData[WDR2_SDGAIN_L].u32Data = (u32Dgain_SE & 0xFF);
+ 	} else if (pstSnsState->enWDRMode == WDR_MODE_NONE) {
+-		total = sizeof(gain_table) / sizeof(CVI_U32);
++		const CVI_U32 (*regTable)[9] = regValTable_linear;
++
++		if (pstSnsState->u8ImgMode == GC4683_MODE_1920X1440P60)
++			regTable = regValTable_linear_1920x1440;
+ 
+ 		u32Again = pu32Again[0];
+-		if (u32Again < (149344)) {
++		if (u32Again < gainTable[total - 1]) {
+ 			for (i = 1; i < total; i++) {
+-				if (*pu32Again < gain_table[i])
++				if (*pu32Again < gainTable[i])
+ 					break;
+ 			}
+ 			i--;
+-			u32Dgain = (u32Again * 1024) / gain_table[i];
++			u32Dgain = (u32Again * 1024) / gainTable[i];
+ 			u32Again = i;
+ 		} else {
+ 			u32Again = total - 1;
+ 			u32Dgain = pu32Dgain[0];
+ 		}
+ 
+-		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_H].u32Data = regValTable_linear[u32Again][0];
+-		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_L].u32Data = regValTable_linear[u32Again][1];
+-		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_PGA].u32Data = regValTable_linear[u32Again][2];
+-		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_MAG1].u32Data = regValTable_linear[u32Again][3];
+-		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_MAG2].u32Data = regValTable_linear[u32Again][4];
+-		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_MAG3].u32Data = regValTable_linear[u32Again][5];
+-		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_MAG4].u32Data = regValTable_linear[u32Again][6];
+-		pstSnsRegsInfo->astI2cData[LINEAR_COL_AGAIN_H].u32Data = regValTable_linear[u32Again][7];
+-		pstSnsRegsInfo->astI2cData[LINEAR_COL_AGAIN_L].u32Data = regValTable_linear[u32Again][8];
++		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_H].u32Data = regTable[u32Again][0];
++		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_L].u32Data = regTable[u32Again][1];
++		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_PGA].u32Data = regTable[u32Again][2];
++		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_MAG1].u32Data = regTable[u32Again][3];
++		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_MAG2].u32Data = regTable[u32Again][4];
++		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_MAG3].u32Data = regTable[u32Again][5];
++		pstSnsRegsInfo->astI2cData[LINEAR_AGAIN_MAG4].u32Data = regTable[u32Again][6];
++		pstSnsRegsInfo->astI2cData[LINEAR_COL_AGAIN_H].u32Data = regTable[u32Again][7];
++		pstSnsRegsInfo->astI2cData[LINEAR_COL_AGAIN_L].u32Data = regTable[u32Again][8];
+ 
+ 		pstSnsRegsInfo->astI2cData[LINEAR_DGAIN_H].u32Data = (u32Dgain >> 8);
+ 		pstSnsRegsInfo->astI2cData[LINEAR_DGAIN_L].u32Data = (u32Dgain & 0xFF);
+@@ -738,6 +830,8 @@ static CVI_S32 cmos_set_wdr_mode(VI_PIPE ViPipe, CVI_U8 u8Mode)
+ 	case WDR_MODE_NONE:
+ 		if (pstSnsState->u8ImgMode == GC4683_MODE_2560X1440P30_WDR)
+ 			pstSnsState->u8ImgMode = GC4683_MODE_2560X1440P60;
++		else if (pstSnsState->u8ImgMode == GC4683_MODE_1920X1440P30_WDR)
++			pstSnsState->u8ImgMode = GC4683_MODE_1920X1440P60;
+ 		pstSnsState->enWDRMode = WDR_MODE_NONE;
+ 		pstSnsState->u32FLStd = g_astGc4683_mode[pstSnsState->u8ImgMode].u32VtsDef;
+ 		CVI_TRACE_SNS(CVI_DBG_INFO, "WDR_MODE_NONE\n");
+@@ -746,6 +840,8 @@ static CVI_S32 cmos_set_wdr_mode(VI_PIPE ViPipe, CVI_U8 u8Mode)
+ 	case WDR_MODE_2To1_LINE:
+ 		if (pstSnsState->u8ImgMode == GC4683_MODE_2560X1440P60)
+ 			pstSnsState->u8ImgMode = GC4683_MODE_2560X1440P30_WDR;
++		else if (pstSnsState->u8ImgMode == GC4683_MODE_1920X1440P60)
++			pstSnsState->u8ImgMode = GC4683_MODE_1920X1440P30_WDR;
+ 		pstSnsState->enWDRMode = WDR_MODE_2To1_LINE;
+ 		pstSnsState->u32FLStd = g_astGc4683_mode[pstSnsState->u8ImgMode].u32VtsDef;
+ 		break;
+@@ -976,6 +1072,8 @@ static CVI_S32 cmos_set_image_mode(VI_PIPE ViPipe, ISP_CMOS_SENSOR_IMAGE_MODE_S
+ 		if (pstSnsState->enWDRMode == WDR_MODE_NONE) {
+ 			if (GC4683_RES_IS_1080P(pstSensorImageMode->u16Width, pstSensorImageMode->u16Height)) {
+ 				u8SensorImageMode = GC4683_MODE_1080P60;
++			} else if (GC4683_RES_IS_1920X1440(pstSensorImageMode->u16Width, pstSensorImageMode->u16Height)) {
++				u8SensorImageMode = GC4683_MODE_1920X1440P60;
+ 			} else if (GC4683_RES_IS_1440P(pstSensorImageMode->u16Width, pstSensorImageMode->u16Height)) {
+ 				u8SensorImageMode = GC4683_MODE_2560X1440P60;
+ 			} else {
+@@ -987,7 +1085,9 @@ static CVI_S32 cmos_set_image_mode(VI_PIPE ViPipe, ISP_CMOS_SENSOR_IMAGE_MODE_S
+ 				return CVI_FAILURE;
+ 			}
+ 		} else if (pstSnsState->enWDRMode == WDR_MODE_2To1_LINE) {
+-			if (GC4683_RES_IS_1440P(pstSensorImageMode->u16Width, pstSensorImageMode->u16Height)) {
++			if (GC4683_RES_IS_1920X1440(pstSensorImageMode->u16Width, pstSensorImageMode->u16Height)) {
++				u8SensorImageMode = GC4683_MODE_1920X1440P30_WDR;
++			} else if (GC4683_RES_IS_1440P(pstSensorImageMode->u16Width, pstSensorImageMode->u16Height)) {
+ 				u8SensorImageMode = GC4683_MODE_2560X1440P30_WDR;
+ 			} else {
+ 				CVI_TRACE_SNS(CVI_DBG_ERR, "Not support! Width:%d, Height:%d, Fps:%f, WDRMode:%d\n",
+@@ -1020,12 +1120,21 @@ static CVI_S32 cmos_set_image_mode(VI_PIPE ViPipe, ISP_CMOS_SENSOR_IMAGE_MODE_S
+ 
+ 	}
+ 
++	if (pstSensorImageMode->f32Fps <= 0 ||
++	    pstSensorImageMode->f32Fps > g_astGc4683_mode[u8SensorImageMode].f32MaxFps) {
++		CVI_TRACE_SNS(CVI_DBG_ERR, "Not support this Fps:%f\n", pstSensorImageMode->f32Fps);
++		return CVI_FAILURE;
++	}
++
+ 	if ((pstSnsState->bInit == CVI_TRUE) && (u8SensorImageMode == pstSnsState->u8ImgMode)) {
+ 		/* Don't need to switch SensorImageMode */
+ 		return CVI_FAILURE;
+ 	}
+ 
+ 	pstSnsState->u8ImgMode = u8SensorImageMode;
++	pstSnsState->u32FLStd = g_astGc4683_mode[u8SensorImageMode].u32VtsDef;
++	pstSnsState->au32FL[0] = pstSnsState->u32FLStd;
++	pstSnsState->au32FL[1] = pstSnsState->u32FLStd;
+ 
+ 	return CVI_SUCCESS;
+ }
+diff --git a/components/cvi_sensor/gcore_gc4683/gc4683_cmos_ex.h b/components/cvi_sensor/gcore_gc4683/gc4683_cmos_ex.h
+index 3be6aa70d8003be9ad4d6f1995ef8b770317b273..1acf35c16764a81474264af2d923ee6593c05692 100644
+--- a/components/cvi_sensor/gcore_gc4683/gc4683_cmos_ex.h
++++ b/components/cvi_sensor/gcore_gc4683/gc4683_cmos_ex.h
+@@ -74,11 +74,39 @@ typedef enum _GC4683_MODE_E {
+ 	GC4683_MODE_2560X1440P60 = 0,
+ 	GC4683_MODE_1080P60,
+ 	GC4683_MODE_1280X720P120,
++	GC4683_MODE_1920X1440P60,
+ 	GC4683_MODE_LINEAR_NUM,
+ 	GC4683_MODE_2560X1440P30_WDR = GC4683_MODE_LINEAR_NUM,
++	GC4683_MODE_1920X1440P30_WDR,
+ 	GC4683_MODE_NUM
+ } GC4683_MODE_E;
+ 
++/*
++ * 1920x1440 WDR timing. HTS must stay at the vendor value 550 (HB < 550 breaks
++ * the 2568-wide readout, see project/bf01/debug/gc4683-wdr-1920x1440-20261030).
++ * VTS is the frame length at the nominal 30 fps; cmos_fps_set scales it by
++ * 30 / s32Framerate, so raising VTS lowers the real frame rate (48000 / VTS_reg).
++ */
++#define GC4683_1920X1440P30_WDR_VTS 1600U
++#define GC4683_1920X1440P30_WDR_HTS 550U
++/*
++ * Short-exposure guard (lines). The SEF readout trails the LEF by T1, so with
++ * T1 = VTS - 1440 - 8 the SEF frame ends only 8 lines (~166 us @ 30 fps) before
++ * the next SOF and the ISP FE/BE HDR hand-off loses the SEF frame (FE ch0/ch1
++ * frame counters diverge, event thread times out forever). Reserve extra lines
++ * so the SEF always finishes >= (8 + GUARD) lines before the next frame.
++ */
++#define GC4683_1920X1440P30_WDR_SEXP_GUARD 80U
++#define GC4683_1920X1440P30_WDR_SEXP_MAX \
++	(GC4683_1920X1440P30_WDR_VTS - 1440U - 8U - GC4683_1920X1440P30_WDR_SEXP_GUARD)
++
++#if GC4683_1920X1440P30_WDR_VTS <= 1440U + 8U + GC4683_1920X1440P30_WDR_SEXP_GUARD || \
++	GC4683_1920X1440P30_WDR_VTS > 16383U || \
++	GC4683_1920X1440P30_WDR_HTS == 0U || \
++	GC4683_1920X1440P30_WDR_HTS > 65535U
++#error "GC4683 1920x1440 WDR timing exceeds register or exposure limits"
++#endif
++
+ typedef struct _GC4683_STATE_S {
+ 	CVI_U32		u32Sexp_MAX;
+ } GC4683_STATE_S;
+diff --git a/components/cvi_sensor/gcore_gc4683/gc4683_cmos_param.h b/components/cvi_sensor/gcore_gc4683/gc4683_cmos_param.h
+index 7094d92f11777a059137f063bbe98a540b0564bb..b08d57cd5406a3baecbe2a750a1fe6bff3fc64de 100644
+--- a/components/cvi_sensor/gcore_gc4683/gc4683_cmos_param.h
++++ b/components/cvi_sensor/gcore_gc4683/gc4683_cmos_param.h
+@@ -136,6 +136,47 @@ static const GC4683_MODE_S g_astGc4683_mode[GC4683_MODE_NUM] = {
+ 			.u32Step = 64,
+ 		},
+ 	},
++	[GC4683_MODE_1920X1440P60] = {
++		.name = "1920x1440P60",
++		.astImg[0] = {
++			.stSnsSize = {
++				.u32Width = 1920,
++				.u32Height = 1440,
++			},
++			.stWndRect = {
++				.s32X = 0,
++				.s32Y = 0,
++				.u32Width = 1920,
++				.u32Height = 1440,
++			},
++			.stMaxSize = {
++				.u32Width = 1920,
++				.u32Height = 1440,
++			},
++		},
++		.f32MaxFps = 60,
++		.f32MinFps = 5.86, /* 1600 * 60 / 16383 */
++		.u32HtsDef = 550,
++		.u32VtsDef = 1600,
++		.stExp[0] = {
++			.u16Min = 1,
++			.u16Max = 1600 - 8,
++			.u16Def = 256,
++			.u16Step = 1,
++		},
++		.stAgain[0] = {
++			.u32Min = 1024,
++			.u32Max = 151168,
++			.u32Def = 1024,
++			.u32Step = 1,
++		},
++		.stDgain[0] = {
++			.u32Min = 1024,
++			.u32Max = 16368,
++			.u32Def = 1024,
++			.u32Step = 64,
++		},
++	},
+ 	[GC4683_MODE_2560X1440P30_WDR] = {
+ 		.name = "2560x1440P30WDR",
+ 		.astImg[0] = {
+@@ -212,6 +253,82 @@ static const GC4683_MODE_S g_astGc4683_mode[GC4683_MODE_NUM] = {
+ 			.u32Step = 64,
+ 		},
+ 	},
++	[GC4683_MODE_1920X1440P30_WDR] = {
++		.name = "1920x1440P30WDR",
++		.astImg[0] = {
++			.stSnsSize = {
++				.u32Width = 1920,
++				.u32Height = 1440,
++			},
++			.stWndRect = {
++				.s32X = 0,
++				.s32Y = 0,
++				.u32Width = 1920,
++				.u32Height = 1440,
++			},
++			.stMaxSize = {
++				.u32Width = 1920,
++				.u32Height = 1440,
++			},
++		},
++		.astImg[1] = {
++			.stSnsSize = {
++				.u32Width = 1920,
++				.u32Height = 1440,
++			},
++			.stWndRect = {
++				.s32X = 0,
++				.s32Y = 0,
++				.u32Width = 1920,
++				.u32Height = 1440,
++			},
++			.stMaxSize = {
++				.u32Width = 1920,
++				.u32Height = 1440,
++			},
++		},
++		.f32MaxFps = 30,
++		.f32MinFps = GC4683_1920X1440P30_WDR_VTS * 30.0f / 16383.0f,
++		.u32HtsDef = GC4683_1920X1440P30_WDR_HTS,
++		.u32VtsDef = GC4683_1920X1440P30_WDR_VTS,
++		.u16SexpMaxReg = GC4683_1920X1440P30_WDR_SEXP_MAX,
++		.stExp[0] = {
++			.u16Min = 1,
++			.u16Max = GC4683_1920X1440P30_WDR_SEXP_MAX,
++			.u16Def = 64,
++			.u16Step = 1,
++		},
++		.stExp[1] = {
++			.u16Min = 1,
++			.u16Max = GC4683_1920X1440P30_WDR_VTS - 1 - 8,
++			.u16Def = 1000,
++			.u16Step = 1,
++		},
++		.stAgain[0] = {
++			.u32Min = 1024,
++			.u32Max = 76080,
++			.u32Def = 1024,
++			.u32Step = 1,
++		},
++		.stAgain[1] = {
++			.u32Min = 1024,
++			.u32Max = 76080,
++			.u32Def = 1024,
++			.u32Step = 1,
++		},
++		.stDgain[0] = {
++			.u32Min = 1024,
++			.u32Max = 16368,
++			.u32Def = 1024,
++			.u32Step = 64,
++		},
++		.stDgain[1] = {
++			.u32Min = 1024,
++			.u32Max = 16368,
++			.u32Def = 1024,
++			.u32Step = 64,
++		},
++	},
+ };
+ 
+ static ISP_CMOS_NOISE_CALIBRATION_S g_stIspNoiseCalibratio = {.CalibrationCoef = {
+diff --git a/components/cvi_sensor/gcore_gc4683/gc4683_sensor_ctl.c b/components/cvi_sensor/gcore_gc4683/gc4683_sensor_ctl.c
+index 471f3643a602a421a7dd1bcf5bc6ed0a03220dcd..c2ade025f149b060003465da67e0231b4f8841a0 100644
+--- a/components/cvi_sensor/gcore_gc4683/gc4683_sensor_ctl.c
++++ b/components/cvi_sensor/gcore_gc4683/gc4683_sensor_ctl.c
+@@ -16,6 +16,8 @@ static void gc4683_linear_1440p60_init(VI_PIPE ViPipe);
+ static void gc4683_linear_1080p60_init(VI_PIPE ViPipe);
+ static void gc4683_linear_720p120_init(VI_PIPE ViPipe);
+ static void gc4683_wdr_1440p30_init(VI_PIPE ViPipe);
++static void gc4683_linear_1920x1440p60_init(VI_PIPE ViPipe);
++static void gc4683_wdr_1920x1440p30_init(VI_PIPE ViPipe);
+ 
+ CVI_U8 gc4683_i2c_addr = 0x31;
+ const CVI_U32 gc4683_addr_byte = 2;
+@@ -124,6 +126,10 @@ void gc4683_init(VI_PIPE ViPipe)
+ 		gc4683_linear_1080p60_init(ViPipe);
+ 	} else if (u8ImgMode == GC4683_MODE_2560X1440P30_WDR) {
+ 		gc4683_wdr_1440p30_init(ViPipe);
++	} else if (u8ImgMode == GC4683_MODE_1920X1440P60) {
++		gc4683_linear_1920x1440p60_init(ViPipe);
++	} else if (u8ImgMode == GC4683_MODE_1920X1440P30_WDR) {
++		gc4683_wdr_1920x1440p30_init(ViPipe);
+ 	} else {
+ 		CVI_TRACE_SNS(CVI_DBG_ERR, "Sensor ImageMode[%d] invalid!\n", u8ImgMode);
+ 	}
+@@ -1278,3 +1284,605 @@ static void gc4683_wdr_1440p30_init(VI_PIPE ViPipe)
+ 
+ 	printf("ViPipe:%d,===GC4683 1440P 30fps 10bit WDR Init OK!===\n", ViPipe);
+ }
++
++/* release_liner_v4.0.0_01_GC4683_MIPI4L_24M_1920x1440_60fps_raw10_linear.txt */
++static void gc4683_linear_1920x1440p60_init(VI_PIPE ViPipe)
++{
++	gc4683_write_register(ViPipe, 0x03fe, 0xf0);
++	gc4683_write_register(ViPipe, 0x03fe, 0x00);
++	gc4683_write_register(ViPipe, 0x03fe, 0x10);
++	gc4683_write_register(ViPipe, 0x0a38, 0x00);
++	gc4683_write_register(ViPipe, 0x0a38, 0x05);
++	gc4683_write_register(ViPipe, 0x0331, 0x07);
++	gc4683_write_register(ViPipe, 0x0320, 0xf2);
++	gc4683_write_register(ViPipe, 0x0a22, 0x04);
++	gc4683_write_register(ViPipe, 0x0a27, 0x02);
++	gc4683_write_register(ViPipe, 0x0a20, 0x1a);
++	gc4683_write_register(ViPipe, 0x0a21, 0x1a);
++	gc4683_write_register(ViPipe, 0x032b, 0x54);
++	gc4683_write_register(ViPipe, 0x032a, 0x55);
++	gc4683_write_register(ViPipe, 0x0a22, 0x17);
++	gc4683_write_register(ViPipe, 0x0a23, 0x20);
++	gc4683_write_register(ViPipe, 0x0a24, 0x0c);
++	gc4683_write_register(ViPipe, 0x0a25, 0x50);
++	gc4683_write_register(ViPipe, 0x0a34, 0x00);
++	gc4683_write_register(ViPipe, 0x0a35, 0x60);
++	gc4683_write_register(ViPipe, 0x0a36, 0x0c);
++	gc4683_write_register(ViPipe, 0x0a37, 0x64);
++	gc4683_write_register(ViPipe, 0x0a27, 0x0b);
++	gc4683_write_register(ViPipe, 0x0a28, 0x24);
++	gc4683_write_register(ViPipe, 0x0a29, 0x14);
++	gc4683_write_register(ViPipe, 0x0a2a, 0xb0);
++	gc4683_write_register(ViPipe, 0x031c, 0x46);
++	gc4683_write_register(ViPipe, 0x0213, 0x1c);
++	gc4683_write_register(ViPipe, 0x0219, 0xc7);
++	gc4683_write_register(ViPipe, 0x0261, 0x98);
++	gc4683_write_register(ViPipe, 0x0259, 0x06);
++	gc4683_write_register(ViPipe, 0x025a, 0x18);
++	gc4683_write_register(ViPipe, 0x0340, 0x06);
++	gc4683_write_register(ViPipe, 0x0341, 0x40);
++	gc4683_write_register(ViPipe, 0x0342, 0x02);
++	gc4683_write_register(ViPipe, 0x0343, 0x26);
++	gc4683_write_register(ViPipe, 0x0346, 0x00);
++	gc4683_write_register(ViPipe, 0x0347, 0x30);
++	gc4683_write_register(ViPipe, 0x0348, 0x0a);
++	gc4683_write_register(ViPipe, 0x0349, 0x08);
++	gc4683_write_register(ViPipe, 0x034a, 0x05);
++	gc4683_write_register(ViPipe, 0x034b, 0xa8);
++	gc4683_write_register(ViPipe, 0x034e, 0x0a);
++	gc4683_write_register(ViPipe, 0x034f, 0xb0);
++	gc4683_write_register(ViPipe, 0x0094, 0x0a);
++	gc4683_write_register(ViPipe, 0x0095, 0x00);
++	gc4683_write_register(ViPipe, 0x0096, 0x05);
++	gc4683_write_register(ViPipe, 0x0097, 0xa0);
++	gc4683_write_register(ViPipe, 0x0099, 0x04);
++	gc4683_write_register(ViPipe, 0x009b, 0x04);
++	gc4683_write_register(ViPipe, 0x070c, 0x00);
++	gc4683_write_register(ViPipe, 0x070d, 0x0a);
++	gc4683_write_register(ViPipe, 0x070e, 0x05);
++	gc4683_write_register(ViPipe, 0x070f, 0x0e);
++	gc4683_write_register(ViPipe, 0x0902, 0x0b);
++	gc4683_write_register(ViPipe, 0x0903, 0x03);
++	gc4683_write_register(ViPipe, 0x0904, 0x0a);
++	gc4683_write_register(ViPipe, 0x0907, 0x35);
++	gc4683_write_register(ViPipe, 0x0909, 0x07);
++	gc4683_write_register(ViPipe, 0x090d, 0x0c);
++	gc4683_write_register(ViPipe, 0x0276, 0x07);
++	gc4683_write_register(ViPipe, 0x0277, 0xa4);
++	gc4683_write_register(ViPipe, 0x0278, 0x3d);
++	gc4683_write_register(ViPipe, 0x0279, 0x57);
++	gc4683_write_register(ViPipe, 0x027b, 0x16);
++	gc4683_write_register(ViPipe, 0x072a, 0x38);
++	gc4683_write_register(ViPipe, 0x0724, 0x03);
++	gc4683_write_register(ViPipe, 0x0727, 0x03);
++	gc4683_write_register(ViPipe, 0x072a, 0x38);
++	gc4683_write_register(ViPipe, 0x072b, 0x19);
++	gc4683_write_register(ViPipe, 0x072f, 0x02);
++	gc4683_write_register(ViPipe, 0x0002, 0x80);
++	gc4683_write_register(ViPipe, 0x0004, 0x1f);
++	gc4683_write_register(ViPipe, 0x0060, 0x40);
++	gc4683_write_register(ViPipe, 0x0038, 0x40);
++	gc4683_write_register(ViPipe, 0x0039, 0x40);
++	gc4683_write_register(ViPipe, 0x003a, 0x40);
++	gc4683_write_register(ViPipe, 0x003b, 0x40);
++	gc4683_write_register(ViPipe, 0x02ac, 0x00);
++	gc4683_write_register(ViPipe, 0x0274, 0x0a);
++	gc4683_write_register(ViPipe, 0x02ad, 0x04);
++	gc4683_write_register(ViPipe, 0x02ae, 0x01);
++	gc4683_write_register(ViPipe, 0x0247, 0x00);
++	gc4683_write_register(ViPipe, 0x0248, 0xb0);
++	gc4683_write_register(ViPipe, 0x1466, 0x20);
++	gc4683_write_register(ViPipe, 0x1467, 0x24);
++	gc4683_write_register(ViPipe, 0x1468, 0x24);
++	gc4683_write_register(ViPipe, 0x1469, 0x02);
++	gc4683_write_register(ViPipe, 0x146a, 0x40);
++	gc4683_write_register(ViPipe, 0x146b, 0x00);
++	gc4683_write_register(ViPipe, 0x0707, 0x08);
++	gc4683_write_register(ViPipe, 0x0704, 0x00);
++	gc4683_write_register(ViPipe, 0x0719, 0x00);
++	gc4683_write_register(ViPipe, 0x071a, 0x40);
++	gc4683_write_register(ViPipe, 0x021b, 0xb0);
++	gc4683_write_register(ViPipe, 0x0006, 0x00);
++	gc4683_write_register(ViPipe, 0x0216, 0x01);
++	gc4683_write_register(ViPipe, 0x027c, 0x0f);
++	gc4683_write_register(ViPipe, 0x1430, 0x00);
++	gc4683_write_register(ViPipe, 0x1409, 0x03);
++	gc4683_write_register(ViPipe, 0x143a, 0x03);
++	gc4683_write_register(ViPipe, 0x1433, 0x80);
++	gc4683_write_register(ViPipe, 0x140f, 0x21);
++	gc4683_write_register(ViPipe, 0x1461, 0x20);
++	gc4683_write_register(ViPipe, 0x1462, 0x20);
++	gc4683_write_register(ViPipe, 0x146e, 0x45);
++	gc4683_write_register(ViPipe, 0x146f, 0x02);
++	gc4683_write_register(ViPipe, 0x1470, 0x3e);
++	gc4683_write_register(ViPipe, 0x1471, 0x02);
++	gc4683_write_register(ViPipe, 0x1474, 0x40);
++	gc4683_write_register(ViPipe, 0x1479, 0x12);
++	gc4683_write_register(ViPipe, 0x1485, 0x06);
++	gc4683_write_register(ViPipe, 0x1475, 0x12);
++	gc4683_write_register(ViPipe, 0x1476, 0xe0);
++	gc4683_write_register(ViPipe, 0x14a1, 0x0d);
++	gc4683_write_register(ViPipe, 0x14a8, 0x70);
++	gc4683_write_register(ViPipe, 0x14a6, 0x30);
++	gc4683_write_register(ViPipe, 0x1420, 0x14);
++	gc4683_write_register(ViPipe, 0x1464, 0x15);
++	gc4683_write_register(ViPipe, 0x146c, 0x08);
++	gc4683_write_register(ViPipe, 0x146d, 0x08);
++	gc4683_write_register(ViPipe, 0x1423, 0x08);
++	gc4683_write_register(ViPipe, 0x1428, 0x40);
++	gc4683_write_register(ViPipe, 0x0245, 0xd9);
++	gc4683_write_register(ViPipe, 0x023a, 0x08);
++	gc4683_write_register(ViPipe, 0x02cd, 0x42);
++	gc4683_write_register(ViPipe, 0x0243, 0x15);
++	gc4683_write_register(ViPipe, 0x029e, 0x3f);
++	gc4683_write_register(ViPipe, 0x029d, 0x2c);
++	gc4683_write_register(ViPipe, 0x0089, 0x03);
++	gc4683_write_register(ViPipe, 0x0040, 0xa3);
++	gc4683_write_register(ViPipe, 0x0075, 0x60);
++	gc4683_write_register(ViPipe, 0x0004, 0x1f);
++	gc4683_write_register(ViPipe, 0x0002, 0x82);
++	gc4683_write_register(ViPipe, 0x0053, 0x00);
++	gc4683_write_register(ViPipe, 0x0205, 0x0c);
++	gc4683_write_register(ViPipe, 0x0317, 0x01);
++	gc4683_write_register(ViPipe, 0x021a, 0x10);
++	gc4683_write_register(ViPipe, 0x0076, 0x01);
++	gc4683_write_register(ViPipe, 0x0054, 0x98);
++	gc4683_write_register(ViPipe, 0x0042, 0x60);
++	gc4683_write_register(ViPipe, 0x0052, 0x02);
++	gc4683_write_register(ViPipe, 0x0046, 0x60);
++	gc4683_write_register(ViPipe, 0x0448, 0x07);
++	gc4683_write_register(ViPipe, 0x0449, 0x07);
++	gc4683_write_register(ViPipe, 0x044a, 0x07);
++	gc4683_write_register(ViPipe, 0x044b, 0x07);
++	gc4683_write_register(ViPipe, 0x044c, 0x79);
++	gc4683_write_register(ViPipe, 0x044d, 0x79);
++	gc4683_write_register(ViPipe, 0x044e, 0x79);
++	gc4683_write_register(ViPipe, 0x044f, 0x79);
++	gc4683_write_register(ViPipe, 0x0468, 0x00);
++	gc4683_write_register(ViPipe, 0x0010, 0x08);
++	gc4683_write_register(ViPipe, 0x04b0, 0x30);
++	gc4683_write_register(ViPipe, 0x04b1, 0x10);
++	gc4683_write_register(ViPipe, 0x04c0, 0x20);
++	gc4683_write_register(ViPipe, 0x04c1, 0x20);
++	gc4683_write_register(ViPipe, 0x04d0, 0x20);
++	gc4683_write_register(ViPipe, 0x04d1, 0x3f);
++	gc4683_write_register(ViPipe, 0x04b2, 0x30);
++	gc4683_write_register(ViPipe, 0x04b3, 0x10);
++	gc4683_write_register(ViPipe, 0x04c2, 0x20);
++	gc4683_write_register(ViPipe, 0x04c3, 0x20);
++	gc4683_write_register(ViPipe, 0x04d2, 0x20);
++	gc4683_write_register(ViPipe, 0x04d3, 0x3f);
++	gc4683_write_register(ViPipe, 0x04b4, 0x30);
++	gc4683_write_register(ViPipe, 0x04b5, 0x10);
++	gc4683_write_register(ViPipe, 0x04c4, 0x20);
++	gc4683_write_register(ViPipe, 0x04c5, 0x20);
++	gc4683_write_register(ViPipe, 0x04d4, 0x20);
++	gc4683_write_register(ViPipe, 0x04d5, 0x3f);
++	gc4683_write_register(ViPipe, 0x04b6, 0x40);
++	gc4683_write_register(ViPipe, 0x04b7, 0x10);
++	gc4683_write_register(ViPipe, 0x04c6, 0x20);
++	gc4683_write_register(ViPipe, 0x04c7, 0x20);
++	gc4683_write_register(ViPipe, 0x04d6, 0x20);
++	gc4683_write_register(ViPipe, 0x04d7, 0x08);
++	gc4683_write_register(ViPipe, 0x04b8, 0x40);
++	gc4683_write_register(ViPipe, 0x04b9, 0x10);
++	gc4683_write_register(ViPipe, 0x04c8, 0x20);
++	gc4683_write_register(ViPipe, 0x04c9, 0x20);
++	gc4683_write_register(ViPipe, 0x04d8, 0x20);
++	gc4683_write_register(ViPipe, 0x04d9, 0x08);
++	gc4683_write_register(ViPipe, 0x04ba, 0x40);
++	gc4683_write_register(ViPipe, 0x04bb, 0x10);
++	gc4683_write_register(ViPipe, 0x04ca, 0x20);
++	gc4683_write_register(ViPipe, 0x04cb, 0x20);
++	gc4683_write_register(ViPipe, 0x04da, 0x20);
++	gc4683_write_register(ViPipe, 0x04db, 0x08);
++	gc4683_write_register(ViPipe, 0x04bc, 0x40);
++	gc4683_write_register(ViPipe, 0x04bd, 0x10);
++	gc4683_write_register(ViPipe, 0x04cc, 0x20);
++	gc4683_write_register(ViPipe, 0x04cd, 0x20);
++	gc4683_write_register(ViPipe, 0x04dc, 0x20);
++	gc4683_write_register(ViPipe, 0x04dd, 0x08);
++	gc4683_write_register(ViPipe, 0x04be, 0x50);
++	gc4683_write_register(ViPipe, 0x04bf, 0x10);
++	gc4683_write_register(ViPipe, 0x04ce, 0x20);
++	gc4683_write_register(ViPipe, 0x04cf, 0x20);
++	gc4683_write_register(ViPipe, 0x04de, 0x20);
++	gc4683_write_register(ViPipe, 0x04df, 0x08);
++	gc4683_write_register(ViPipe, 0x0704, 0x07);
++	gc4683_write_register(ViPipe, 0x0715, 0x04);
++	gc4683_write_register(ViPipe, 0x0716, 0xb0);
++	gc4683_write_register(ViPipe, 0x0718, 0xd0);
++	gc4683_write_register(ViPipe, 0x071b, 0x00);
++	gc4683_write_register(ViPipe, 0x071c, 0x40);
++	gc4683_write_register(ViPipe, 0x071d, 0x00);
++	gc4683_write_register(ViPipe, 0x071e, 0x40);
++	gc4683_write_register(ViPipe, 0x031f, 0x02);
++	gc4683_write_register(ViPipe, 0x031f, 0x00);
++	gc4683_write_register(ViPipe, 0x0a67, 0x80);
++	gc4683_write_register(ViPipe, 0x0a51, 0x41);
++	gc4683_write_register(ViPipe, 0x0a52, 0x41);
++	gc4683_write_register(ViPipe, 0x0a4e, 0x0c);
++	gc4683_write_register(ViPipe, 0x0a4f, 0x0c);
++	gc4683_write_register(ViPipe, 0x0a54, 0x36);
++	gc4683_write_register(ViPipe, 0x0a55, 0x36);
++	gc4683_write_register(ViPipe, 0x0a9f, 0x17);
++	gc4683_write_register(ViPipe, 0x0a9e, 0x10);
++	gc4683_write_register(ViPipe, 0x0aa1, 0x10);
++	gc4683_write_register(ViPipe, 0x0a53, 0x00);
++	gc4683_write_register(ViPipe, 0x05be, 0x00);
++	gc4683_write_register(ViPipe, 0x05a9, 0x01);
++	gc4683_write_register(ViPipe, 0x0028, 0x0a);
++	gc4683_write_register(ViPipe, 0x0029, 0x08);
++	gc4683_write_register(ViPipe, 0x002a, 0x05);
++	gc4683_write_register(ViPipe, 0x002b, 0xa8);
++	gc4683_write_register(ViPipe, 0x0022, 0x00);
++	gc4683_write_register(ViPipe, 0x0023, 0x00);
++	gc4683_write_register(ViPipe, 0x0024, 0x00);
++	gc4683_write_register(ViPipe, 0x0025, 0x00);
++	gc4683_write_register(ViPipe, 0x0a70, 0x03);
++	gc4683_write_register(ViPipe, 0x0a71, 0x02);
++	gc4683_write_register(ViPipe, 0x0a73, 0x60);
++	gc4683_write_register(ViPipe, 0x0a82, 0x01);
++	gc4683_write_register(ViPipe, 0x0a83, 0x10);
++	gc4683_write_register(ViPipe, 0x0a5a, 0x80);
++	gc4683_write_register(ViPipe, 0x0313, 0x80);
++	delay_ms(20);
++	gc4683_write_register(ViPipe, 0x0a70, 0x00);
++	gc4683_write_register(ViPipe, 0x05be, 0x01);
++	gc4683_write_register(ViPipe, 0x0080, 0x02);
++	gc4683_write_register(ViPipe, 0x0021, 0x40);
++	gc4683_write_register(ViPipe, 0x0020, 0x8c);
++	gc4683_write_register(ViPipe, 0x0202, 0x01);
++	gc4683_write_register(ViPipe, 0x0203, 0x00);
++	gc4683_write_register(ViPipe, 0x02aa, 0x00);
++	gc4683_write_register(ViPipe, 0x02ab, 0x00);
++	gc4683_write_register(ViPipe, 0x0181, 0xf0);
++	gc4683_write_register(ViPipe, 0x0185, 0x08);
++	gc4683_write_register(ViPipe, 0x0111, 0x2b);
++	gc4683_write_register(ViPipe, 0x0180, 0x46);
++	gc4683_write_register(ViPipe, 0x02ce, 0x45);
++	gc4683_write_register(ViPipe, 0x0100, 0x09);
++	gc4683_write_register(ViPipe, 0x0106, 0x38);
++	gc4683_write_register(ViPipe, 0x010d, 0x0c);
++	gc4683_write_register(ViPipe, 0x010e, 0x80);
++	gc4683_write_register(ViPipe, 0x0112, 0x01);
++	gc4683_write_register(ViPipe, 0x0114, 0x03);
++	gc4683_write_register(ViPipe, 0x0115, 0x10);
++	gc4683_write_register(ViPipe, 0x0125, 0x20);
++	gc4683_write_register(ViPipe, 0x0124, 0x02);
++	gc4683_write_register(ViPipe, 0x0122, 0x06);
++	gc4683_write_register(ViPipe, 0x0123, 0x20);
++	gc4683_write_register(ViPipe, 0x0126, 0x08);
++	gc4683_write_register(ViPipe, 0x0121, 0x10);
++	gc4683_write_register(ViPipe, 0x0129, 0x08);
++	gc4683_write_register(ViPipe, 0x012a, 0x0a);
++	gc4683_write_register(ViPipe, 0x012b, 0x08);
++	gc4683_write_register(ViPipe, 0x03fe, 0x00);
++	gc4683_write_register(ViPipe, 0x0094, 0x07);
++	gc4683_write_register(ViPipe, 0x0095, 0x80);
++	gc4683_write_register(ViPipe, 0x009a, 0x01);
++	gc4683_write_register(ViPipe, 0x009b, 0x44);
++	gc4683_write_register(ViPipe, 0x010d, 0x09);
++	gc4683_write_register(ViPipe, 0x010e, 0x60);
++
++	gc4683_default_reg_init(ViPipe);
++	delay_ms(10);
++
++	printf("ViPipe:%d,===GC4683 1920x1440 60fps 10bit LINEAR Init OK!===\n", ViPipe);
++}
++
++/* release_raw10_hdr_v4.0.0_04_GC4683_MIPI4L_24M_1920x1440_30fps_raw10.txt */
++static void gc4683_wdr_1920x1440p30_init(VI_PIPE ViPipe)
++{
++	gc4683_write_register(ViPipe, 0x03fe, 0xf0);
++	gc4683_write_register(ViPipe, 0x03fe, 0x00);
++	gc4683_write_register(ViPipe, 0x03fe, 0x10);
++	gc4683_write_register(ViPipe, 0x0a38, 0x00);
++	gc4683_write_register(ViPipe, 0x0a38, 0x05);
++	gc4683_write_register(ViPipe, 0x0331, 0x07);
++	gc4683_write_register(ViPipe, 0x0320, 0xf2);
++	gc4683_write_register(ViPipe, 0x0a22, 0x04);
++	gc4683_write_register(ViPipe, 0x0a27, 0x02);
++	gc4683_write_register(ViPipe, 0x0a20, 0x1a);
++	gc4683_write_register(ViPipe, 0x0a21, 0x1a);
++	gc4683_write_register(ViPipe, 0x032b, 0x54);
++	gc4683_write_register(ViPipe, 0x032a, 0x55);
++	gc4683_write_register(ViPipe, 0x0a22, 0x17);
++	gc4683_write_register(ViPipe, 0x0a23, 0x20);
++	gc4683_write_register(ViPipe, 0x0a24, 0x0c);
++	gc4683_write_register(ViPipe, 0x0a25, 0x50);
++	gc4683_write_register(ViPipe, 0x0a34, 0x00);
++	gc4683_write_register(ViPipe, 0x0a35, 0x60);
++	gc4683_write_register(ViPipe, 0x0a36, 0x0c);
++	gc4683_write_register(ViPipe, 0x0a37, 0x64);
++	gc4683_write_register(ViPipe, 0x0a27, 0x0b);
++	gc4683_write_register(ViPipe, 0x0a28, 0x24);
++	gc4683_write_register(ViPipe, 0x0a29, 0x14);
++	gc4683_write_register(ViPipe, 0x0a2a, 0xb0);
++	gc4683_write_register(ViPipe, 0x031c, 0x46);
++	gc4683_write_register(ViPipe, 0x0213, 0x1c);
++	gc4683_write_register(ViPipe, 0x0219, 0xc7);
++	gc4683_write_register(ViPipe, 0x0261, 0x98);
++	gc4683_write_register(ViPipe, 0x0259, 0x06);
++	gc4683_write_register(ViPipe, 0x025a, 0x18);
++	gc4683_write_register(ViPipe, 0x0340, (GC4683_1920X1440P30_WDR_VTS >> 8) & 0xff);
++	gc4683_write_register(ViPipe, 0x0341, GC4683_1920X1440P30_WDR_VTS & 0xff);
++	gc4683_write_register(ViPipe, 0x0342, (GC4683_1920X1440P30_WDR_HTS >> 8) & 0xff);
++	gc4683_write_register(ViPipe, 0x0343, GC4683_1920X1440P30_WDR_HTS & 0xff);
++	gc4683_write_register(ViPipe, 0x0346, 0x00);
++	gc4683_write_register(ViPipe, 0x0347, 0x30);
++	gc4683_write_register(ViPipe, 0x0348, 0x0a);
++	gc4683_write_register(ViPipe, 0x0349, 0x08);
++	gc4683_write_register(ViPipe, 0x034a, 0x05);
++	gc4683_write_register(ViPipe, 0x034b, 0xa8);
++	gc4683_write_register(ViPipe, 0x034e, 0x0a);
++	gc4683_write_register(ViPipe, 0x034f, 0xb0);
++	gc4683_write_register(ViPipe, 0x0094, 0x0a);
++	gc4683_write_register(ViPipe, 0x0095, 0x00);
++	gc4683_write_register(ViPipe, 0x0096, 0x05);
++	gc4683_write_register(ViPipe, 0x0097, 0xa0);
++	gc4683_write_register(ViPipe, 0x0099, 0x04);
++	gc4683_write_register(ViPipe, 0x009b, 0x04);
++	gc4683_write_register(ViPipe, 0x070c, 0x00);
++	gc4683_write_register(ViPipe, 0x070d, 0x0a);
++	gc4683_write_register(ViPipe, 0x070e, 0x05);
++	gc4683_write_register(ViPipe, 0x070f, 0x0e);
++	gc4683_write_register(ViPipe, 0x0902, 0x0b);
++	gc4683_write_register(ViPipe, 0x0903, 0x03);
++	gc4683_write_register(ViPipe, 0x0904, 0x0a);
++	gc4683_write_register(ViPipe, 0x0907, 0x35);
++	gc4683_write_register(ViPipe, 0x0909, 0x07);
++	gc4683_write_register(ViPipe, 0x090d, 0x0c);
++	gc4683_write_register(ViPipe, 0x0276, 0x07);
++	gc4683_write_register(ViPipe, 0x0277, 0xa4);
++	gc4683_write_register(ViPipe, 0x0278, 0x3d);
++	gc4683_write_register(ViPipe, 0x0279, 0x57);
++	gc4683_write_register(ViPipe, 0x027b, 0x16);
++	gc4683_write_register(ViPipe, 0x072a, 0x38);
++	gc4683_write_register(ViPipe, 0x0724, 0x03);
++	gc4683_write_register(ViPipe, 0x0727, 0x03);
++	gc4683_write_register(ViPipe, 0x072a, 0x38);
++	gc4683_write_register(ViPipe, 0x072b, 0x19);
++	gc4683_write_register(ViPipe, 0x072f, 0x02);
++	gc4683_write_register(ViPipe, 0x0002, 0x80);
++	gc4683_write_register(ViPipe, 0x0004, 0x1f);
++	gc4683_write_register(ViPipe, 0x0060, 0x40);
++	gc4683_write_register(ViPipe, 0x0038, 0x40);
++	gc4683_write_register(ViPipe, 0x0039, 0x40);
++	gc4683_write_register(ViPipe, 0x003a, 0x40);
++	gc4683_write_register(ViPipe, 0x003b, 0x40);
++	gc4683_write_register(ViPipe, 0x003c, 0x40);
++	gc4683_write_register(ViPipe, 0x003d, 0x40);
++	gc4683_write_register(ViPipe, 0x003e, 0x40);
++	gc4683_write_register(ViPipe, 0x003f, 0x40);
++	gc4683_write_register(ViPipe, 0x02ac, 0x00);
++	gc4683_write_register(ViPipe, 0x0274, 0x0a);
++	gc4683_write_register(ViPipe, 0x02ad, 0x04);
++	gc4683_write_register(ViPipe, 0x02ae, 0x01);
++	gc4683_write_register(ViPipe, 0x0247, 0x00);
++	gc4683_write_register(ViPipe, 0x0248, 0xb0);
++	gc4683_write_register(ViPipe, 0x1456, 0x20);
++	gc4683_write_register(ViPipe, 0x1457, 0x24);
++	gc4683_write_register(ViPipe, 0x1458, 0x24);
++	gc4683_write_register(ViPipe, 0x1459, 0x02);
++	gc4683_write_register(ViPipe, 0x145a, 0x40);
++	gc4683_write_register(ViPipe, 0x145b, 0x00);
++	gc4683_write_register(ViPipe, 0x1466, 0x20);
++	gc4683_write_register(ViPipe, 0x1467, 0x24);
++	gc4683_write_register(ViPipe, 0x1468, 0x24);
++	gc4683_write_register(ViPipe, 0x1469, 0x02);
++	gc4683_write_register(ViPipe, 0x146a, 0x40);
++	gc4683_write_register(ViPipe, 0x146b, 0x00);
++	gc4683_write_register(ViPipe, 0x0707, 0x08);
++	gc4683_write_register(ViPipe, 0x0704, 0x00);
++	gc4683_write_register(ViPipe, 0x0719, 0x00);
++	gc4683_write_register(ViPipe, 0x071a, 0x40);
++	gc4683_write_register(ViPipe, 0x021b, 0xb0);
++	gc4683_write_register(ViPipe, 0x0006, 0x00);
++	gc4683_write_register(ViPipe, 0x0216, 0x01);
++	gc4683_write_register(ViPipe, 0x027c, 0x0f);
++	gc4683_write_register(ViPipe, 0x1430, 0x00);
++	gc4683_write_register(ViPipe, 0x1409, 0x03);
++	gc4683_write_register(ViPipe, 0x143a, 0x03);
++	gc4683_write_register(ViPipe, 0x1433, 0x80);
++	gc4683_write_register(ViPipe, 0x14ab, 0x30);
++	gc4683_write_register(ViPipe, 0x140f, 0x21);
++	gc4683_write_register(ViPipe, 0x1461, 0x20);
++	gc4683_write_register(ViPipe, 0x1462, 0x20);
++	gc4683_write_register(ViPipe, 0x146e, 0x45);
++	gc4683_write_register(ViPipe, 0x146f, 0x02);
++	gc4683_write_register(ViPipe, 0x1470, 0x3e);
++	gc4683_write_register(ViPipe, 0x1471, 0x02);
++	gc4683_write_register(ViPipe, 0x1474, 0x40);
++	gc4683_write_register(ViPipe, 0x1479, 0x12);
++	gc4683_write_register(ViPipe, 0x1485, 0x06);
++	gc4683_write_register(ViPipe, 0x1475, 0x12);
++	gc4683_write_register(ViPipe, 0x1476, 0xe8);
++	gc4683_write_register(ViPipe, 0x14a1, 0x0d);
++	gc4683_write_register(ViPipe, 0x14a8, 0x70);
++	gc4683_write_register(ViPipe, 0x14a6, 0x30);
++	gc4683_write_register(ViPipe, 0x1420, 0x14);
++	gc4683_write_register(ViPipe, 0x1464, 0x15);
++	gc4683_write_register(ViPipe, 0x146c, 0x08);
++	gc4683_write_register(ViPipe, 0x146d, 0x08);
++	gc4683_write_register(ViPipe, 0x1423, 0x08);
++	gc4683_write_register(ViPipe, 0x1428, 0x40);
++	gc4683_write_register(ViPipe, 0x0245, 0xd9);
++	gc4683_write_register(ViPipe, 0x023a, 0x08);
++	gc4683_write_register(ViPipe, 0x0239, 0x08);
++	gc4683_write_register(ViPipe, 0x0275, 0x42);
++	gc4683_write_register(ViPipe, 0x02cd, 0x42);
++	gc4683_write_register(ViPipe, 0x0243, 0x15);
++	gc4683_write_register(ViPipe, 0x0089, 0x03);
++	gc4683_write_register(ViPipe, 0x0040, 0xa3);
++	gc4683_write_register(ViPipe, 0x0075, 0x60);
++	gc4683_write_register(ViPipe, 0x0004, 0x1f);
++	gc4683_write_register(ViPipe, 0x0002, 0x82);
++	gc4683_write_register(ViPipe, 0x0053, 0x00);
++	gc4683_write_register(ViPipe, 0x0205, 0x0c);
++	gc4683_write_register(ViPipe, 0x0317, 0x04);
++	gc4683_write_register(ViPipe, 0x021a, 0x10);
++	gc4683_write_register(ViPipe, 0x0076, 0x01);
++	gc4683_write_register(ViPipe, 0x0054, 0x98);
++	gc4683_write_register(ViPipe, 0x0042, 0x60);
++	gc4683_write_register(ViPipe, 0x0052, 0x02);
++	gc4683_write_register(ViPipe, 0x0046, 0x60);
++	gc4683_write_register(ViPipe, 0x0448, 0x07);
++	gc4683_write_register(ViPipe, 0x0449, 0x07);
++	gc4683_write_register(ViPipe, 0x044a, 0x07);
++	gc4683_write_register(ViPipe, 0x044b, 0x07);
++	gc4683_write_register(ViPipe, 0x044c, 0x79);
++	gc4683_write_register(ViPipe, 0x044d, 0x79);
++	gc4683_write_register(ViPipe, 0x044e, 0x79);
++	gc4683_write_register(ViPipe, 0x044f, 0x79);
++	gc4683_write_register(ViPipe, 0x0468, 0x00);
++	gc4683_write_register(ViPipe, 0x0450, 0x09);
++	gc4683_write_register(ViPipe, 0x0451, 0x09);
++	gc4683_write_register(ViPipe, 0x0452, 0x09);
++	gc4683_write_register(ViPipe, 0x0453, 0x09);
++	gc4683_write_register(ViPipe, 0x0454, 0x77);
++	gc4683_write_register(ViPipe, 0x0455, 0x77);
++	gc4683_write_register(ViPipe, 0x0456, 0x77);
++	gc4683_write_register(ViPipe, 0x0457, 0x77);
++	gc4683_write_register(ViPipe, 0x0468, 0x80);
++	gc4683_write_register(ViPipe, 0x0468, 0x80);
++	gc4683_write_register(ViPipe, 0x0010, 0x08);
++	gc4683_write_register(ViPipe, 0x04b0, 0x30);
++	gc4683_write_register(ViPipe, 0x04b1, 0x10);
++	gc4683_write_register(ViPipe, 0x04c0, 0x20);
++	gc4683_write_register(ViPipe, 0x04c1, 0x20);
++	gc4683_write_register(ViPipe, 0x04d0, 0x20);
++	gc4683_write_register(ViPipe, 0x04d1, 0x3f);
++	gc4683_write_register(ViPipe, 0x04b2, 0x30);
++	gc4683_write_register(ViPipe, 0x04b3, 0x10);
++	gc4683_write_register(ViPipe, 0x04c2, 0x20);
++	gc4683_write_register(ViPipe, 0x04c3, 0x20);
++	gc4683_write_register(ViPipe, 0x04d2, 0x20);
++	gc4683_write_register(ViPipe, 0x04d3, 0x3f);
++	gc4683_write_register(ViPipe, 0x04b4, 0x30);
++	gc4683_write_register(ViPipe, 0x04b5, 0x10);
++	gc4683_write_register(ViPipe, 0x04c4, 0x20);
++	gc4683_write_register(ViPipe, 0x04c5, 0x20);
++	gc4683_write_register(ViPipe, 0x04d4, 0x20);
++	gc4683_write_register(ViPipe, 0x04d5, 0x3f);
++	gc4683_write_register(ViPipe, 0x04b6, 0x40);
++	gc4683_write_register(ViPipe, 0x04b7, 0x10);
++	gc4683_write_register(ViPipe, 0x04c6, 0x20);
++	gc4683_write_register(ViPipe, 0x04c7, 0x20);
++	gc4683_write_register(ViPipe, 0x04d6, 0x20);
++	gc4683_write_register(ViPipe, 0x04d7, 0x08);
++	gc4683_write_register(ViPipe, 0x04b8, 0x40);
++	gc4683_write_register(ViPipe, 0x04b9, 0x10);
++	gc4683_write_register(ViPipe, 0x04c8, 0x20);
++	gc4683_write_register(ViPipe, 0x04c9, 0x20);
++	gc4683_write_register(ViPipe, 0x04d8, 0x20);
++	gc4683_write_register(ViPipe, 0x04d9, 0x08);
++	gc4683_write_register(ViPipe, 0x04ba, 0x40);
++	gc4683_write_register(ViPipe, 0x04bb, 0x10);
++	gc4683_write_register(ViPipe, 0x04ca, 0x20);
++	gc4683_write_register(ViPipe, 0x04cb, 0x20);
++	gc4683_write_register(ViPipe, 0x04da, 0x20);
++	gc4683_write_register(ViPipe, 0x04db, 0x08);
++	gc4683_write_register(ViPipe, 0x04bc, 0x40);
++	gc4683_write_register(ViPipe, 0x04bd, 0x10);
++	gc4683_write_register(ViPipe, 0x04cc, 0x20);
++	gc4683_write_register(ViPipe, 0x04cd, 0x20);
++	gc4683_write_register(ViPipe, 0x04dc, 0x20);
++	gc4683_write_register(ViPipe, 0x04dd, 0x08);
++	gc4683_write_register(ViPipe, 0x04be, 0x50);
++	gc4683_write_register(ViPipe, 0x04bf, 0x10);
++	gc4683_write_register(ViPipe, 0x04ce, 0x20);
++	gc4683_write_register(ViPipe, 0x04cf, 0x20);
++	gc4683_write_register(ViPipe, 0x04de, 0x20);
++	gc4683_write_register(ViPipe, 0x04df, 0x08);
++	gc4683_write_register(ViPipe, 0x0704, 0x07);
++	gc4683_write_register(ViPipe, 0x0715, 0x04);
++	gc4683_write_register(ViPipe, 0x0716, 0xb0);
++	gc4683_write_register(ViPipe, 0x0718, 0xd0);
++	gc4683_write_register(ViPipe, 0x071b, 0x00);
++	gc4683_write_register(ViPipe, 0x071c, 0x40);
++	gc4683_write_register(ViPipe, 0x071d, 0x00);
++	gc4683_write_register(ViPipe, 0x071e, 0x40);
++	gc4683_write_register(ViPipe, 0x031f, 0x02);
++	gc4683_write_register(ViPipe, 0x031f, 0x00);
++	gc4683_write_register(ViPipe, 0x0a67, 0x80);
++	gc4683_write_register(ViPipe, 0x0a51, 0x41);
++	gc4683_write_register(ViPipe, 0x0a52, 0x41);
++	gc4683_write_register(ViPipe, 0x0a4e, 0x0c);
++	gc4683_write_register(ViPipe, 0x0a4f, 0x0c);
++	gc4683_write_register(ViPipe, 0x0a54, 0x36);
++	gc4683_write_register(ViPipe, 0x0a55, 0x36);
++	gc4683_write_register(ViPipe, 0x0a9f, 0x17);
++	gc4683_write_register(ViPipe, 0x0a9e, 0x10);
++	gc4683_write_register(ViPipe, 0x0aa1, 0x10);
++	gc4683_write_register(ViPipe, 0x0a53, 0x00);
++	gc4683_write_register(ViPipe, 0x05be, 0x00);
++	gc4683_write_register(ViPipe, 0x05a9, 0x01);
++	gc4683_write_register(ViPipe, 0x0028, 0x0a);
++	gc4683_write_register(ViPipe, 0x0029, 0x08);
++	gc4683_write_register(ViPipe, 0x002a, 0x05);
++	gc4683_write_register(ViPipe, 0x002b, 0xa8);
++	gc4683_write_register(ViPipe, 0x0022, 0x00);
++	gc4683_write_register(ViPipe, 0x0023, 0x00);
++	gc4683_write_register(ViPipe, 0x0024, 0x00);
++	gc4683_write_register(ViPipe, 0x0025, 0x00);
++	gc4683_write_register(ViPipe, 0x0a70, 0x03);
++	gc4683_write_register(ViPipe, 0x0a71, 0x02);
++	gc4683_write_register(ViPipe, 0x0a73, 0x60);
++	gc4683_write_register(ViPipe, 0x0a82, 0x01);
++	gc4683_write_register(ViPipe, 0x0a83, 0x10);
++	gc4683_write_register(ViPipe, 0x0a5a, 0x80);
++	gc4683_write_register(ViPipe, 0x0313, 0x80);
++	delay_ms(20);
++	gc4683_write_register(ViPipe, 0x0a70, 0x00);
++	gc4683_write_register(ViPipe, 0x05be, 0x01);
++	gc4683_write_register(ViPipe, 0x0080, 0x02);
++	gc4683_write_register(ViPipe, 0x0021, 0x40);
++	gc4683_write_register(ViPipe, 0x0020, 0x8c);
++	gc4683_write_register(ViPipe, 0x0202, 0x01);
++	gc4683_write_register(ViPipe, 0x0203, 0x00);
++	gc4683_write_register(ViPipe, 0x02aa, 0x00);
++	gc4683_write_register(ViPipe, 0x02ab, 0x00);
++	gc4683_write_register(ViPipe, 0x0293, 0x00);
++	gc4683_write_register(ViPipe, 0x0294, 0x00);
++	gc4683_write_register(ViPipe, 0x0181, 0xf0);
++	gc4683_write_register(ViPipe, 0x0185, 0x08);
++	gc4683_write_register(ViPipe, 0x0111, 0x2b);
++	gc4683_write_register(ViPipe, 0x0180, 0x46);
++	gc4683_write_register(ViPipe, 0x02ce, 0x45);
++	gc4683_write_register(ViPipe, 0x02cc, 0x05);
++	gc4683_write_register(ViPipe, 0x0100, 0x09);
++	gc4683_write_register(ViPipe, 0x0106, 0x38);
++	gc4683_write_register(ViPipe, 0x010d, 0x0c);
++	gc4683_write_register(ViPipe, 0x010e, 0x80);
++	gc4683_write_register(ViPipe, 0x0112, 0x01);
++	gc4683_write_register(ViPipe, 0x0114, 0x03);
++	gc4683_write_register(ViPipe, 0x0115, 0x10);
++	gc4683_write_register(ViPipe, 0x0125, 0x20);
++	gc4683_write_register(ViPipe, 0x0124, 0x02);
++	gc4683_write_register(ViPipe, 0x0122, 0x06);
++	gc4683_write_register(ViPipe, 0x0123, 0x20);
++	gc4683_write_register(ViPipe, 0x0126, 0x08);
++	gc4683_write_register(ViPipe, 0x0121, 0x10);
++	gc4683_write_register(ViPipe, 0x0129, 0x08);
++	gc4683_write_register(ViPipe, 0x012a, 0x0a);
++	gc4683_write_register(ViPipe, 0x012b, 0x08);
++	gc4683_write_register(ViPipe, 0x0222, 0x41);
++	gc4683_write_register(ViPipe, 0x023b, 0x00);
++	gc4683_write_register(ViPipe, 0x023c, 0x18);
++	gc4683_write_register(ViPipe, 0x0201, 0x3f);
++	gc4683_write_register(ViPipe, 0x0107, 0x89);
++	gc4683_write_register(ViPipe, 0x03fe, 0x00);
++	gc4683_write_register(ViPipe, 0x0094, 0x07);
++	gc4683_write_register(ViPipe, 0x0095, 0x80);
++	gc4683_write_register(ViPipe, 0x009a, 0x01);
++	gc4683_write_register(ViPipe, 0x009b, 0x44);
++	gc4683_write_register(ViPipe, 0x010d, 0x09);
++	gc4683_write_register(ViPipe, 0x010e, 0x60);
++
++	gc4683_default_reg_init(ViPipe);
++	delay_ms(10);
++
++	printf("ViPipe:%d,===GC4683 1920x1440 30fps 10bit WDR Init OK! VTS=%u HTS=%u===\n",
++		ViPipe, GC4683_1920X1440P30_WDR_VTS, GC4683_1920X1440P30_WDR_HTS);
++}
+diff --git a/components/cvi_sensor/sensor_cfg/sensor_cfg.c b/components/cvi_sensor/sensor_cfg/sensor_cfg.c
+index e2e19ab9f1f50046b8455b04cb4de6340bb8b556..610ee32675267a6fc3d1e30b9c37270bfd2998ce 100644
+--- a/components/cvi_sensor/sensor_cfg/sensor_cfg.c
++++ b/components/cvi_sensor/sensor_cfg/sensor_cfg.c
+@@ -103,6 +103,7 @@ const char *snsr_type_name[SNS_TYPE_WDR_BUTT] = {
+ 	"GCORE_GC4683_MIPI_4M_60FPS_10BIT",
+ 	"GCORE_GC4683_MIPI_2M_60FPS_10BIT",
+ 	"GCORE_GC4683_MIPI_1M_120FPS_10BIT",
++	"GCORE_GC4683_MIPI_3M_60FPS_10BIT",
+ 	"OV_OG01A1B_MIPI_2M_30FPS_10BIT",
+ 	"OV_OG01A10_MIPI_2M_30FPS_10BIT",
+ 	"OV_OS02G10_MIPI_2M_30FPS_10BIT",
+@@ -159,6 +160,7 @@ const char *snsr_type_name[SNS_TYPE_WDR_BUTT] = {
+ 	"GCORE_GC2093_MIPI_2M_30FPS_10BIT_WDR2TO1",
+ 	"GCORE_GC4663_MIPI_4M_30FPS_10BIT_WDR2TO1",
+ 	"GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1",
++	"GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1",
+ 	"SMS_SC285SL_MIPI_2M_30FPS_10BIT_WDR2TO1",
+ 	/* ------ WDR 2TO1 END ------*/
+ };
+@@ -269,6 +271,8 @@ ISP_SNS_OBJ_S *getSnsObj(SNS_TYPE_E enSnsType)
+ 	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
++	case GCORE_GC4683_MIPI_3M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1:
+ 		return &stSnsGc4683_Obj;
+ #endif
+ #if CONFIG_SENSOR_OV_OG01A1B
+@@ -594,6 +598,11 @@ CVI_S32 getPicSize(CVI_S32 dev_id, SNS_SIZE_S *pstSize)
+ 		pstSize->u32Width  = 1920;
+ 		pstSize->u32Height = 1080;
+ 		break;
++	case GCORE_GC4683_MIPI_3M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1:
++		pstSize->u32Width  = 1920;
++		pstSize->u32Height = 1440;
++		break;
+ 	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
+ 		pstSize->u32Width  = 1280;
+ 		pstSize->u32Height = 720;
+@@ -677,6 +686,8 @@ CVI_S32 getDevAttr(VI_DEV ViDev, VI_DEV_ATTR_S *pstViDevAttr)
+ 	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
++	case GCORE_GC4683_MIPI_3M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1:
+ 		pstViDevAttr->enBayerFormat = BAYER_FORMAT_GR;
+ 		break;
+ 	// YUV Sensor
+@@ -727,6 +738,8 @@ CVI_S32 getDevAttr(VI_DEV ViDev, VI_DEV_ATTR_S *pstViDevAttr)
+ 		case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
+ 		case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
+ 		case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
++		case GCORE_GC4683_MIPI_3M_60FPS_10BIT:
++		case GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1:
+ 		case SONY_IMX675_MIPI_5M_30FPS_12BIT:
+ 		case SONY_IMX675_MIPI_5M_25FPS_12BIT_WDR2TO1:
+ 			pstViDevAttr->disEnableSbm = 1;
+@@ -812,4 +825,4 @@ CVI_S32 getSnsTypeByName(SNS_TYPE_S *SnsInfo)
+ 		return CVI_FAILURE;
+ 	}
+ 	return CVI_SUCCESS;
+-}
+\ No newline at end of file
++}
+diff --git a/components/cvi_sensor/sensor_cfg/sensor_cfg.h b/components/cvi_sensor/sensor_cfg/sensor_cfg.h
+index 5d6479a5f48454495a52fea0f8bcbe986e7ab1a7..4f231ef668d7b7ad18d58d978e4a2a51c9d567a4 100644
+--- a/components/cvi_sensor/sensor_cfg/sensor_cfg.h
++++ b/components/cvi_sensor/sensor_cfg/sensor_cfg.h
+@@ -55,6 +55,7 @@ typedef enum _SNS_TYPE_E {
+ 	GCORE_GC4683_MIPI_4M_60FPS_10BIT,
+ 	GCORE_GC4683_MIPI_2M_60FPS_10BIT,
+ 	GCORE_GC4683_MIPI_1M_120FPS_10BIT,
++	GCORE_GC4683_MIPI_3M_60FPS_10BIT,
+ 	OV_OG01A1B_MIPI_2M_30FPS_10BIT,
+ 	OV_OG01A10_MIPI_2M_30FPS_10BIT,
+ 	OV_OS02G10_MIPI_2M_30FPS_10BIT,
+@@ -113,6 +114,7 @@ typedef enum _SNS_TYPE_E {
+ 	GCORE_GC2093_MIPI_2M_30FPS_10BIT_WDR2TO1,
+ 	GCORE_GC4663_MIPI_4M_30FPS_10BIT_WDR2TO1,
+ 	GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1,
++	GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1,
+ 	SMS_SC285SL_MIPI_2M_30FPS_10BIT_WDR2TO1,
+ 	/* ------ WDR 2TO1 END ------*/
+ 	SNS_TYPE_WDR_BUTT,
+-- 
+2.25.1
+

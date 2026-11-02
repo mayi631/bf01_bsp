@@ -1,0 +1,131 @@
+From 748092b690921adf35814cbb5acb0a59b1d67c19 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Mon, 2 Nov 2026 16:10:17 +0800
+Subject: [PATCH] feat(sample): add gc4683 1920x1440 60fps linear and 30fps WDR
+ modes
+
+[description ]:
+- Add SNS_TYPE GCORE_GC4683_MIPI_3M_60FPS_10BIT and
+  GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1 to the sample common VI/ISP
+  tables: BAYER_GRBG ISP pub attr, stSnsGc4683_Obj sensor object,
+  BAYER_FORMAT_GR VI dev attr and disEnableSbm = 1, matching the existing
+  GC4683 4M/2M/1M entries.
+- Add PIC_1920x1440 to PIC_SIZE_E and SAMPLE_COMM_SYS_GetPicSize so
+  SAMPLE_COMM_VI_GetSizeBySensor can return the 1920x1440 frame size for
+  the two new modes.
+- Behavior impact: Linux-side samples (sample_vio etc.) can select the
+  GC4683 1920x1440 60fps linear or 1920x1440 30fps WDR2TO1 modes that the
+  cvi_alios GC4683 driver now provides; existing GC4683 2560x1440/1080p/720p
+  modes and other sensors are unchanged.
+
+[root   cause]:
+- The cvi_alios GC4683 driver and sensor_cfg.h added the two 1920x1440
+  modes, but the cvi_mpi sample common code only mapped the original
+  four GC4683 SNS_TYPE values, so a 1920x1440 SNS_TYPE fell into the
+  default branches with no sensor object, wrong Bayer order and no frame
+  size.
+- PIC_SIZE_E had no 1920x1440 entry, so the size lookup could not describe
+  the new modes without a new enum value.
+
+[JIRA      ID]:CV180X181X-4655
+[chip project]:181x
+[side effects]:
+- Only adds new switch cases and one PIC_SIZE_E entry inserted after
+  PIC_1088; no numeric PIC_SIZE_E value is parsed from configuration files
+  in the sample tree, so existing size handling is unaffected.
+- Syntax-checked sample_common_isp.c and sample_common_vi.c with the
+  arm-linux-gnueabihf toolchain against the cvi_alios sensor_cfg.h that
+  declares the new modes; no new warnings. Requires the matching cvi_alios
+  commit 1b8cece5 for the SNS_TYPE declarations.
+
+[Affected *.ko/*.so/*.a] :source-only change in sample/common; rebuilt sample binaries (sample_vio and other samples linking sample_common) pick up the new modes; no *.ko/*.so/*.a changed.
+
+Change-Id: I163392f9fde00fea8a61055096a1adcfd0923269
+---
+ sample/common/sample_comm.h       |  1 +
+ sample/common/sample_common_isp.c |  4 ++++
+ sample/common/sample_common_vi.c  | 13 +++++++++++++
+ 3 files changed, 18 insertions(+)
+
+diff --git a/sample/common/sample_comm.h b/sample/common/sample_comm.h
+index d196caa0729bc7aa3109379351e1f805358c5ac4..be7f2d49152cacce1886373525aeb543eb48520f 100644
+--- a/sample/common/sample_comm.h
++++ b/sample/common/sample_comm.h
+@@ -222,6 +222,7 @@ typedef enum _PIC_SIZE_E {
+ 	PIC_1600x1200,               /* Resolution (1600 * 1200) */
+ 	PIC_1080P,                   /* 1080P resolution (1920 * 1080) */
+ 	PIC_1088,                    /* Resolution (1920 * 1088) */
++	PIC_1920x1440,               /* Resolution (1920 * 1440) */
+ 	PIC_1440P,                   /* 1440P resolution (2560 * 1440) */
+ 	PIC_1536P,                   /* Resolution (2048 * 1536) */
+ 	PIC_2304x1296,               /* Resolution (2304 * 1296) */
+diff --git a/sample/common/sample_common_isp.c b/sample/common/sample_common_isp.c
+index bb1c22ca943e6970a449ce87d4c9379234e3a41f..9bcc2891998d7abcec2e5f71d9cb29e729641aa5 100644
+--- a/sample/common/sample_common_isp.c
++++ b/sample/common/sample_common_isp.c
+@@ -521,6 +521,8 @@ CVI_S32 SAMPLE_COMM_ISP_GetIspAttrBySns(SNS_TYPE_E enSnsType, ISP_PUB_ATTR_S *ps
+ 	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
++	case GCORE_GC4683_MIPI_3M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1:
+ 		pstPubAttr->enBayer = BAYER_GRBG;
+ 		break;
+ #ifdef ARCH_CV182X
+@@ -775,6 +777,8 @@ CVI_VOID *SAMPLE_COMM_GetSnsObj(SNS_TYPE_E enSnsType)
+ 	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
++	case GCORE_GC4683_MIPI_3M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1:
+ 		return &stSnsGc4683_Obj;
+ #endif
+ #if defined(SENSOR_NEXTCHIP_N5)
+diff --git a/sample/common/sample_common_vi.c b/sample/common/sample_common_vi.c
+index 8a578e4b1067a5047269a7f3fe4dcafcae57d72b..50f0029cf15c2c9647d3a714f76fe5132c59ed8c 100644
+--- a/sample/common/sample_common_vi.c
++++ b/sample/common/sample_common_vi.c
+@@ -109,6 +109,11 @@ CVI_S32 SAMPLE_COMM_SYS_GetPicSize(PIC_SIZE_E enPicSize, SIZE_S *pstSize)
+ 		pstSize->u32Height = 1088;
+ 		break;
+ 
++	case PIC_1920x1440:
++		pstSize->u32Width  = 1920;
++		pstSize->u32Height = 1440;
++		break;
++
+ 	case PIC_1440P:  /* 2560 * 1440 */
+ 		pstSize->u32Width  = 2560;
+ 		pstSize->u32Height = 1440;
+@@ -356,6 +361,8 @@ CVI_S32 SAMPLE_COMM_VI_GetDevAttrBySns(SNS_TYPE_E enSnsType, VI_DEV_ATTR_S *pstV
+ 	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
++	case GCORE_GC4683_MIPI_3M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1:
+ 		pstViDevAttr->enBayerFormat = BAYER_FORMAT_GR;
+ 		break;
+ 	default:
+@@ -379,6 +386,8 @@ CVI_S32 SAMPLE_COMM_VI_GetDevAttrBySns(SNS_TYPE_E enSnsType, VI_DEV_ATTR_S *pstV
+ 	case GCORE_GC4683_MIPI_2M_60FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
+ 	case GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1:
++	case GCORE_GC4683_MIPI_3M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1:
+ 	case SONY_IMX675_MIPI_5M_30FPS_12BIT:
+ 	case SONY_IMX675_MIPI_5M_25FPS_12BIT_WDR2TO1:
+ 		pstViDevAttr->disEnableSbm = 1;
+@@ -1020,6 +1029,10 @@ CVI_S32 SAMPLE_COMM_VI_GetSizeBySensor(SNS_TYPE_E enMode, PIC_SIZE_E *penSize)
+ 	case GCORE_GC4683_MIPI_1M_120FPS_10BIT:
+ 		*penSize = PIC_720P;
+ 		break;
++	case GCORE_GC4683_MIPI_3M_60FPS_10BIT:
++	case GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1:
++		*penSize = PIC_1920x1440;
++		break;
+ 	case OV_OV4689_MIPI_4M_30FPS_10BIT:
+ 		*penSize = PIC_2688x1520;
+ 		break;
+-- 
+2.25.1
+

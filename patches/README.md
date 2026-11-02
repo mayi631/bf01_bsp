@@ -135,6 +135,27 @@ osdrv 基线 -> 0009（可独立编译的驱动基础功能）
 S99user 不再启动 Wi-Fi 服务；驱动补丁保留供后续无线功能负责人使用。
 下文 Wi-Fi 验证方法仅适用于重新启用无线配置后的版本。
 
+## 内部 SDK 同步补丁 0022–0026
+
+- `0022-fsbl--fix-bl31-rebuild-cv181x-bl31-with-opteed-and-remove-.patch`：
+  重新构建 cv181x BL31（带 opteed）并移除启动日志；只改 fsbl 预编译产物。
+- `0023-cvi_alios--feat-sensor-add-gc4683-1920x1440-60fps-linear-and-30.patch`：
+  GC4683 新增 1920x1440 60fps linear 与 30fps WDR 模式；依赖既有 0004。
+- `patches_public/0024-cvi_alios--fix-venc-support-get-stream-from-alios.patch`：
+  更新预编译 `cvi_mw_venc/obj/cvi_venc.fastboot.cv181x.o`，支持小核直接获取
+  VENC 码流；源码改动不随本仓库发布，只交付对象文件。应用后需重新编译
+  AliOS 并更新 yoc 分区。
+- `patches_public/0025-cvi_mpi--fix-cvi_mpi-sample-declare-GC4683-1920x1440-modes-us.patch`：
+  `sensor_cfg.h` 声明 GC4683 1920x1440 60fps linear 与 30fps WDR 两个 SNS_TYPE，
+  与 cvi_alios 0023 的 sensor_cfg.h 保持一致；依赖既有 0008。
+- `0026-cvi_mpi--feat-sample-add-gc4683-1920x1440-60fps-linear-and-30.patch`：
+  sample common VI/ISP 表加入上述两个模式（Bayer GR、stSnsGc4683_Obj、
+  disEnableSbm），新增 `PIC_1920x1440` 尺寸；依赖 0025 与 cvi_alios 0023。
+
+内部 `fix(fastboot): select fastboot MPI objects`（release 构建前 clean 并以
+`BOOT_SOLUTION=fastboot` 重建 cvi_mpi 归档）的功能已包含在 0021 对
+`solutions/fastboot/Makefile` 的改动中，外部不再单独提供该补丁。
+
 ## 更新与迁移
 
 旧的 0008–0028 系列已用 revert 撤销，新的 0008–0020 替代它，

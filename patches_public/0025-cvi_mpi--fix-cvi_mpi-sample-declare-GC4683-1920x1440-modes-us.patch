@@ -1,0 +1,39 @@
+From bfb0e9c2e533dc618bb8013b59833709ec50ad8f Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Mon, 2 Nov 2026 16:11:18 +0800
+Subject: [PATCH] fix(cvi_mpi/sample): declare GC4683 1920x1440 modes used by
+ VI and ISP
+
+Problem: the sample common code adds GCORE_GC4683_MIPI_3M_60FPS_10BIT and
+GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1 cases, but sensor_cfg.h in this
+tree does not declare them.
+Fix: add the two SNS_TYPE_E entries next to the existing GC4683 linear and
+WDR declarations, matching cvi_alios components/cvi_sensor/sensor_cfg/sensor_cfg.h.
+Prerequisite: existing GC4683 mode declarations (0008).
+---
+ sample/common/sensor_cfg.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/sample/common/sensor_cfg.h b/sample/common/sensor_cfg.h
+index 5d6479a5f48454495a52fea0f8bcbe986e7ab1a7..4f231ef668d7b7ad18d58d978e4a2a51c9d567a4 100644
+--- a/sample/common/sensor_cfg.h
++++ b/sample/common/sensor_cfg.h
+@@ -55,6 +55,7 @@ typedef enum _SNS_TYPE_E {
+ 	GCORE_GC4683_MIPI_4M_60FPS_10BIT,
+ 	GCORE_GC4683_MIPI_2M_60FPS_10BIT,
+ 	GCORE_GC4683_MIPI_1M_120FPS_10BIT,
++	GCORE_GC4683_MIPI_3M_60FPS_10BIT,
+ 	OV_OG01A1B_MIPI_2M_30FPS_10BIT,
+ 	OV_OG01A10_MIPI_2M_30FPS_10BIT,
+ 	OV_OS02G10_MIPI_2M_30FPS_10BIT,
+@@ -113,6 +114,7 @@ typedef enum _SNS_TYPE_E {
+ 	GCORE_GC2093_MIPI_2M_30FPS_10BIT_WDR2TO1,
+ 	GCORE_GC4663_MIPI_4M_30FPS_10BIT_WDR2TO1,
+ 	GCORE_GC4683_MIPI_4M_30FPS_10BIT_WDR2TO1,
++	GCORE_GC4683_MIPI_3M_30FPS_10BIT_WDR2TO1,
+ 	SMS_SC285SL_MIPI_2M_30FPS_10BIT_WDR2TO1,
+ 	/* ------ WDR 2TO1 END ------*/
+ 	SNS_TYPE_WDR_BUTT,
+-- 
+2.25.1
+
