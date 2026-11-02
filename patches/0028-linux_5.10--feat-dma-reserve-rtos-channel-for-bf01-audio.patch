@@ -1,0 +1,228 @@
+From 63f3cccc13965ecab380eed8892fa05dd17070b4 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Mon, 2 Nov 2026 18:22:45 +0800
+Subject: [PATCH] feat(linux): reserve sysDMA channel for BF01 early capture
+
+Partition sysDMA channel 3 for the RTOS MIC path, preserve NAND channels, and initialize completion IRQs without leaving stale Linux DMA interrupts active.
+
+diff --git a/drivers/dma/cvitek/cvitek-dma.c b/drivers/dma/cvitek/cvitek-dma.c
+index 4431dd39120e..d8d38c4a0b5f 100644
+--- a/drivers/dma/cvitek/cvitek-dma.c
++++ b/drivers/dma/cvitek/cvitek-dma.c
+@@ -243,6 +243,7 @@ static void dwc_initialize(struct dw_dma_chan *dwc)
+ 	}
+ 
+ 	channel_writeq(dwc, INTSTATUS_ENABLEREG, int_status_reg);
++	channel_writeq(dwc, INTSIGNAL_ENABLEREG, int_status_reg);
+ 
+ 	set_bit(DW_DMA_IS_INITIALIZED, &dwc->flags);
+ }
+@@ -1638,7 +1639,9 @@ static void dw_dma_tasklet(unsigned long data)
+ 
+ 	ch_en = dma_readq(dw, CH_EN);
+ 
+-	for (i = 0; i < dw->dma.chancnt; i++) {
++	for (i = 0; i < dw->nr_channels; i++) {
++		if (dw->rtos_channel_mask & BIT(i))
++			continue;
+ 		dwc = &dw->chan[i];
+ 		if (dwc->has_interrupt == 1) {
+ 			dwc_handle_cyclic(dw, dwc,1);
+@@ -1656,7 +1659,8 @@ static void dw_dma_off(struct dw_dma *dw)
+ {
+ 	unsigned int i;
+ 
+-	dma_writeq(dw, CFG, 0); /* disable dmac and interrupt */
++	if (!dw->rtos_channel_mask)
++		dma_writeq(dw, CFG, 0);
+ 
+ 	/* Clear all interrupts on all channels. */
+ #if 0
+@@ -1667,8 +1671,12 @@ static void dw_dma_off(struct dw_dma *dw)
+ 	//while (dma_readq(dw, CFG) & DW_CFG_DMA_EN)
+ 	//	cpu_relax();
+ 
+-	for (i = 0; i < dw->dma.chancnt; i++)
+-		clear_bit(DW_DMA_IS_INITIALIZED, &dw->chan[i].flags);
++	if (!dw->chan)
++		return;
++	for (i = 0; i < dw->nr_channels; i++) {
++		if (!(dw->rtos_channel_mask & BIT(i)))
++			clear_bit(DW_DMA_IS_INITIALIZED, &dw->chan[i].flags);
++	}
+ }
+ 
+ static void dw_dma_on(struct dw_dma *dw)
+@@ -1685,7 +1693,9 @@ static void instead_of_tasklet(struct dw_dma *dw)
+ 
+ 	ch_en = dma_readq(dw, CH_EN);
+ 
+-	for (i = 0; i < dw->dma.chancnt; i++) {
++	for (i = 0; i < dw->nr_channels; i++) {
++		if (dw->rtos_channel_mask & BIT(i))
++			continue;
+ 		dwc = &dw->chan[i];
+ 		if (test_bit(DW_DMA_IS_CYCLIC, &dwc->flags)) {
+ 			if (dwc->has_interrupt == 1) {
+@@ -1706,19 +1716,18 @@ static irqreturn_t dw_dma_interrupt(int irq, void *dev_id)
+ 	struct dw_dma *dw = dev_id;
+ 	struct dw_dma_chan *dwc;
+ 
+-	/* Check if we have any interrupt from the DMAC which is not in use */
+-	if (!dw->in_use)
+-		return IRQ_NONE;
+-
+-	status = dma_readq(dw, INTSTATUS);
++	status = dma_readq(dw, INTSTATUS) & ~dw->rtos_channel_mask;
+ 	/* Check if we have any interrupt from the DMAC */
+ 	if (!status)
+ 		return IRQ_NONE;
+ 
+ 	dma_writeq(dw, COMM_INTCLEAR, 0x10f); /* clear all common interrupts */
+-	for (i = 0; i < dw->dma.chancnt; i++) {
++	for (i = 0; i < dw->nr_channels; i++) {
++		if (dw->rtos_channel_mask & BIT(i))
++			continue;
+ 		dwc = &dw->chan[i];
+-		if (((status >> i) & 0x1) && (test_bit(DW_DMA_IS_CYCLIC, &dwc->flags))) {
++		if ((dw->in_use & BIT(i)) && ((status >> i) & 0x1) &&
++		    test_bit(DW_DMA_IS_CYCLIC, &dwc->flags)) {
+ 			dwc->has_interrupt = 1;
+ 		}
+ 		dwc_status = channel_readq(dwc, INTSTATUS);
+@@ -1726,13 +1735,16 @@ static irqreturn_t dw_dma_interrupt(int irq, void *dev_id)
+ 		//dwc_interrupts_set(dwc, false);
+ 	}
+ 
+-	status = dma_readq(dw, INTSTATUS);
++	status = dma_readq(dw, INTSTATUS) & ~dw->rtos_channel_mask;
+ 	if (status) {
+ 		dev_dbg(dw->dma.dev,
+ 			"BUG: Unexpected interrupts pending: 0x%llx\n",
+ 			status);
+ 	}
+ 
++	if (!dw->in_use)
++		return IRQ_HANDLED;
++
+ #ifdef DO_NOT_USE_TASK
+ 	instead_of_tasklet(dw);
+ #else
+@@ -1763,6 +1775,12 @@ static int dw_dma_channel_init(struct platform_device *pdev,
+ 	for (i = 0; i < dw->nr_channels; i++) {
+ 		struct dw_dma_chan *dwc = &dw->chan[i];
+ 
++		dwc->ch_regs = &__dw_regs(dw)->CHAN[i];
++		dwc->mask = BIT(i);
++		if (dw->rtos_channel_mask & BIT(i))
++			continue;
++		channel_writeq(dwc, INTSIGNAL_ENABLEREG, 0);
++		channel_writeq(dwc, INTSTATUS_ENABLEREG, 0);
+ 		dwc->chan.device = &dw->dma;
+ 		dma_cookie_init(&dwc->chan);
+ 		if (dw->chan_allocation_order == CHAN_ALLOCATION_ASCENDING)
+@@ -1790,11 +1808,22 @@ static int dw_dma_channel_init(struct platform_device *pdev,
+ 		dwc->axi_tr_width = dw->block_size;
+ 	}
+ 
+-	dma_clear_bit(dw, CH_EN, DW_DMA_CHAN_MASK);
++	if (dw->rtos_channel_mask) {
++		u64 linux_mask = DW_DMA_CHAN_MASK & ~dw->rtos_channel_mask;
++		dma_writeq(dw, CH_EN, (linux_mask << DW_DMAC_CH_EN_WE_OFFSET) |
++			(linux_mask << DW_DMAC_CH_PAUSE_EN_OFFSET));
++	} else {
++		dma_clear_bit(dw, CH_EN, DW_DMA_CHAN_MASK);
++		dma_set_bit(dw, CH_EN, DW_DMA_CHAN_MASK << DW_DMAC_CH_EN_WE_OFFSET);
++		dma_set_bit(dw, CH_EN, DW_DMA_CHAN_MASK << DW_DMAC_CH_PAUSE_EN_OFFSET);
++	}
+ 
+-	/* channel en bit set */
+-	dma_set_bit(dw, CH_EN, DW_DMA_CHAN_MASK << DW_DMAC_CH_EN_WE_OFFSET);
+-	dma_set_bit(dw, CH_EN, DW_DMA_CHAN_MASK << DW_DMAC_CH_PAUSE_EN_OFFSET);
++	for (i = 0; i < dw->nr_channels; i++) {
++		if (!(dw->rtos_channel_mask & BIT(i)))
++			channel_writeq(&dw->chan[i], INTCLEARREG, 0xffffffff);
++	}
++	dma_writeq(dw, COMM_INTCLEAR, 0x10f);
++	dma_readq(dw, INTSTATUS);
+ 
+ 	/* Set capabilities */
+ 	dma_cap_set(DMA_SLAVE, dw->dma.cap_mask);
+@@ -1884,15 +1913,15 @@ static int dw_dma_resource_init(struct platform_device *pdev,
+ 		goto err_resource;
+ 	}
+ 
+-	dma_writeq(dw, RESET, 1); /* reset sysDMA */
++	of_property_read_u32(pdev->dev.of_node, "cvitek,rtos-channel-mask", &dw->rtos_channel_mask);
++	if (dw->rtos_channel_mask & ~DW_DMA_CHAN_MASK)
++		return -EINVAL;
++	if (!dw->rtos_channel_mask)
++		dma_writeq(dw, RESET, 1);
+ 
+ 	dw->irq = platform_get_irq(pdev, 0);
+ 	if (dw->irq < 0)
+ 		return -EINVAL;
+-	err = devm_request_irq(dw->dev, dw->irq, dw_dma_interrupt,
+-			       IRQF_SHARED, "dw_dmac", dw);
+-	if (err)
+-		return err;
+ 	spin_lock_init(&dw->lock);
+ 
+ 
+@@ -2111,6 +2140,11 @@ static int dw_dma_probe(struct platform_device *pdev)
+ 		goto err_chan;
+ 	}
+ 
++	err = devm_request_irq(dw->dev, dw->irq, dw_dma_interrupt,
++			       IRQF_SHARED, "dw_dmac", dw);
++	if (err)
++		goto err_chan;
++
+ 	err = dma_async_device_register(&dw->dma);
+ 	if (err)
+ 		goto err_dma_register;
+@@ -2124,7 +2158,7 @@ static int dw_dma_probe(struct platform_device *pdev)
+ 		return PTR_ERR(dw->clk);
+ 	}
+ 
+-	err = clk_prepare(dw->clk);
++	err = dw->rtos_channel_mask ? clk_prepare_enable(dw->clk) : clk_prepare(dw->clk);
+ 	dw->clk_count = 0;
+ 
+ 	if (err)
+@@ -2208,7 +2242,10 @@ static int dw_dma_remove(struct platform_device *pdev)
+ 
+ 	__dw_dma_remove(dw);
+ 	pm_runtime_disable(&pdev->dev);
+-	clk_unprepare(dw->clk);
++	if (dw->rtos_channel_mask)
++		clk_disable_unprepare(dw->clk);
++	else
++		clk_unprepare(dw->clk);
+ 
+ 	return 0;
+ }
+@@ -2253,8 +2290,9 @@ static int dw_dma_resume_early(struct device *dev)
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct dw_dma *dw = platform_get_drvdata(pdev);
+ 
+-	clk_prepare_enable(dw->clk);
+-	dma_writeq(dw, CH_EN, 0xFF00);
++	if (!dw->rtos_channel_mask)
++		clk_prepare_enable(dw->clk);
++	dma_writeq(dw, CH_EN, (DW_DMA_CHAN_MASK & ~dw->rtos_channel_mask) << DW_DMAC_CH_EN_WE_OFFSET);
+ 	dw_dma_on(dw);
+ 
+ 	return 0;
+diff --git a/drivers/dma/cvitek/cvitek-dma.h b/drivers/dma/cvitek/cvitek-dma.h
+index c1a3015eb5bc..a9a9172954e0 100644
+--- a/drivers/dma/cvitek/cvitek-dma.h
++++ b/drivers/dma/cvitek/cvitek-dma.h
+@@ -424,6 +424,7 @@ struct dw_dma {
+ 
+ 	/* dma configs */
+ 	unsigned char nr_channels;
++	u32 rtos_channel_mask;
+ 	bool is_private;
+ 	bool is_memcpy;
+ #define CHAN_ALLOCATION_ASCENDING	0	/* zero to seven */
