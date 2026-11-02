@@ -175,7 +175,7 @@ PARAM_CLASSDEFINE(PARAM_VENC_CHN_CFG_S,VENCCFG,CTX,VENC)[] = {
         .stChnParam = {
             .bEnable = 1,
             .u8VencChn = 3,
-            .enBindMode = VENC_BIND_DISABLE,
+            .enBindMode = VENC_BIND_VPSS,
             .astChn[0] = {
                 .enModId = CVI_ID_VPSS,
                 .s32DevId = 1,
@@ -186,7 +186,7 @@ PARAM_CLASSDEFINE(PARAM_VENC_CHN_CFG_S,VENCCFG,CTX,VENC)[] = {
                 .s32DevId = 0,
                 .s32ChnId = 3,
             },
-            .u16Width = 2560,
+            .u16Width = 1920,
             .u16Height = 1440,
             .u8EsBufQueueEn = 0,
             .u16EnType = PT_JPEG,
@@ -195,6 +195,7 @@ PARAM_CLASSDEFINE(PARAM_VENC_CHN_CFG_S,VENCCFG,CTX,VENC)[] = {
         },
         .stRcParam = {
             .u16RcMode = VENC_RC_MODE_MJPEGCBR,
+            .u16InitialDelay = CVI_INITIAL_DELAY_DEFAULT,
             .s16Quality = 85,
             .s16MCUPerECS = 0,
         },

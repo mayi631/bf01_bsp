@@ -147,7 +147,7 @@ PARAM_CLASSDEFINE(PARAM_VPSS_CHN_CFG_S,CHNCFG,GRP1,CHN)[] = {
     {
         .abChnEnable = 1,
         .stVpssChnAttr = {
-            .u32Width = 2560,
+            .u32Width = 1920,
             .u32Height = 1440,
             .enVideoFormat = VIDEO_FORMAT_LINEAR,
             .enPixelFormat = PIXEL_FORMAT_NV21,
@@ -158,7 +158,16 @@ PARAM_CLASSDEFINE(PARAM_VPSS_CHN_CFG_S,CHNCFG,GRP1,CHN)[] = {
             .u32Depth = 1,
             .stAspectRatio.enMode = ASPECT_RATIO_NONE,
         },
-        .stVpssChnCropInfo.bEnable = 0,
+        .stVpssChnCropInfo = {
+            .bEnable = 1,
+            .enCropCoordinate = VPSS_CROP_ABS_COOR,
+            .stCropRect = {
+                .s32X = 320,
+                .s32Y = 0,
+                .u32Width = 1920,
+                .u32Height = 1440,
+            },
+        },
         .u8VpssAttachEnable = 1,
         .u8VpssAttachId = 4,
         .u8Rotation = ROTATION_0,
@@ -217,7 +226,7 @@ PARAM_CLASSDEFINE(PARAM_VPSS_GRP_CFG_S,GRPCFG,CTX,GRP)[] = {
         .u8ChnCnt = 1,
         .pstChnCfg = PARAM_CLASS(CHNCFG,GRP1,CHN),
         .stVpssGrpCropInfo.bEnable = 0,
-        .bBindMode = 1,
+        .bBindMode = 0,
         .astChn[0] = {
             .enModId = CVI_ID_VI,
             .s32DevId = 0,

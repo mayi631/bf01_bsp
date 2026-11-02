@@ -7,7 +7,6 @@ ${CVI_SHOPTS}
 modules_seq="
 /mnt/system/ko/cv181x_sys.ko
 /mnt/system/ko/cv181x_clock_cooling.ko
-/mnt/system/ko/cv181x_sys.ko
 /mnt/system/ko/cvi_ipcm.ko
 /mnt/system/ko/cv181x_tpu.ko
 /mnt/system/ko/cv181x_ive.ko
