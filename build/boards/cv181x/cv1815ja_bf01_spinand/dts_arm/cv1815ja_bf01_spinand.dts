@@ -5,7 +5,15 @@
 #include "cv181x_default_memmap.dtsi"
 
 / {
+	sysdma_remap {
+		ch-remap = <CVI_I2S0_RX CVI_I2S2_TX CVI_I2S1_RX CVI_I2S0_RX
+			CVI_SPI_NAND CVI_SPI_NAND CVI_I2S2_RX CVI_I2S3_TX>;
+		int_mux = <0x008001f7>;
+	};
+};
 
+&dmac {
+	cvitek,rtos-channel-mask = <0x08>;
 };
 
 &wifisd{
