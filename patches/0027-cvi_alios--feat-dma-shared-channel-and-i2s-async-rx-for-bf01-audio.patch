@@ -1,0 +1,234 @@
+From bd002ecdf8bb5364647674df825319aab1b78b24 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Mon, 2 Nov 2026 18:22:42 +0800
+Subject: [PATCH] feat(cvi_alios): add shared DMA and I2S support for BF01
+ early capture
+
+Reserve a DMA channel for the RTOS early-capture path and keep Linux/NAND channels usable. Start the I2S RX DMA from the asynchronous receive path.
+
+diff --git a/components/chip_cv181x/src/drivers/dma/cvi/include/cvi_dma.h b/components/chip_cv181x/src/drivers/dma/cvi/include/cvi_dma.h
+index 4e9cbb63..039b408d 100644
+--- a/components/chip_cv181x/src/drivers/dma/cvi/include/cvi_dma.h
++++ b/components/chip_cv181x/src/drivers/dma/cvi/include/cvi_dma.h
+@@ -9,6 +9,8 @@ typedef struct {
+ } cvi_dma_ch_desc_t;
+ 
+ int cvi_dma_init(dw_dma_t *dma, int8_t ctrl_id, unsigned long reg_base, uint32_t irq_num);
++int cvi_dma_init_shared(dw_dma_t *dma, int8_t ctrl_id, unsigned long reg_base,
++    uint32_t irq_num, uint32_t channel_mask);
+ void cvi_dma_uninit(dw_dma_t *dma);
+ int cvi_dma_ch_alloc(uint8_t ctrl_idx, uint8_t ch_idx);
+ void cvi_dma_ch_stop(int ctrl_idx, int ch_idx);
+@@ -28,4 +30,4 @@ void cvi_dma_ch_attach_callback(int ctrl_idx, int ch_idx, void *callback, void *
+ void cvi_dma_ch_detach_callback(int ctrl_idx, int ch_idx);
+ int cvi_get_ch_info_random(cvi_dma_ch_desc_t *ch_info);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/components/chip_cv181x/src/drivers/dma/cvi/src/csi_dma.c b/components/chip_cv181x/src/drivers/dma/cvi/src/csi_dma.c
+index ecc17d21..053a248c 100644
+--- a/components/chip_cv181x/src/drivers/dma/cvi/src/csi_dma.c
++++ b/components/chip_cv181x/src/drivers/dma/cvi/src/csi_dma.c
+@@ -13,6 +13,11 @@
+ #include <cvi_dma.h>
+ 
+ csi_error_t csi_dma_init(csi_dma_t *dma, int8_t ctrl_id)
++{
++	return csi_dma_init_shared(dma, ctrl_id, (1U << DW_DMA_MAX_NR_CHANNELS) - 1);
++}
++
++csi_error_t csi_dma_init_shared(csi_dma_t *dma, int8_t ctrl_id, uint32_t channel_mask)
+ {
+ 	CSI_PARAM_CHK(dma, CSI_ERROR);
+ 	csi_error_t ret = CSI_OK;
+@@ -36,10 +41,11 @@ csi_error_t csi_dma_init(csi_dma_t *dma, int8_t ctrl_id)
+ 
+ 	dma->ch_num = DW_DMA_MAX_NR_CHANNELS;
+ 
+-	ret = cvi_dma_init(dw_dma, ctrl_id, dma->dev.reg_base, dma->dev.irq_num);
++	ret = cvi_dma_init_shared(dw_dma, ctrl_id, dma->dev.reg_base, dma->dev.irq_num, channel_mask);
+ 	if(ret){
+ 		dma_err("cvi_dma_init failed\r\n");
+ 		free(dw_dma);
++		dma->priv = NULL;
+ 		return CSI_ERROR;
+ 	}
+ 
+diff --git a/components/chip_cv181x/src/drivers/dma/cvi/src/cvi_dma.c b/components/chip_cv181x/src/drivers/dma/cvi/src/cvi_dma.c
+index b2c9f6ea..0953decd 100644
+--- a/components/chip_cv181x/src/drivers/dma/cvi/src/cvi_dma.c
++++ b/components/chip_cv181x/src/drivers/dma/cvi/src/cvi_dma.c
+@@ -279,14 +279,17 @@ void dw_dma_irq_handler(uint32_t irqn, void *arg)
+ 
+ 	dma_dbg("enter dw_dma_irq_handler\r\n");
+ 
+-	status = hal_dma_get_intstatus(dma);
++	status = hal_dma_get_intstatus(dma) & dma->channel_mask;
+ 	/* Check if we have any interrupt from the DMAC */
+ 	dma_dbg("intstatus = %lx\r\n", status);
+ 	if (!status)
+ 		return ;
+ 
+-	hal_dma_clear_comm_intstatus(dma); /* clear all common interrupts */
++	if (dma->channel_mask == DW_DMA_CHAN_MASK)
++		hal_dma_clear_comm_intstatus(dma);
+ 	for (int i = 0; i < dma->nr_channels; i++) {
++		if (!(dma->channel_mask & (1U << i)))
++			continue;
+ 		dwc = &dma->chans[i];
+ 		dwc_status = hal_dma_dwc_read_clear_intstatus(dwc);
+ 		if(dwc_status & DWC_CH_INTSTA_DMA_TFR_DONE){
+@@ -501,11 +504,17 @@ int cvi_set_ch_hw_param(dw_dma_channel_t *dwc, uint8_t master, uint8_t hs_polari
+ }
+ 
+ int cvi_dma_init(dw_dma_t *dma, int8_t ctrl_id, unsigned long reg_base, uint32_t irq_num)
++{
++	return cvi_dma_init_shared(dma, ctrl_id, reg_base, irq_num, DW_DMA_CHAN_MASK);
++}
++
++int cvi_dma_init_shared(dw_dma_t *dma, int8_t ctrl_id, unsigned long reg_base,
++	uint32_t irq_num, uint32_t channel_mask)
+ {
+ 	int irq_flags;
+ 
+ 	/* current soc just have dma 0 */
+-	if (ctrl_id || !dma){
++	if (ctrl_id || !dma || !channel_mask || (channel_mask & ~DW_DMA_CHAN_MASK)){
+ 		dma_err("cvi_dma_init: dma=%p, ctrl_id: %d.\r\n", dma, ctrl_id);
+ 		return -EINVAL;
+ 	}
+@@ -519,6 +528,7 @@ int cvi_dma_init(dw_dma_t *dma, int8_t ctrl_id, unsigned long reg_base, uint32_t
+ 	csi_irq_restore(irq_flags);
+ 
+ 	dw_init(dma);
++	dma->channel_mask = channel_mask;
+ 
+ 	dma_array[ctrl_id]->nr_channels = DW_DMA_MAX_NR_CHANNELS;
+ 
+@@ -529,21 +539,15 @@ int cvi_dma_init(dw_dma_t *dma, int8_t ctrl_id, unsigned long reg_base, uint32_t
+ 
+ 	dw_clk_enable(dma);
+ 
+-	hal_dma_reset(dma);
++	if (channel_mask == DW_DMA_CHAN_MASK)
++		hal_dma_reset(dma);
+ 
+ 	dma->irq_num = irq_num;
+ 
+ 	dma_dbg("dma->irq_num=%d\r\n", dma->irq_num);
+ 
+-#ifdef __riscv
+-	hal_sdma_dma_int_mux_set_c906b();
+-	dma_dbg("sdma_dma_int_mux=0x%x\r\n", sdma_dma_int_mux_get());
+-#endif
+-
+-	request_irq((uint32_t)dma->irq_num, &dw_dma_irq_handler, 0, "dma", dma);
+-
+ 	//init channel
+-	dma->alloc_status = 0U;
++	dma->alloc_status = DW_DMA_CHAN_MASK & ~channel_mask;
+ 
+ 	/* init each channel */
+ 	for (int i = 0; i < dma->nr_channels; i++) {
+@@ -552,20 +556,42 @@ int cvi_dma_init(dw_dma_t *dma, int8_t ctrl_id, unsigned long reg_base, uint32_t
+ 		dma_dbg("dwc->regs[%d]=%p\r\n", i, dwc->regs);
+ 		dlist_init(&dwc->queue_list);
+ 		dlist_init(&dwc->active_list);
++		if (!(channel_mask & (1U << i)))
++			continue;
++		hal_dma_enable_irq(dwc, 0);
+ 		//clear int status
+ 		hal_dma_dwc_clear_intstatus(dwc);
+ 
+ 		//turn off all channel
+-		hal_dma_turn_off_chans(dma);
++		if (channel_mask == DW_DMA_CHAN_MASK)
++			hal_dma_turn_off_chans(dma);
++		else
++			hal_dma_ch_off(dma, 1U << i);
++		hal_dma_dwc_clear_intstatus(dwc);
+ 	}
+ 
++	if (channel_mask == DW_DMA_CHAN_MASK)
++		hal_dma_clear_comm_intstatus(dma);
++#ifdef __riscv
++	if (channel_mask == DW_DMA_CHAN_MASK) {
++		hal_sdma_dma_int_mux_set_c906b();
++	} else {
++		volatile uint32_t *routing = (volatile uint32_t *)SDMA_DMA_INT_MUX;
++		uint32_t routing_mask = channel_mask | (channel_mask << 10) | (channel_mask << 20);
++		*routing = (*routing & ~routing_mask) | (channel_mask << 20);
++	}
++	dma_dbg("sdma_dma_int_mux=0x%x\r\n", sdma_dma_int_mux_get());
++#endif
++	request_irq((uint32_t)dma->irq_num, &dw_dma_irq_handler, 0, "dma", dma);
++
+ 	dw_clk_disable(dma);
+ 
+ 	irq_flags = csi_irq_save();
+ 	g_inited_ctrl_num++;
+ 	csi_irq_restore(irq_flags);
+ 
+-	dma_hs_remap_init();
++	if (channel_mask == DW_DMA_CHAN_MASK)
++		dma_hs_remap_init();
+ 
+ 	return 0;
+ }
+@@ -577,8 +603,10 @@ void cvi_dma_uninit(dw_dma_t *dma)
+ 	if(!dma)
+ 		return;
+ 
+-	hal_dma_off(dma);
+-	hal_dma_dwc_clk_set(0);
++	if (dma->channel_mask == DW_DMA_CHAN_MASK) {
++		hal_dma_off(dma);
++		hal_dma_dwc_clk_set(0);
++	}
+ 
+ 	csi_irq_detach(dma->irq_num);
+ 	csi_irq_disable(dma->irq_num);
+diff --git a/components/chip_cv181x/src/drivers/i2s/dw/src/i2s.c b/components/chip_cv181x/src/drivers/i2s/dw/src/i2s.c
+index ef3282e0..b55e3861 100644
+--- a/components/chip_cv181x/src/drivers/i2s/dw/src/i2s.c
++++ b/components/chip_cv181x/src/drivers/i2s/dw/src/i2s.c
+@@ -1250,6 +1250,14 @@ csi_error_t csi_i2s_receive_start(csi_i2s_t *i2s)
+     i2s_receive_rx_data(pi2s_tx);
+     memset(i2s->rx_buf->buffer, 0, i2s->rx_buf->size);
+     i2s->state.readable = 1U;
++    if (i2s->rx_dma && !i2s0_start_dma) {
++        uint32_t irq_state = csi_irq_save();
++        audio_dcache_clean_invalid_range((unsigned long)i2s->rx_buf->buffer, i2s->rx_buf->size);
++        i2s0_start_dma = true;
++        csi_dma_ch_start(i2s->rx_dma, (void *)&pi2s_tx->base_address->rx_rd_port_ch0,
++            i2s->rx_buf->buffer + i2s->rx_buf->write, i2s->rx_period);
++        csi_irq_restore(irq_state);
++    }
+     return ret;
+ }
+ 
+diff --git a/components/chip_cv181x/src/hal/dma/cvi/include/cvi_dma_ll.h b/components/chip_cv181x/src/hal/dma/cvi/include/cvi_dma_ll.h
+index 1c7bc10b..3ee7c752 100644
+--- a/components/chip_cv181x/src/hal/dma/cvi/include/cvi_dma_ll.h
++++ b/components/chip_cv181x/src/hal/dma/cvi/include/cvi_dma_ll.h
+@@ -80,6 +80,7 @@ typedef struct dw_dma {
+ 	uint8_t idx;	//current only have one dma controller
+ 	dw_dma_regs_t *regs;
+ 	uint32_t alloc_status;
++	uint32_t channel_mask;
+ 	uint32_t nr_masters;
+ 	uint32_t nr_channels;
+ 	uint32_t block_ts;
+diff --git a/components/csi/csi2/include/drv/dma.h b/components/csi/csi2/include/drv/dma.h
+index 668dd5e2..c97af056 100755
+--- a/components/csi/csi2/include/drv/dma.h
++++ b/components/csi/csi2/include/drv/dma.h
+@@ -117,6 +117,7 @@ typedef struct {
+   \return      csi error code
+ */
+ csi_error_t csi_dma_init(csi_dma_t *dma, int8_t ctrl_id);
++csi_error_t csi_dma_init_shared(csi_dma_t *dma, int8_t ctrl_id, uint32_t channel_mask);
+ 
+ /**
+   \brief       Uninit dma controller

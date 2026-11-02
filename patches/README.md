@@ -156,6 +156,30 @@ S99user 不再启动 Wi-Fi 服务；驱动补丁保留供后续无线功能负�
 `BOOT_SOLUTION=fastboot` 重建 cvi_mpi 归档）的功能已包含在 0021 对
 `solutions/fastboot/Makefile` 的改动中，外部不再单独提供该补丁。
 
+## BF01：小核早期录像与采音
+
+- `0027-cvi_alios--feat-dma-shared-channel-and-i2s-async-rx-for-bf01-audio.patch`：
+  为 BF01 小核早期采音提供共享 DMA 通道和 I2S 异步接收支持；录像联调期间的
+  DMA 初始化、通道释放和中断处理修复合并在此功能补丁中。依赖 0021 和内部
+  `patches_public/0024` 的 AliOS VENC GetStream 支持。
+- `0028-linux_5.10--feat-dma-reserve-rtos-channel-for-bf01-audio.patch`：
+  Linux 侧避开保留给小核 MIC 的 SysDMA 通道，修正共享 DMA 的中断初始化和完成
+  处理，并保持 NAND 等其他通道可用。依赖 0027。
+
+BF01 板级实现随后分为两个独立提交：
+
+```text
+0021 启动抓拍入口
+  -> 0027 AliOS DMA/I2S 采音支持
+  -> 0028 Linux SysDMA 通道保护
+  -> BF01 设备树 DMA 映射
+  -> BF01 小核 H.265/PCM 缓存与大核交接
+```
+
+板级 H.265 视频、PCM 音频缓存、三张照片后的录像启动、大小核交接和喇叭关闭
+代码位于 `cvi_alios/solutions/fastboot/customization/cv1815ja_bf01_spinand/src`。
+`ipcamera_bf01` 应用目录不属于本次 BSP 提交。
+
 ## 更新与迁移
 
 旧的 0008–0028 系列已用 revert 撤销，新的 0008–0020 替代它，
