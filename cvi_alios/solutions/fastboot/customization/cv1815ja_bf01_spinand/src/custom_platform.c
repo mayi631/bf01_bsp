@@ -73,7 +73,8 @@ static void _AudioPinmux(void)
 #if defined (CONFIG_CHIP_cv1801b) || defined (CONFIG_CHIP_cv180zb)
     PINMUX_CONFIG(SPK_EN, XGPIOA_15);
 #endif
-    PLATFORM_SpkMute(1);
+    PINMUX_CONFIG(SPK_EN, XGPIOA_15);
+    _GPIOSetValue(0, 15, 0);
 }
 static void _UartPinmux()
 {

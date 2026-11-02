@@ -7,6 +7,7 @@
 #include <aos/kernel.h>
 #include <drv/tick.h>
 #include "bf01_boot_capture.h"
+#include "bf01_boot_video.h"
 #include "cvi_ipcm.h"
 #include "cvi_sys.h"
 #include "cvi_venc.h"
@@ -356,11 +357,16 @@ static void *capture_burst(void *argument)
     uint32_t completed_ms = (uint32_t)aos_now_ms();
     printf("[boot-capture] burst finished: count=%u error=%d completed_ms=%u elapsed_ms=%u; retained until SD commit\n",
         burst.count, error, completed_ms, completed_ms - started_ms);
+    if (!error)
+        APP_BootVideoStart();
     return NULL;
 }
 
 void APP_BootCaptureStart(int media_result)
 {
+    int video_result = APP_BootVideoInit();
+    if (video_result != CVI_SUCCESS)
+        printf("[boot-video] IPC registration failed: %d\n", video_result);
     uint32_t media_ready_ms = (uint32_t)aos_now_ms();
     pthread_mutex_lock(&burst_mutex);
     burst.state = media_result == CVI_SUCCESS ? BF01_BURST_CAPTURING : BF01_BURST_FAILED;
