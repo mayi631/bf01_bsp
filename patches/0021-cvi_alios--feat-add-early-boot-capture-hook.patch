@@ -1,0 +1,52 @@
+From db21d605ce74cf9a51752e1228c9fbc93c6676d9 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Mon, 2 Nov 2026 10:00:00 +0800
+Subject: [PATCH] feat(fastboot): invoke early boot capture hook
+
+Run the optional board-level boot capture hook immediately after media
+initialization and pass through the media initialization result. Also clean
+and rebuild the fastboot MPI libraries with the fastboot build selection in
+release builds so the generated small-core image matches the solution.
+---
+ solutions/fastboot/Makefile                  | 3 ++-
+ solutions/fastboot/application/app_main.c   | 6 +++++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/solutions/fastboot/Makefile b/solutions/fastboot/Makefile
+index 18e6ca5f8a2c583f06c971d9c98abfd3422618d0..22ccf363b1fdc468bce151ca243ed289751b9055 100644
+--- a/solutions/fastboot/Makefile
++++ b/solutions/fastboot/Makefile
+@@ -25,7 +25,8 @@ endif
+ 	@/usr/bin/env python ../../scripts/defconfig/defconfig.py
+ 	@/usr/bin/env python ../../scripts/yaml_update.py
+ ifeq ($(RELEASE_FLAG),1)
+-	@make -C ../../components/cvi_mpi CHIP_ARCH=$(CHIP_ARCH)
++	@$(MAKE) -C ../../components/cvi_mpi clean
++	@$(MAKE) -C ../../components/cvi_mpi CHIP_ARCH=$(CHIP_ARCH) BOOT_SOLUTION=fastboot
+ endif
+ 	$(CPRE) scons $(VERB) --board=$(ALIOS_BOARD) -j4
+ 	@cp yoc.bin $(MK_GENERATED_IMGS_PATH)/data/prim
+diff --git a/solutions/fastboot/application/app_main.c b/solutions/fastboot/application/app_main.c
+index 938cc932f88e9c12bb3af30cecd94958c51ceb8d..c611826e2c88f09c765f993c108548423020962c 100644
+--- a/solutions/fastboot/application/app_main.c
++++ b/solutions/fastboot/application/app_main.c
+@@ -122,6 +122,8 @@ static int start_pwm(void)
+ 	return 0;
+ }
+ 
++extern void APP_BootCaptureStart(int media_result) __attribute__((weak));
++
+ int main(int argc, char *argv[])
+ {
+ #if defined(CONFIG_CHIP_BIG_ARM) && CONFIG_CHIP_BIG_ARM
+@@ -162,7 +164,9 @@ int main(int argc, char *argv[])
+ #ifdef CONFIG_RTOS_INIT_MEDIA
+ 	//custom_evenet_pre
+ 	//media video
+-	MEDIA_VIDEO_Init(0);
++	int media_result = MEDIA_VIDEO_Init(0);
++	if (APP_BootCaptureStart)
++		APP_BootCaptureStart(media_result);
+ #endif
+ 
+ #if 0
