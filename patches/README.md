@@ -164,6 +164,26 @@ S99user 不再启动 Wi-Fi 服务；驱动补丁保留供后续无线功能负�
   `REG_SPI_NAND_BOOT_CTRL=0x40280100`，提升 FSBL 读 yoc.bin / loader_2nd 的
   SPI NAND 速度。延时线参数沿用 Y15，需在 BF01（GD5F2GM7UEYIG）上验证。
 
+- `0029-build--feat-alios-pack-yoc.bin-with-128-byte-cimg-header-wh.patch`：
+  `alios.mk` 在 `CONFIG_MIRROR_2ND_PACK_HEAD=y` 时先用 `raw2cimg_alios.py`
+  （PackYocTool）给 yoc.bin 加 128B 头（magic/file_sz/chunk_crc），`fip_v2.mk`
+  把该宏导出给 fsbl；`raw2cimg_alios.py` 魔数改为小写 `cimg`，避免与 `CIMG`
+  下载头冲突。须与 0030 同时应用。
+- `0030-fsbl--fix-bl2-load-packed-2nd-image-by-header-file_sz-on-S.patch`：
+  `bl2_opt.c` 的 `MIRROR_2ND_PACK_HEAD` 路径重写：先整块读入 DRAM 再 memcpy
+  出头，从分区起点读 `file_sz+128` 后跳头做 CRC16/解压（原实现整页读会踩
+  .bss、SPI NAND 页对齐导致解压源错位）；blcp_2nd 解压类型 `COMP_LZMA`→
+  `COMP_LZ4`；`MAGIC_2ND` 改为 `cimg`；`print_head_2nd` 降为 NOTICE。
+  须与 0029、0031 同时应用。
+- `0031-cvi_alios--feat-build-compress-yoc.bin-with-lz4-and-keep-uncomp.patch`：
+  `boards/cv181xc_evb/script/aft_build.sh` 的 yoc.bin 压缩由 `lzma -zf` 改为
+  `lz4 -9`（fsbl 解压约 138ms，LZMA 约 270ms）；`solutions/fastboot/Makefile`
+  不再用压缩后的 yoc.bin 覆盖 `generated/data/prim`（主机 `product image`
+  对 LZ4 格式段错误）。配合板级 `CONFIG_COMPRESS_RTOS_BIN=y`、
+  `CONFIG_MIRROR_2ND_PACK_HEAD=y`（已写入 `cv1815ja_bf01_spinand_fastboot_defconfig`），
+  BF01 `release_blcp_2nd` 397ms→355ms。应用后需 `defconfig cv1815ja_bf01_spinand`
+  重新加载配置，再 `build_alios`、`build_uboot`，主机需安装 `lz4`。
+
 内部 `fix(fastboot): select fastboot MPI objects`（release 构建前 clean 并以
 `BOOT_SOLUTION=fastboot` 重建 cvi_mpi 归档）的功能已包含在 0021 对
 `solutions/fastboot/Makefile` 的改动中，外部不再单独提供该补丁。

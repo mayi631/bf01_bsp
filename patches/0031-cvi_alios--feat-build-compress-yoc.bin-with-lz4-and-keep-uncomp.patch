@@ -1,0 +1,63 @@
+From 8ef27bc9906178ab99da820945aec69946db8c56 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Tue, 3 Nov 2026 21:09:18 +0800
+Subject: [PATCH] feat(build): compress yoc.bin with lz4 and keep uncompressed
+ prim for product tool
+
+[description ]:
+- boards/cv181xc_evb/script/aft_build.sh: when CONFIG_COMPRESS_RTOS_BIN
+  is set, compress yoc.bin with "lz4 -9" (frame format) instead of
+  "lzma -zf". fsbl decompresses blcp_2nd with COMP_LZ4 / LZ4F_decompress.
+- solutions/fastboot/Makefile: do not overwrite generated/data/prim with
+  the compressed yoc.bin when the postbuild script already placed the
+  uncompressed copy there.
+
+[root   cause]:
+- LZMA decompression of the 2.9MB yoc.bin costs ~270ms in fsbl on BF01
+  (A53, -Os, no dcache) versus ~138ms for LZ4; LZ4 output is 1.43MB vs
+  1.03MB for LZMA but the read-time difference is small next to the
+  decompression saving.
+- The host "product image" tool segfaults when data/prim is an LZ4
+  stream (LZMA and raw are fine). aft_build.sh copies the raw yoc.bin
+  to data/prim before compressing, but the Makefile then overwrote it
+  with the compressed file, so "make" failed after the switch to lz4.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME (to be provided)
+[chip project]:181x
+[side effects]:
+- Any solution built with CONFIG_COMPRESS_RTOS_BIN on this board now
+  produces an LZ4 yoc.bin and needs an fsbl with COMP_LZ4 for blcp_2nd
+  (fsbl change in the same series). Host needs the lz4 CLI.
+- generated/data/prim, images.zip and fota.bin keep using the
+  uncompressed image as before.
+- Verified on cv1815ja_bf01_spinand fastboot: release_blcp_2nd 397ms ->
+  355ms together with MIRROR_2ND_PACK_HEAD; media init and boot
+  capture OK.
+
+[Affected *.ko/*.so/*.a] :yoc.bin (lz4 compressed), no .ko/.so/.a
+---
+ boards/cv181xc_evb/script/aft_build.sh | 2 +-
+ solutions/fastboot/Makefile            | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/boards/cv181xc_evb/script/aft_build.sh b/boards/cv181xc_evb/script/aft_build.sh
+index ccdc0cd8..18b0a41e 100644
+--- a/boards/cv181xc_evb/script/aft_build.sh
++++ b/boards/cv181xc_evb/script/aft_build.sh
+@@ -75,3 +75,3 @@ fi
+ if [ "$(echo $MK_VARIABLE | grep "CONFIG_COMPRESS_RTOS_BIN:1")" != "" ]; then
+-[ -f yoc.bin ] && cp -arf yoc.bin ${MK_GENERATED_PATH}/data/prim && lzma -zf yoc.bin && mv yoc.bin.lzma yoc.bin
++[ -f yoc.bin ] && cp -arf yoc.bin ${MK_GENERATED_PATH}/data/prim && lz4 -9 -f -q yoc.bin yoc.bin.lz4 && mv yoc.bin.lz4 yoc.bin
+ else
+diff --git a/solutions/fastboot/Makefile b/solutions/fastboot/Makefile
+index 22ccf363..b23f37a8 100644
+--- a/solutions/fastboot/Makefile
++++ b/solutions/fastboot/Makefile
+@@ -31,3 +31,3 @@ endif
+ 	$(CPRE) scons $(VERB) --board=$(ALIOS_BOARD) -j4
+-	@cp yoc.bin $(MK_GENERATED_IMGS_PATH)/data/prim
++	@[ -f $(MK_GENERATED_IMGS_PATH)/data/prim ] || cp yoc.bin $(MK_GENERATED_IMGS_PATH)/data/prim
+ 	@echo YoC SDK Done
+-- 
+2.25.1
+

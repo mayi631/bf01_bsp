@@ -1,0 +1,89 @@
+From d1f1498e6d6a0c4f9b8023093ce1b413571ec5cf Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Tue, 3 Nov 2026 20:09:49 +0800
+Subject: [PATCH] feat(alios): pack yoc.bin with 128-byte cimg header when
+ MIRROR_2ND_PACK_HEAD=y
+
+[description ]:
+- alios.mk: when CONFIG_MIRROR_2ND_PACK_HEAD=y, run raw2cimg_alios.py
+  (PackYocTool) on rawimages/yoc.bin before the normal raw2cimg download
+  header, so the 2nd partition image carries magic/version/file_sz/
+  chunk_crc and fsbl can read only file_sz bytes instead of SECEND_SIZE.
+- scripts/fip_v2.mk: export CONFIG_MIRROR_2ND_PACK_HEAD (with ':=' to
+  avoid make self-reference) so fsbl/Makefile defines MIRROR_2ND_PACK_HEAD.
+- raw2cimg_alios.py: use lowercase "cimg" (0x676d6963) as the pack
+  header magic. Uppercase "CIMG" is the USB/SD download header magic and
+  makes raw2cimg.py skip adding the download header. Matches the fsbl
+  MAGIC_2ND change in the same series.
+
+[root   cause]:
+- BF01 fsbl read the whole 3MB 2nd partition (1536 pages, ~220us/page,
+  ~340ms) regardless of the real yoc.bin size because no header told it
+  the file size. With CONFIG_COMPRESS_RTOS_BIN alone the read amount is
+  unchanged and decompression adds time, so compression was a net loss
+  (LZMA +270ms, LZ4 +138ms on release_blcp_2nd).
+
+[JIRA      ID]:TBD-BF01-BOOTTIME (to be provided)
+[chip project]:181x
+[side effects]:
+- Only active when CONFIG_MIRROR_2ND_PACK_HEAD=y; other boards unchanged.
+- Requires the matching fsbl change (cimg magic, header read from DRAM
+  buffer) because the old fsbl path reads 2KB NAND pages into a 128-byte
+  .bss header and mis-offsets the image on SPI NAND.
+- Verified on cv1815ja_bf01_spinand: release_blcp_2nd 397ms -> 355ms
+  (LZ4 + header), 397ms -> 384ms (uncompressed + header); AliOS media
+  init and boot capture OK.
+
+[Affected *.ko/*.so/*.a] :yoc.bin image layout (128-byte header), fip.bin via fsbl define; no .ko/.so/.a
+
+Change-Id: Ic7d2fa4eefa9f3704cfc7d900634500f4b7afaf6
+---
+ alios.mk                                  | 5 +++++
+ scripts/fip_v2.mk                         | 1 +
+ tools/common/image_tool/raw2cimg_alios.py | 2 +-
+ 3 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/alios.mk b/alios.mk
+index 787811069ab0f356330f674dbd00417684fcf98e..57a95d875b7ada6fbd42e5920ff2b4173bf1a159 100644
+--- a/alios.mk
++++ b/alios.mk
+@@ -34,6 +34,11 @@ alios-build: memory-map alios-depends
+ 	${Q}cd ${ALIOS_PATH};echo "y" | yoc init;cd -
+ 	${Q}$(MAKE) -C ${ALIOS_SOLUTIONS_DIR} ALIOS_BOARD=""
+ 	${Q}cp ${ALIOS_SOLUTIONS_DIR}/yoc.bin ${OUTPUT_DIR}/rawimages/
++ifeq (${CONFIG_MIRROR_2ND_PACK_HEAD},y)
++	# prepend 128-byte "cimg" header (file_sz + chunk crc) so fsbl reads only the real image size
++	$(call raw2cimg_alios,yoc.bin)
++	${Q}mv ${OUTPUT_DIR}/yoc.bin ${OUTPUT_DIR}/rawimages/yoc.bin
++endif
+ ifeq ($(CONFIG_SUP_LARGE_PART_SIZE),y)
+ 	$(call raw2cimg_lps,yoc.bin)
+ else
+diff --git a/scripts/fip_v2.mk b/scripts/fip_v2.mk
+index db6a50ed148c4f85f9ecbc23d606558b6885c199..32c87dc292e2b5b0afe7c61f5135b64ec9d8c3a6 100644
+--- a/scripts/fip_v2.mk
++++ b/scripts/fip_v2.mk
+@@ -39,6 +39,7 @@ fsbl%: export RTOS_DUMP_PRINT_SZ_IDX=$(CONFIG_DUMP_PRINT_SZ_IDX)
+ fsbl%: export RTOS_FAST_IMAGE_TYPE=${CONFIG_FAST_IMAGE_TYPE}
+ fsbl%: export RTOS_ENABLE_FREERTOS=${CONFIG_ENABLE_FREERTOS}
+ fsbl%: export COMPRESS_RTOS_BIN=${CONFIG_COMPRESS_RTOS_BIN}
++fsbl%: export CONFIG_MIRROR_2ND_PACK_HEAD:=${CONFIG_MIRROR_2ND_PACK_HEAD}
+ endif
+ fsbl%: export FSBL_SECURE_BOOT_SUPPORT=${CONFIG_FSBL_SECURE_BOOT_SUPPORT}
+ fsbl%: export ARCH=$(call qstrip,${CONFIG_ARCH})
+diff --git a/tools/common/image_tool/raw2cimg_alios.py b/tools/common/image_tool/raw2cimg_alios.py
+index 89e3da6aaafaea1566dcfbd443ee076b37310c09..4d34aa4525beecfd8726a12b369587c2b3a5ce9c 100644
+--- a/tools/common/image_tool/raw2cimg_alios.py
++++ b/tools/common/image_tool/raw2cimg_alios.py
+@@ -77,7 +77,7 @@ def main():
+                 )
+                 raise ValueError
+ 
+-            magic = 0x474d4943  # "CIMG"
++            magic = 0x676d6963  # "cimg" (lowercase: must differ from the "CIMG" download header)
+             version = 0x12345678
+             chunk_crc_offset = 0x0
+             chunk_crc_size = 0x1000
+-- 
+2.25.1
+

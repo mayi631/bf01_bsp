@@ -1,0 +1,179 @@
+From 79988eceeed717379baad56ce80834232b3a8454 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Tue, 3 Nov 2026 20:10:04 +0800
+Subject: [PATCH] fix(bl2): load packed 2nd image by header file_sz on SPI NAND
+ and switch blcp_2nd to LZ4
+
+[description ]:
+- bl2_opt.c / bl2_double_opt.c: decompress blcp_2nd (yoc.bin) with
+  COMP_LZ4 instead of COMP_LZMA; the alios build now packs yoc.bin with
+  lz4 (frame format, LZ4F_decompress).
+- bl2_opt.c load_blcp_2nd(), MIRROR_2ND_PACK_HEAD path rewritten:
+  read the first block into the DRAM image buffer and memcpy the
+  128-byte header out of it; verify it; read file_sz + 128 bytes from
+  the partition start; run verify_2nd() and bl2_decompress() on
+  buffer + 128. For an uncompressed image memmove it down to runaddr.
+- bl2_2nd_parse.h: MAGIC_2ND = 0x676d6963 ("cimg"), the PackYocTool
+  header magic, distinct from the "CIMG" download header.
+- bl2_2nd_parse.c: print_head_2nd() uses NOTICE instead of ERROR so it
+  is silent with LOG_LEVEL=0.
+
+[root   cause]:
+- Without MIRROR_2ND_PACK_HEAD fsbl reads SECEND_SIZE (whole 3MB
+  partition) for yoc.bin; on BF01 this is ~340ms at ~220us/page.
+- The existing MIRROR_2ND_PACK_HEAD path was written for eMMC: it
+  loads sizeof(struct head) into the .bss header_2nd, but
+  cv_spi_nand_read_data() rounds the size up to a 2KB page and
+  overruns .bss by 1920 bytes; it then reads from part_offset + 128,
+  which the page-granular driver rounds back to the partition start,
+  so the decompressor was handed the header instead of the image.
+- LZMA decompression of the 2.9MB image costs ~270ms on the A53 in
+  fsbl (-Os, no dcache); LZ4 costs ~138ms.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME (to be provided)
+[chip project]:181x
+[side effects]:
+- COMP_LZ4 applies whenever COMPRESS_RTOS_BIN is set; boards that still
+  pack yoc.bin with lzma must switch aft_build.sh to lz4 (cvi_alios
+  change in the same series).
+- MIRROR_2ND_PACK_HEAD path now requires the "cimg" magic produced by
+  build/tools raw2cimg_alios.py; eMMC boards using the old uppercase
+  magic need the matching build change.
+- Verified on cv1815ja_bf01_spinand (GD5F2GM7UEYIG): release_blcp_2nd
+  397ms -> 355ms with LZ4 + header, 384ms uncompressed + header; header
+  CRC16 passes, AliOS media init and boot capture OK.
+
+[Affected *.ko/*.so/*.a] :fip.bin / fip_spl.bin (bl2), no .ko/.so/.a
+
+Change-Id: I096cbaa380447228b69703ef3fec8cb464c9d2c5
+---
+ lib/utils/bl2_2nd_parse.c        |  2 +-
+ lib/utils/bl2_2nd_parse.h        |  2 +-
+ plat/cv181x/bl2/bl2_double_opt.c |  2 +-
+ plat/cv181x/bl2/bl2_opt.c        | 40 +++++++++++++++++++++++++-------
+ 4 files changed, 35 insertions(+), 11 deletions(-)
+
+diff --git a/lib/utils/bl2_2nd_parse.c b/lib/utils/bl2_2nd_parse.c
+index 7023144648899feea77d3865ace86a6dad2e8fd6..e0c08f108a98989a5b3a8bfc623f3fd3408e4397 100644
+--- a/lib/utils/bl2_2nd_parse.c
++++ b/lib/utils/bl2_2nd_parse.c
+@@ -6,7 +6,7 @@
+ struct head header_2nd;
+ void print_head_2nd(void)
+ {
+-	ERROR("HEAD:\n"
++	NOTICE("HEAD:\n"
+ 			"   magic: 0x%x\n"
+ 			"   version: 0x%x\n"
+ 			"   file_sz: 0x%x\n"
+diff --git a/lib/utils/bl2_2nd_parse.h b/lib/utils/bl2_2nd_parse.h
+index 3098c348a3a4f342c9315ff50466bd6d6a8c66bf..ad289d7cf83c5e5e8ffc5cef3898addfe276b7a4 100644
+--- a/lib/utils/bl2_2nd_parse.h
++++ b/lib/utils/bl2_2nd_parse.h
+@@ -3,7 +3,7 @@
+ 
+ #include "sys/types.h"
+ 
+-#define		MAGIC_2ND	(0x474d4943)    // "CIMG"
++#define		MAGIC_2ND	(0x676d6963)    // "cimg" (PackYocTool header, not the "CIMG" download header)
+ #define		CRC_TAG	(0x5a54)
+ #define		BOOT_FLAG_2ND	(uint32_t *)(0x0E000028)	//set 0 is success, other is fail
+ 
+diff --git a/plat/cv181x/bl2/bl2_double_opt.c b/plat/cv181x/bl2/bl2_double_opt.c
+index d119b923f3be60956bfbf2a23ec270dd0674bacf..c3d0b83d87c66d9e35c2931877c6f50750648c2b 100644
+--- a/plat/cv181x/bl2/bl2_double_opt.c
++++ b/plat/cv181x/bl2/bl2_double_opt.c
+@@ -160,7 +160,7 @@ int load_blcp_2nd_doublesdk(int retry)
+ 		ret = bl2_decompress(
+ 			(void *)(uintptr_t)fip_param2.blcp_2nd_runaddr,
+ 			&dst_size, (void *)(uintptr_t)load_pos_com,
+-			(size_t)fip_param2.blcp_2nd_size, COMP_LZMA);
++			(size_t)fip_param2.blcp_2nd_size, COMP_LZ4);
+ 
+ 		flush_dcache_range(fip_param2.blcp_2nd_runaddr, dst_size);
+ 	} else {
+diff --git a/plat/cv181x/bl2/bl2_opt.c b/plat/cv181x/bl2/bl2_opt.c
+index 7028b77dadc60acad8ee4d84ca763b9d232eef67..d38e522c10eebb03567bf01c7faa5491e565883e 100644
+--- a/plat/cv181x/bl2/bl2_opt.c
++++ b/plat/cv181x/bl2/bl2_opt.c
+@@ -279,20 +279,31 @@ int load_blcp_2nd(int retry)
+ 	}
+ 
+ 	struct head *header_2nd_ptr = get_head_2nd();
++	uint8_t *image_2nd = (uint8_t *)(uintptr_t)load_pos_com;
++
+ 	if (header_2nd_ptr != NULL) {
+-		// get 2nd header
++		/*
++		 * The 128-byte PackYocTool header sits at the start of the
++		 * partition. Storage drivers (SPI NAND: whole pages, eMMC:
++		 * 512-byte blocks) transfer more than sizeof(struct head), so
++		 * land the first block in the DRAM image buffer and copy the
++		 * header out of it instead of reading into header_2nd directly.
++		 */
+ 		header_size_2nd = sizeof(struct head);
+-		ret = load_data_from_storage((void *)header_2nd_ptr,
++		ret = load_data_from_storage((void *)(uintptr_t)load_pos_com,
+ 					     part_offset_2nd, header_size_2nd,
+ 					     retry, 0);
+ 		if (ret < 0) {
+ 			ERROR("error: load header, ret=0x%x\n", ret);
+ 			goto exit;
+ 		}
++		memcpy(header_2nd_ptr, (void *)(uintptr_t)load_pos_com,
++		       sizeof(struct head));
+ 		if (header_verify_2nd()) {
+ 			goto exit;
+ 		}
+ 		fip_param2.blcp_2nd_size = header_2nd_ptr->file_sz;
++		image_2nd += header_size_2nd;
+ 	} else {
+ 		fip_param2.blcp_2nd_size = SECEND_SIZE;
+ 	}
+@@ -300,24 +311,37 @@ int load_blcp_2nd(int retry)
+ 	NOTICE("\t load_pos:%x, part_offset_2nd:%x, size:%x\n", load_pos_com,
+ 	       part_offset_2nd, fip_param2.blcp_2nd_size);
+ 
++	/*
++	 * Always read from the partition start: SPI NAND reads are page
++	 * granular, so an offset of part_offset_2nd + 128 would be rounded
++	 * back to the page boundary anyway. The header (if any) is skipped
++	 * through image_2nd.
++	 */
+ 	ret = load_data_from_storage((void *)(uintptr_t)load_pos_com,
+-				     (part_offset_2nd + header_size_2nd),
+-				     fip_param2.blcp_2nd_size, retry, 0);
++				     part_offset_2nd,
++				     fip_param2.blcp_2nd_size + header_size_2nd,
++				     retry, 0);
+ 
+ 	if (ret < 0) {
+ 		goto exit;
+ 	}
+ 	if (header_2nd_ptr != NULL) {
+-		if (verify_2nd((uint8_t *)(uintptr_t)(load_pos_com))) {
++		if (verify_2nd(image_2nd)) {
+ 			goto exit;
+ 		}
++		if (macros_misc.blcp_2nd_comp_bin_addr == 0) {
++			/* Uncompressed image was loaded at runaddr + header: slide it down. */
++			memmove((void *)(uintptr_t)fip_param2.blcp_2nd_runaddr,
++				image_2nd, fip_param2.blcp_2nd_size);
++			image_2nd = (uint8_t *)(uintptr_t)fip_param2.blcp_2nd_runaddr;
++		}
+ 	}
+-	uint64_t data = *(uint64_t *)(uintptr_t)load_pos_com;
++	uint64_t data = *(uint64_t *)image_2nd;
+ 	NOTICE("\nthe first 8 bytes data of yoc is:0x%lx\n", data);
+ 
+ 	ret = bl2_decompress((void *)(uintptr_t)fip_param2.blcp_2nd_runaddr,
+-			     &dst_size, (void *)(uintptr_t)load_pos_com,
+-			     (size_t)fip_param2.blcp_2nd_size, COMP_LZMA);
++			     &dst_size, image_2nd,
++			     (size_t)fip_param2.blcp_2nd_size, COMP_LZ4);
+ 
+ 	/*
+ 	crc = p_rom_api_image_crc((void *)(uintptr_t)fip_param2.blcp_2nd_runaddr, fip_param2.blcp_2nd_size);
+-- 
+2.25.1
+

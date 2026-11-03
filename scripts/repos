@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """
 仓库管理脚本 - Python 实现
 
@@ -27,6 +28,11 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Set
 from dataclasses import dataclass, field
 from functools import lru_cache
+
+try:
+    import argcomplete  # 可选依赖，提供 shell TAB 补全
+except ImportError:
+    argcomplete = None
 
 # 初始化 colorama 以支持彩色输出
 colorama.init(autoreset=True)
@@ -1246,6 +1252,44 @@ def check_expected_commits(projects: List[RepoProject], txt_file: str, target_na
     return issues
 
 
+def list_patchable_commits(repo_path: str, base_commit: str) -> Optional[List[str]]:
+    """列出基线之后「可导出为补丁」的提交，oldest-first。
+
+    必须 --no-merges：git format-patch 按设计不导出 merge 提交，若把 merge 计入，
+    提交数会永久多于补丁数，check-env 误报「额外 N 笔」，genpatch 也会取错起点。
+    """
+    result = run_cmd(
+        ["git", "rev-list", "--no-merges", "--reverse", f"{base_commit}..HEAD"],
+        cwd=repo_path,
+        check=False
+    )
+    if result.returncode != 0:
+        return None
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def find_evil_merges(repo_path: str, base_commit: str) -> List[str]:
+    """找出区间内「自带改动」的 merge 提交（evil merge / 冲突解决改动）。
+
+    --no-merges 会把这些 merge 一并丢掉：纯合并的内容全部来自某个父提交，丢得无妨；
+    但 evil merge 自身携带的改动没有任何补丁能表达，漏掉会造成补丁集不完整，
+    因此必须单独提示，而不是静默通过。
+    判据：git show --cc 只输出「与所有父提交都不同」的 hunk，纯合并输出为空。
+    """
+    result = run_cmd(["git", "rev-list", "--merges", f"{base_commit}..HEAD"],
+                     cwd=repo_path, check=False)
+    if result.returncode != 0:
+        return []
+    merges = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    evil = []
+    for m in merges:
+        result = run_cmd(["git", "show", "--cc", "--format=", m],
+                         cwd=repo_path, check=False, capture_output=True)
+        if result.returncode == 0 and (result.stdout or "").strip():
+            evil.append(m)
+    return evil
+
+
 def check_patch_sync(projects: List[RepoProject], txt_file: str, patch_dirs: List[Path], target_name: str) -> List[str]:
     """先比数量，再按 From/Date/Subject（Subject 去 []）精确比对补丁。"""
     issues = []
@@ -1290,16 +1334,16 @@ def check_patch_sync(projects: List[RepoProject], txt_file: str, patch_dirs: Lis
         patch_files = collect_patch_files(patch_dirs, repo_name)
         expected_count = len(patch_files)
 
-        result = run_cmd(
-            ["git", "rev-list", "--reverse", f"{base_commit}..HEAD"],
-            cwd=str(path),
-            check=False
-        )
-        if result.returncode != 0:
+        commit_ids = list_patchable_commits(str(path), base_commit)
+        if commit_ids is None:
             issues.append(f"{label}: 无法获取基线之后提交列表")
             continue
 
-        commit_ids = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        for merge_id in find_evil_merges(str(path), base_commit):
+            issues.append(
+                f"{label}: merge 提交 {merge_id[:12]} 自带改动（非纯合并），其内容无法表达为补丁"
+            )
+
         actual_count = len(commit_ids)
 
         # 第一阶段：数量不一致直接报错
@@ -1615,16 +1659,18 @@ def gen_patches(projects: List[RepoProject], patch_dirs: List[Path], txt_file: s
         patch_files = collect_patch_files(patch_dirs, repo_name)
         existing_count = len(patch_files)
 
-        result = run_cmd(
-            ["git", "rev-list", "--reverse", f"{base_commit}..HEAD"],
-            cwd=str(path),
-            check=False
-        )
-        if result.returncode != 0:
+        commit_ids = list_patchable_commits(str(path), base_commit)
+        if commit_ids is None:
             print(config.colored("错误: 无法获取基线之后提交列表", Colors.RED))
             continue
 
-        commit_ids = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        evil_merges = find_evil_merges(str(path), base_commit)
+        if evil_merges:
+            print(config.colored("错误: 区间内存在自带改动的 merge 提交，补丁无法表达其内容，拒绝生成", Colors.RED))
+            for merge_id in evil_merges:
+                print(f"  {merge_id[:12]}")
+            continue
+
         actual_count = len(commit_ids)
 
         # ── 门禁 ──────────────────────────────────────────────
@@ -1716,10 +1762,6 @@ def main():
     setup_logging()
     signal.signal(signal.SIGINT, handle_sigint)
 
-    if len(sys.argv) < 2:
-        print_usage()
-        sys.exit(1)
-
     # 解析参数
     parser = argparse.ArgumentParser(add_help=False, usage=argparse.SUPPRESS)
     parser.add_argument("--gitclone", action="store_true")
@@ -1742,6 +1784,14 @@ def main():
     parser.add_argument("-q", "--quiet", action="store_true")
     parser.add_argument("--app", action="store_true")
     parser.add_argument("--bsp", action="store_true")
+
+    # shell TAB 补全：必须在 len(sys.argv) < 2 早退之前，否则裸敲 `<TAB>` 拿不到候选
+    if argcomplete:
+        argcomplete.autocomplete(parser)
+
+    if len(sys.argv) < 2:
+        print_usage()
+        sys.exit(1)
 
     args = parser.parse_args()
 
