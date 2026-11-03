@@ -1,0 +1,80 @@
+From 760ed92367f1c064a5318aca11bc914000892d8f Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Tue, 3 Nov 2026 17:51:52 +0800
+Subject: [PATCH] feat(fip): add FSBL_LOG_LEVEL Kconfig to control fsbl uart
+ log level
+
+[description ]:
+- Add `FSBL_LOG_LEVEL` (int, range 0~4) under FIP setting in Kconfig,
+  default 4 when BUILD_FOR_DEBUG else 1, matching the previous behaviour.
+- scripts/fip_v2.mk: when CONFIG_FSBL_LOG_LEVEL is set, pass it to the
+  fsbl build as LOG_LEVEL; otherwise fall back to the old
+  BUILD_FOR_DEBUG based 4/1 selection.
+- Lets a board defconfig set CONFIG_FSBL_LOG_LEVEL=0 so FSBL prints only
+  E: lines on uart (NOTICE/INFO/VERBOSE still go to the boot log buffer)
+  without changing BUILD_FOR_DEBUG.
+
+[root   cause]:
+- fsbl LOG_LEVEL was derived only from CONFIG_BUILD_FOR_DEBUG in
+  fip_v2.mk. BF01 fastboot keeps BUILD_FOR_DEBUG=y for kernel/U-Boot/
+  rootfs debug features, so FSBL always printed ~90 lines at 115200
+  baud during boot; on BF01 this cost ~74ms between ddr_init_end and
+  release_blcp_2nd (102ms->72ms, 527ms->453ms measured via /tmp/boottime).
+
+[JIRA      ID]:TBD-BF01-BOOTTIME (to be provided)
+[chip project]:181x
+[side effects]:
+- No change for configs that do not set CONFIG_FSBL_LOG_LEVEL; after
+  olddefconfig the new symbol takes its default (4 or 1) and the make
+  line is identical to before.
+- Verified on cv1815ja_bf01_spinand: defconfig + build_uboot produce
+  fsbl make lines with LOG_LEVEL=0, board boots normally, uart shows
+  only BootROM, DDR BIST E: lines and BL31 output before U-Boot.
+
+[Affected *.ko/*.so/*.a] :fip.bin / fip_spl.bin (bl2 build flag only), no .ko/.so/.a
+
+Change-Id: Ibf8b3b005c72b280ac73ac3ef5877831ac79d1d9
+---
+ Kconfig           | 10 ++++++++++
+ scripts/fip_v2.mk |  4 +++-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/Kconfig b/Kconfig
+index c48b1206b3093a6cd13a4bdad623b83633d272c6..c88642c3d97f6e4955dfaa5cccec302c17821efc 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -409,6 +409,16 @@ config FSBL_SECURE_BOOT_SUPPORT
+ 	  "y" only build FSBL with authentication and decryption function.
+ 	  Still need to program eFuse to enable authentication or decryption.
+ 
++config FSBL_LOG_LEVEL
++	int "FSBL uart log level (0:error 1:warn 2:notice 3:info 4:verbose)"
++	range 0 4
++	default 4 if BUILD_FOR_DEBUG
++	default 1
++	help
++	  Log level passed to FSBL build as LOG_LEVEL. Messages above this
++	  level are still kept in the boot log buffer but not printed to uart.
++	  Set 0 to keep only error messages for a quiet boot.
++
+ choice
+   prompt "Select Encryption Key of ATF"
+   config ATF_KEY_SEL_default
+diff --git a/scripts/fip_v2.mk b/scripts/fip_v2.mk
+index 7b19604727a6346639d7b2d9c46c17d06340daa1..db6a50ed148c4f85f9ecbc23d606558b6885c199 100644
+--- a/scripts/fip_v2.mk
++++ b/scripts/fip_v2.mk
+@@ -50,7 +50,9 @@ fsbl%: export CHIP_CV1811HA=${CONFIG_CHIP_cv1811ha}
+ fsbl%: export TPU_PERF_MODE=${CONFIG_CHIP_cv1812cp}
+ fsbl%: export CONFIG_ENABLE_EMMC_HW_RESET_QFN:=${CONFIG_ENABLE_EMMC_HW_RESET_QFN}
+ fsbl%: export SUSPEND=${CONFIG_SUSPEND}
+-ifeq (${CONFIG_BUILD_FOR_DEBUG},y)
++ifneq (${CONFIG_FSBL_LOG_LEVEL},)
++fsbl%: export LOG_LEVEL=${CONFIG_FSBL_LOG_LEVEL}
++else ifeq (${CONFIG_BUILD_FOR_DEBUG},y)
+ fsbl%: export LOG_LEVEL=4
+ else
+ fsbl%: export LOG_LEVEL=1
+-- 
+2.25.1
+

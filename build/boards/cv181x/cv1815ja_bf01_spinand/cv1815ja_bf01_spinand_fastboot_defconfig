@@ -48,3 +48,6 @@ CONFIG_VIRTUAL_UART=y
 
 # sensor
 CONFIG_SENSOR_GCORE_GC4683=y
+
+# fsbl: only print error messages on uart
+CONFIG_FSBL_LOG_LEVEL=0

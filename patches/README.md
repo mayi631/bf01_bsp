@@ -152,6 +152,18 @@ S99user 不再启动 Wi-Fi 服务；驱动补丁保留供后续无线功能负�
   sample common VI/ISP 表加入上述两个模式（Bayer GR、stSnsGc4683_Obj、
   disEnableSbm），新增 `PIC_1920x1440` 尺寸；依赖 0025 与 cvi_alios 0023。
 
+- `0027-build--feat-fip-add-FSBL_LOG_LEVEL-Kconfig-to-control-fsbl-.patch`：
+  `Kconfig` FIP setting 新增 `FSBL_LOG_LEVEL`（0~4，默认随 `BUILD_FOR_DEBUG`
+  取 4/1），`scripts/fip_v2.mk` 优先以它作为 fsbl 的 `LOG_LEVEL`。配合板级
+  `cv1815ja_bf01_spinand_fastboot_defconfig` 的 `CONFIG_FSBL_LOG_LEVEL=0`，
+  FSBL 串口只保留 `E:` 行，BF01 实测 `release_blcp_2nd` 527ms→453ms。
+  需 `defconfig cv1815ja_bf01_spinand` 重新应用后 `build_uboot`。
+- `0028-fsbl--fix-clk-change-clk_spi_nand-to-166.67MHz-and-SCK-to-.patch`：
+  `plat/cv181x/platform.c` 的 `sys_pll_od/nd` 把 `clk_spi_nand` 改为
+  FPLL/9=166.67MHz，并写 `REG_SPI_NAND_TRX_CTRL1=0x900`（SCK=83.3MHz）、
+  `REG_SPI_NAND_BOOT_CTRL=0x40280100`，提升 FSBL 读 yoc.bin / loader_2nd 的
+  SPI NAND 速度。延时线参数沿用 Y15，需在 BF01（GD5F2GM7UEYIG）上验证。
+
 内部 `fix(fastboot): select fastboot MPI objects`（release 构建前 clean 并以
 `BOOT_SOLUTION=fastboot` 重建 cvi_mpi 归档）的功能已包含在 0021 对
 `solutions/fastboot/Makefile` 的改动中，外部不再单独提供该补丁。

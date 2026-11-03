@@ -1,0 +1,68 @@
+From c8cf10c8b406a004dd0b9f4e304dbce173431ee6 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Tue, 3 Nov 2026 17:22:36 +0800
+Subject: [PATCH] fix(clk): change clk_spi_nand to 166.67MHz and SCK to
+ divide-by-2 (83.3MHz)
+
+[description ]:
+- sys_pll_od / sys_pll_nd: clk_spi_nand = FPLL(1500) / 9 = 166.67MHz
+  (was FPLL / 8 = 187.5MHz).
+- Program REG_SPI_NAND_TRX_CTRL1 = 0x900 (sck_h = 0, sck_l = 0) so the
+  SPI NAND SCK is clk_spi_nand / 2 = 83.3MHz, and
+  REG_SPI_NAND_BOOT_CTRL = 0x40280100 (rsp delay override, delay line
+  0x28) for sampling at the higher SCK.
+- FSBL previously left both registers at the BootROM values derived
+  from the fip nand_info (sck_l = 1, sck_h = 0 -> 187.5 / 3 = 62.5MHz),
+  so yoc.bin / loader_2nd were read at 62.5MHz.
+- Same scheme as the Y15 (ZB35Q02CYIG) change; BF01 uses GD5F2GM7UEYIG.
+
+[root   cause]:
+- BF01 boot time is dominated by FSBL reading yoc.bin (2.9MB, ~381ms,
+  ~7.6MB/s) from SPI NAND at 62.5MHz SCK; raising SCK to 83.3MHz
+  shortens the read.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME (to be provided)
+[chip project]:181x
+[side effects]:
+- Affects every SPI NAND access in FSBL (bl2, loader_2nd, yoc.bin) on
+  cv181x boards built from this tree; delay line 0x28 comes from Y15
+  and must be verified on BF01 (fip boot, yoc.bin CRC, boot time).
+- U-Boot / Linux do not rewrite these registers on the normal boot
+  path, so the setting persists at runtime.
+
+[Affected *.ko/*.so/*.a] :fip.bin / fip_spl.bin (bl2), no .ko/.so/.a
+
+Change-Id: If993612d6f8f550da1ae49ffd79e586e78b616a5
+---
+ plat/cv181x/platform.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/plat/cv181x/platform.c b/plat/cv181x/platform.c
+index 8109a6a60181eed165e36e55d4d25541e14b5fba..0073304a7dd84a0451699d8586e140e5ccf6d872 100644
+--- a/plat/cv181x/platform.c
++++ b/plat/cv181x/platform.c
+@@ -221,7 +221,9 @@ void sys_pll_od(void)
+ 	mmio_write_32(0x03002048, 0x00030009); //clk_cpu_axi0 = FPLL(1500) / 3
+ 	mmio_write_32(0x03002054, 0x00020009); //clk_tpu = TPLL(1400) / 2 = 700MHz
+ 	mmio_write_32(0x03002064, 0x00040009); //clk_emmc = FPLL(1500) / 4 = 375MHz
+-	mmio_write_32(0x03002088, 0x00080009); //clk_spi_nand = FPLL(1500) / 8 = 187.5MHz
++	mmio_write_32(0x03002088, 0x00090009); //clk_spi_nand = FPLL(1500) / 9 = 166.67MHz
++	mmio_write_32(0x04060024, 0x40280100); //REG_SPI_NAND_BOOT_CTRL
++	mmio_write_32(0x04060004, 0x900);      //REG_SPI_NAND_TRX_CTRL1: sck_h=0 sck_l=0, 166.67MHz/2=83.3MHz
+ 	mmio_write_32(0x03002098, 0x00200009); //clk_sdma_aud0 = APLL(786.432) / 32 = 24.576MHz
+ 	mmio_write_32(0x03002120, 0x000F0009); //clk_pwm_src = FPLL(1500) / 15 = 100MHz
+ 	mmio_write_32(0x030020A8, 0x00010009); //clk_uart -> clk_cam0_200 = XTAL(25) / 1 = 25MHz
+@@ -363,7 +365,9 @@ void sys_pll_nd(int vc_overdrive)
+ 
+ 	mmio_write_32(0x03002048, 0x00030009); //clk_cpu_axi0 = FPLL(1500) / 3
+ 	mmio_write_32(0x03002064, 0x00040009); //clk_emmc = FPLL(1500) / 4 = 375MHz
+-	mmio_write_32(0x03002088, 0x00080009); //clk_spi_nand = FPLL(1500) / 8 = 187.5MHz
++	mmio_write_32(0x03002088, 0x00090009); //clk_spi_nand = FPLL(1500) / 9 = 166.67MHz
++	mmio_write_32(0x04060024, 0x40280100); //REG_SPI_NAND_BOOT_CTRL
++	mmio_write_32(0x04060004, 0x900);      //REG_SPI_NAND_TRX_CTRL1: sck_h=0 sck_l=0, 166.67MHz/2=83.3MHz
+ 	mmio_write_32(0x03002098, 0x00120009); //clk_sdma_aud0 = APLL(442.368) / 18 = 24.576MHz
+ 	mmio_write_32(0x03002120, 0x000F0009); //clk_pwm_src = FPLL(1500) / 15 = 100MHz
+ 	mmio_write_32(0x030020A8, 0x00010009); //clk_uart -> clk_cam0_200 = XTAL(25) / 1 = 25MHz
+-- 
+2.25.1
+

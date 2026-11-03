@@ -83,3 +83,6 @@ CONFIG_SPL_NAND_ECC=y
 # spl support ramdisk
 CONFIG_SPL_GZIP=y
 CONFIG_SPL_LZO=y
+
+# fastboot efuse: auto run "efusew FASTBOOT" after update/USB download
+CONFIG_EFUSE_ENABLE_FASTBOOT=y
