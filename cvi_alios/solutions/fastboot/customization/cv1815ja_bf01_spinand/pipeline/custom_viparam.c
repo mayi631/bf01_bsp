@@ -39,7 +39,7 @@ PARAM_CLASSDEFINE(PARAM_ISP_CFG_S,ISPCFG,CTX,ISP)[] = {
             .pIspBinData = NULL,
             .u32IspBinDataLen = 0,
         },
-        .s8ByPassNum = 5,
+        .s8ByPassNum = 0, /* ISP freeze / VI start bypass frames (was 5); 0 = deliver from the first frame */
     }
 };
 
