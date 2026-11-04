@@ -152,13 +152,13 @@ S99user 不再启动 Wi-Fi 服务；驱动补丁保留供后续无线功能负�
   sample common VI/ISP 表加入上述两个模式（Bayer GR、stSnsGc4683_Obj、
   disEnableSbm），新增 `PIC_1920x1440` 尺寸；依赖 0025 与 cvi_alios 0023。
 
-- `0027-build--feat-fip-add-FSBL_LOG_LEVEL-Kconfig-to-control-fsbl-.patch`：
+- `0032-build--feat-fip-add-FSBL_LOG_LEVEL-Kconfig-to-control-fsbl-.patch`：
   `Kconfig` FIP setting 新增 `FSBL_LOG_LEVEL`（0~4，默认随 `BUILD_FOR_DEBUG`
   取 4/1），`scripts/fip_v2.mk` 优先以它作为 fsbl 的 `LOG_LEVEL`。配合板级
   `cv1815ja_bf01_spinand_fastboot_defconfig` 的 `CONFIG_FSBL_LOG_LEVEL=0`，
   FSBL 串口只保留 `E:` 行，BF01 实测 `release_blcp_2nd` 527ms→453ms。
   需 `defconfig cv1815ja_bf01_spinand` 重新应用后 `build_uboot`。
-- `0028-fsbl--fix-clk-change-clk_spi_nand-to-166.67MHz-and-SCK-to-.patch`：
+- `0033-fsbl--fix-clk-change-clk_spi_nand-to-166.67MHz-and-SCK-to-.patch`：
   `plat/cv181x/platform.c` 的 `sys_pll_od/nd` 把 `clk_spi_nand` 改为
   FPLL/9=166.67MHz，并写 `REG_SPI_NAND_TRX_CTRL1=0x900`（SCK=83.3MHz）、
   `REG_SPI_NAND_BOOT_CTRL=0x40280100`，提升 FSBL 读 yoc.bin / loader_2nd 的
@@ -183,6 +183,15 @@ S99user 不再启动 Wi-Fi 服务；驱动补丁保留供后续无线功能负�
   `CONFIG_MIRROR_2ND_PACK_HEAD=y`（已写入 `cv1815ja_bf01_spinand_fastboot_defconfig`），
   BF01 `release_blcp_2nd` 397ms→355ms。应用后需 `defconfig cv1815ja_bf01_spinand`
   重新加载配置，再 `build_alios`、`build_uboot`，主机需安装 `lz4`。
+
+- `0034-build--feat-fip-export-ENABLE_BOOTLOGO-to-the-fsbl-build.patch`：
+  `scripts/fip_v2.mk` 把 `ENABLE_BOOTLOGO`（`envsetup_soc.sh`，BF01 为 0）导出给
+  fsbl make，原来该变量只控制 U-Boot 的 `CONFIG_BOOTLOGO`。须与 0035 同时应用。
+- `0035-fsbl--fix-bl2-load-the-boot-logo-partition-only-when-ENABL.patch`：
+  `Makefile` 在 `ENABLE_BOOTLOGO=1` 时定义 `FSBL_LOAD_BOOTLOGO`；`mmap.h` 的
+  `BL_LOGO_*` 增加该宏条件，bootlogo 关闭时 fsbl 不再读 384KB MISC 分区
+  （192 页 SPI NAND）。开 bootlogo 的板子行为不变。BF01 实测 `release_blcp_2nd`
+  363ms→331ms。
 
 内部 `fix(fastboot): select fastboot MPI objects`（release 构建前 clean 并以
 `BOOT_SOLUTION=fastboot` 重建 cvi_mpi 归档）的功能已包含在 0021 对

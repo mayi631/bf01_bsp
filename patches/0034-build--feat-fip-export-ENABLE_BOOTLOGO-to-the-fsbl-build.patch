@@ -1,0 +1,49 @@
+From ada662a5f8f333fdd9feae7395f525fb89a85a5e Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Wed, 4 Nov 2026 18:42:53 +0800
+Subject: [PATCH] feat(fip): export ENABLE_BOOTLOGO to the fsbl build
+
+[description ]:
+- scripts/fip_v2.mk: export ENABLE_BOOTLOGO (from envsetup_soc.sh, with
+  ':=' to avoid make self-reference) to the fsbl make so fsbl can decide
+  whether to load the boot logo partition. Pairs with the fsbl change
+  that defines FSBL_LOAD_BOOTLOGO only when ENABLE_BOOTLOGO=1.
+
+[root   cause]:
+- ENABLE_BOOTLOGO only toggled U-Boot CONFIG_BOOTLOGO; fsbl never saw it
+  and loaded the MISC (logo) partition unconditionally. On BF01
+  (ENABLE_BOOTLOGO=0, SPI NAND, 384KB MISC) that is 192 wasted page
+  reads (~30-40ms) before releasing the C906L core.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME (to be provided)
+[chip project]:181x
+[side effects]:
+- Boards with ENABLE_BOOTLOGO=1 are unchanged (fsbl still loads the logo).
+- Boards with ENABLE_BOOTLOGO=0 stop loading the logo partition in fsbl
+  once the matching fsbl change is applied; U-Boot does not read the
+  logo in that configuration either, so nothing consumes it.
+- Verified on cv1815ja_bf01_spinand: release_blcp_2nd 363ms -> 331ms,
+  AliOS media init and boot capture OK.
+
+[Affected *.ko/*.so/*.a] :fip.bin / fip_spl.bin via fsbl define; no .ko/.so/.a
+
+Change-Id: Ia439b2b5e83603e861646177afdd4725bb10e05a
+---
+ scripts/fip_v2.mk | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/scripts/fip_v2.mk b/scripts/fip_v2.mk
+index 32c87dc292e2b5b0afe7c61f5135b64ec9d8c3a6..ea3ecabdc08b33fd0d8f217fdb30b268968b5f67 100644
+--- a/scripts/fip_v2.mk
++++ b/scripts/fip_v2.mk
+@@ -40,6 +40,7 @@ fsbl%: export RTOS_FAST_IMAGE_TYPE=${CONFIG_FAST_IMAGE_TYPE}
+ fsbl%: export RTOS_ENABLE_FREERTOS=${CONFIG_ENABLE_FREERTOS}
+ fsbl%: export COMPRESS_RTOS_BIN=${CONFIG_COMPRESS_RTOS_BIN}
+ fsbl%: export CONFIG_MIRROR_2ND_PACK_HEAD:=${CONFIG_MIRROR_2ND_PACK_HEAD}
++fsbl%: export ENABLE_BOOTLOGO:=${ENABLE_BOOTLOGO}
+ endif
+ fsbl%: export FSBL_SECURE_BOOT_SUPPORT=${CONFIG_FSBL_SECURE_BOOT_SUPPORT}
+ fsbl%: export ARCH=$(call qstrip,${CONFIG_ARCH})
+-- 
+2.25.1
+

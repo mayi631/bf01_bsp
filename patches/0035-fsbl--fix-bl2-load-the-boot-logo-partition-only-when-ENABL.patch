@@ -1,0 +1,76 @@
+From 59635aedce1bf5ef64b457c7c9b59a65e836bf91 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Wed, 4 Nov 2026 18:43:05 +0800
+Subject: [PATCH] fix(bl2): load the boot logo partition only when
+ ENABLE_BOOTLOGO=1
+
+[description ]:
+- Makefile: define FSBL_LOAD_BOOTLOGO when the SDK passes
+  ENABLE_BOOTLOGO=1 (exported by build/scripts/fip_v2.mk).
+- plat/cv181x/include/mmap.h: BL_LOGO_RUNADDR / BL_LOGO_LOADADDR /
+  BL_LOGO_SIZE are now only non-zero when LOGO_OFFSET,
+  CVIMMAP_BOOTLOGO_ADDR and FSBL_LOAD_BOOTLOGO are all defined. With
+  BL_LOGO_SIZE == 0 load_user_param_and_logo() skips the logo read; no C
+  code change is needed.
+
+[root   cause]:
+- mmap.h enabled the logo load whenever the partition table had a MISC
+  partition (cvipart.h provides LOGO_OFFSET) and the memory map had
+  CVIMMAP_BOOTLOGO_ADDR, regardless of ENABLE_BOOTLOGO. On BF01 the
+  bootlogo is disabled yet fsbl read the whole 384KB MISC partition
+  (192 SPI NAND pages at ~216us) into DDR on every boot, delaying
+  release_blcp_2nd by ~30-40ms.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME (to be provided)
+[chip project]:181x
+[side effects]:
+- ENABLE_BOOTLOGO=1 builds are unchanged.
+- ENABLE_BOOTLOGO=0 builds no longer place logo data at
+  CVIMMAP_BOOTLOGO_ADDR; U-Boot with CONFIG_BOOTLOGO=n does not read it.
+- Requires the build/scripts/fip_v2.mk export in the same series;
+  without it ENABLE_BOOTLOGO is empty in the fsbl make and the logo is
+  never loaded even for bootlogo-enabled boards.
+- Verified on cv1815ja_bf01_spinand (GD5F2GM7UEYIG): UPL stage 0ms,
+  release_blcp_2nd 363ms -> 331ms, AliOS media init and boot capture OK.
+
+[Affected *.ko/*.so/*.a] :fip.bin / fip_spl.bin (bl2), no .ko/.so/.a
+
+Change-Id: Iabdd4ace6b4788975009c3e1dd0f19dad8204d49
+---
+ Makefile                   | 6 ++++++
+ plat/cv181x/include/mmap.h | 2 +-
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index d1211e4386320cc69cb4fefe0e1780c0d0255d23..9a7bc40daf683d723feaf38b90ab3d6e2eea3236 100644
+--- a/Makefile
++++ b/Makefile
+@@ -209,6 +209,12 @@ ifeq (${COMPRESS_RTOS_BIN},y)
+ $(eval $(call add_define,COMPRESS_RTOS_BIN))
+ endif
+ 
++# Only load the boot logo partition (MISC) in fsbl when the SDK enables bootlogo;
++# otherwise the ~384KB read is wasted boot time.
++ifeq (${ENABLE_BOOTLOGO},1)
++$(eval $(call add_define,FSBL_LOAD_BOOTLOGO))
++endif
++
+ ifeq ($(OD_CLK_SEL),y)
+ $(eval $(call add_define,OD_CLK_SEL))
+ endif
+diff --git a/plat/cv181x/include/mmap.h b/plat/cv181x/include/mmap.h
+index 6ca76b6b1c41a736154081552f18f98788f11c06..c0191dcb0e4b237cbb33b05327ecacca35401423 100644
+--- a/plat/cv181x/include/mmap.h
++++ b/plat/cv181x/include/mmap.h
+@@ -130,7 +130,7 @@
+ #define BL_PARAM_BAK_LOADADDR 0
+ #endif
+ 
+-#if defined(LOGO_OFFSET) && defined(CVIMMAP_BOOTLOGO_ADDR)
++#if defined(LOGO_OFFSET) && defined(CVIMMAP_BOOTLOGO_ADDR) && defined(FSBL_LOAD_BOOTLOGO)
+ #define BL_LOGO_RUNADDR CVIMMAP_BOOTLOGO_ADDR
+ #define BL_LOGO_LOADADDR LOGO_OFFSET
+ #define BL_LOGO_SIZE LOGO_SIZE
+-- 
+2.25.1
+
