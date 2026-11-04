@@ -167,10 +167,10 @@ static int save_stream(const VENC_STREAM_S *stream)
     return 0;
 }
 
-static int capture_frame(void)
+static int feed_frame(uint64_t *pts)
 {
     VIDEO_FRAME_INFO_S input = {0};
-    VIDEO_FRAME_INFO_S output = {0};
+    *pts = 0;
     CVI_S32 result = CVI_VI_GetChnFrame(0, 0, &input, VIDEO_TIMEOUT_MS);
     if (result != CVI_SUCCESS)
         goto failed;
@@ -182,11 +182,43 @@ static int capture_frame(void)
     CVI_S32 released = CVI_VI_ReleaseChnFrame(0, 0, &input);
     if (result != CVI_SUCCESS || released != CVI_SUCCESS)
         goto failed;
-    result = CVI_VPSS_GetChnFrame(1, 0, &output, VIDEO_TIMEOUT_MS);
+    *pts = input.stVFrame.u64PTS;
+    return 0;
+failed:
+    printf("[boot-video] frame pipeline failed: ret=%#x\n", (unsigned int)result);
+    return EIO;
+}
+
+static void *feed_video(void *opaque)
+{
+    int error = 0;
+    uint32_t frames = 0;
+    while (!stopping()) {
+        uint64_t pts;
+        error = feed_frame(&pts);
+        if (error)
+            break;
+        if (pts && (++frames == 1 || frames % BF01_VIDEO_FPS == 0))
+            printf("[boot-video] input frames=%u pts=%llu boot_ms=%llu\n",
+                frames, (unsigned long long)pts,
+                (unsigned long long)(csi_tick_get_us() / 1000));
+    }
+    pthread_mutex_lock(&video_mutex);
+    *(int *)opaque = error;
+    if (error)
+        video_stop = 1;
+    pthread_mutex_unlock(&video_mutex);
+    return NULL;
+}
+
+static int receive_frame(void)
+{
+    VIDEO_FRAME_INFO_S output = {0};
+    CVI_S32 result = CVI_VPSS_GetChnFrame(1, 0, &output, VIDEO_TIMEOUT_MS);
     if (result != CVI_SUCCESS)
         goto failed;
     result = CVI_VENC_SendFrame(VIDEO_CHANNEL, &output, VIDEO_TIMEOUT_MS);
-    released = CVI_VPSS_ReleaseChnFrame(1, 0, &output);
+    CVI_S32 released = CVI_VPSS_ReleaseChnFrame(1, 0, &output);
     if (result != CVI_SUCCESS || released != CVI_SUCCESS)
         goto failed;
     VENC_CHN_STATUS_S status = {0};
@@ -221,7 +253,7 @@ static int capture_frame(void)
     result = CVI_VENC_ReleaseStream(VIDEO_CHANNEL, &stream);
     return result == CVI_SUCCESS ? error : EIO;
 failed:
-    printf("[boot-video] frame pipeline failed: ret=%#x\n", (unsigned int)result);
+    printf("[boot-video] stream receive failed: ret=%#x\n", (unsigned int)result);
     return EIO;
 }
 
@@ -232,6 +264,9 @@ static void *record_video(void *opaque)
     int receiving = 0;
     int unbound = 0;
     int audio_started = 0;
+    int feeding = 0;
+    int feed_error = 0;
+    pthread_t feed_thread;
     int error = EIO;
     MMF_CHN_S source = {.enModId = CVI_ID_VPSS, .s32DevId = 1, .s32ChnId = 0};
     MMF_CHN_S jpeg = {.enModId = CVI_ID_VENC, .s32DevId = 0, .s32ChnId = 3};
@@ -302,8 +337,19 @@ static void *record_video(void *opaque)
     if (error)
         goto done;
     audio_started = 1;
+    pthread_attr_t thread_attributes;
+    error = pthread_attr_init(&thread_attributes);
+    if (!error) {
+        error = pthread_attr_setstacksize(&thread_attributes, 32U * 1024);
+        if (!error)
+            error = pthread_create(&feed_thread, &thread_attributes, feed_video, &feed_error);
+        pthread_attr_destroy(&thread_attributes);
+    }
+    if (error)
+        goto done;
+    feeding = 1;
     set_state(BF01_VIDEO_CAPTURING, 0);
-    printf("[boot-video] start: boot_ms=%llu channel=%u H265 %ux%u fps=%u ring=%#x bytes=%u\n",
+    printf("[boot-video] start: boot_ms=%llu channel=%u H265 %ux%u fps=%u ring=%#x bytes=%u pipelined=1\n",
         (unsigned long long)(csi_tick_get_us() / 1000), VIDEO_CHANNEL,
         BF01_VIDEO_WIDTH, BF01_VIDEO_HEIGHT, BF01_VIDEO_FPS,
         video_status.ring_paddr, video_status.ring_size);
@@ -313,17 +359,21 @@ static void *record_video(void *opaque)
         error = APP_BootAudioError();
         if (error)
             break;
-        uint32_t frame_started_ms = (uint32_t)aos_now_ms();
-        error = capture_frame();
+        error = receive_frame();
         if (error)
             break;
-        uint32_t elapsed_ms = (uint32_t)aos_now_ms() - frame_started_ms;
-        if (elapsed_ms < 1000U / BF01_VIDEO_FPS)
-            aos_msleep(1000U / BF01_VIDEO_FPS - elapsed_ms);
     }
     if (error == ECANCELED)
         error = 0;
 done:
+    if (feeding) {
+        pthread_mutex_lock(&video_mutex);
+        video_stop = 1;
+        pthread_mutex_unlock(&video_mutex);
+        pthread_join(feed_thread, NULL);
+        if (!error)
+            error = feed_error;
+    }
     if (audio_started) {
         int audio_result = APP_BootAudioStop();
         if (!error)
