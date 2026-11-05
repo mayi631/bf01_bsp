@@ -3,12 +3,16 @@
     Please keep the first 2.5MB reserved for fip and fip size less than 1.25MB-->
     <partition label="fip" size_in_kb="2560" file="fip_spl.bin"/>
     <partition label="2nd" size_in_kb="3072" readonly="false" file="yoc.bin"/>
-    <partition label="BOOT" size_in_kb="8192" file="boot.spinand"/>
-    <partition label="MISC" size_in_kb="384" file="logo.jpg" />
-    <partition label="ENV" size_in_kb="128" file="" />
-    <partition label="ENV_BAK" size_in_kb="128" file="" />
-    <partition label="ROOTFS" size_in_kb="71680" file="rootfs.spinand" />
+    <!--A/B slots boot_a/boot_b + rootfs_a/rootfs_b. "misc" holds the A/B metadata (AvbABData) that
+        u-boot SPL reads to pick the slot and that Linux update_misc modifies (CONFIG_AB_SYSTEM).
+        Without CONFIG_AB_SYSTEM the slot is fixed at build time ("Enable b system" -> slot B).-->
+    <partition label="boot_a" size_in_kb="8192" file="boot.spinand"/>
+    <partition label="boot_b" size_in_kb="8192" file="boot_b.spinand"/>
+    <!--No ENV partition: u-boot uses the built-in default env (CONFIG_ENV_IS_NOWHERE).
+        No CFG partition: no cfg image, no ISP tuning bins (/mnt/cfg stays empty).-->
+    <partition label="misc" size_in_kb="512" file="misc.spinand"/>
+    <partition label="rootfs_a" size_in_kb="40960" file="rootfs.spinand" />
+    <partition label="rootfs_b" size_in_kb="40960" file="rootfs_b.spinand" />
     <partition label="SYSTEM" size_in_kb="40960" file="system.spinand" mountpoint="" type="ubifs" />
-    <partition label="CFG" size_in_kb="4096" file="cfg.spinand" mountpoint="/mnt/cfg" type="ubifs" />
-    <partition label="DATA" size_in_kb="126976" file="data.spinand" mountpoint="/mnt/data" type="ubifs" />
+    <partition label="DATA" size_in_kb="112768" file="data.spinand" mountpoint="/mnt/data" type="ubifs" />
 </physical_partition>

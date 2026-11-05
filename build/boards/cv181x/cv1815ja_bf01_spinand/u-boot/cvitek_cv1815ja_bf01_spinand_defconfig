@@ -46,7 +46,9 @@ CONFIG_LZMA=y
 
 CONFIG_MTD_RAW_NAND=y
 CONFIG_NAND_FLASH_CVSNFC_V3=y
-CONFIG_ENV_IS_IN_NAND=y
+# no ENV partition in partition.xml: built-in default env only (no saveenv)
+# CONFIG_ENV_IS_IN_NAND is not set
+CONFIG_ENV_IS_NOWHERE=y
 
 # for u-boot-spl
 CONFIG_SPL_SIZE_LIMIT=0x100000
@@ -86,3 +88,9 @@ CONFIG_SPL_LZO=y
 
 # fastboot efuse: auto run "efusew FASTBOOT" after update/USB download
 CONFIG_EFUSE_ENABLE_FASTBOOT=y
+
+# A/B boot slot commands (misc partition), flow enabled by SDK CONFIG_AB_SYSTEM
+CONFIG_CMD_BOOT_MODE=y
+
+# A/B fallback: a non-FIT (erased/corrupt) boot slot must fail instead of being jumped to as a raw image
+# CONFIG_SPL_RAW_IMAGE_SUPPORT is not set

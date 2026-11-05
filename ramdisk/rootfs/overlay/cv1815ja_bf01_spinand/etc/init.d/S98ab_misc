@@ -1,0 +1,20 @@
+#!/bin/sh
+${CVI_SHOPTS}
+#
+# A/B boot: tell u-boot the running slot booted fine by refilling its
+# tries_remaining in the misc partition (CONFIG_AB_SYSTEM).
+#
+case "$1" in
+  start)
+        if [ -x /bin/update_misc ]; then
+                /bin/update_misc spinand boot_ok
+        fi
+        ;;
+  stop|restart|reload)
+        ;;
+  *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac
+
+exit 0

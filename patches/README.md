@@ -221,6 +221,33 @@ BF01 板级实现随后分为两个独立提交：
 代码位于 `cvi_alios/solutions/fastboot/customization/cv1815ja_bf01_spinand/src`。
 `ipcamera_bf01` 应用目录不属于本次 BSP 提交。
 
+## A/B 分区（0036–0037）
+
+- `0036-build--feat-ab-add-misc-controlled-A-B-boot-partitions-and-.patch`：
+  `ROOTFS options` 新增 `Enable ab system`（CONFIG_AB_SYSTEM）与 `Enable b system`（CONFIG_B_SYSTEM）；
+  分区表含 `rootfs_b`/`boot_b` 时同时打包 `rootfs_b.spinand`/`boot_b.spinand`；新增 `make misc`/`pack_misc`
+  生成 misc.spinand（AvbABData，默认槽按 B_SYSTEM）；`mkcvipart.py` 输出 `BOOT_DEV(_B)`、`ROOTFS_DEV(_B)`、
+  `SPL_BOOT(_B)_PART_OFFSET`、`AB_MISC_OFFSET/SIZE`；新增 `tools/common/update_misc`（Linux 静态工具：
+  `boot_ok [N]` / `dump` / `get_active` / `set_active a|b [N]` / `set_tries a|b N` / `reinit`），AB_SYSTEM=y 时装入
+  rootfs `/bin`；CFG 分区可选（无 CFG 时不打 cfg 镜像、不拷 PQ 参数）。
+- `0037-u-boot-2021.10--feat-ab-select-the-boot-slot-from-the-misc-partition.patch`：
+  新增 `cmd/cvi_boot_mode.c`（CONFIG_CMD_BOOT_MODE，SPL 与 u-boot 共用）：从 `misc` 裸 NAND 块读 A/B 元数据选槽、
+  tries 递减、坏块跳过；SPL 快启按槽加载 `boot_a`/`boot_b`，加载失败标记该槽不可启动并同次回退另一槽；
+  bootargs 带 `ubi.mtd=rootfs_x slot_suffix=_x`；`nandboot` 先 `ab_select`；命令 `get_slot`/`set_slot`/
+  `dump_abdata`/`reinit_abdata`；cvsnfc 增加编程/擦除失败检测；`cvi_update.c` 在 `ENV_IS_NOWHERE` 下不再调 `saveenv`。
+
+0036/0037 与以下板级文件在同一笔 BSP 提交中交付：
+
+- `build/boards/cv181x/cv1815ja_bf01_spinand/partition/partition_spinand.xml`：
+  `fip | 2nd | boot_a | boot_b | misc | rootfs_a | rootfs_b | SYSTEM | DATA`（删除 MISC/ENV/ENV_BAK/CFG，并入 DATA）。
+- `build/boards/cv181x/cv1815ja_bf01_spinand/u-boot/cvitek_cv1815ja_bf01_spinand_defconfig`：
+  `CONFIG_CMD_BOOT_MODE=y`、`CONFIG_ENV_IS_NOWHERE=y`（无 ENV 分区）、关闭 `CONFIG_SPL_RAW_IMAGE_SUPPORT`
+  （否则擦空的 boot 槽会被当裸镜像执行，无法回退）。
+- `ramdisk/rootfs/overlay/cv1815ja_bf01_spinand/etc/init.d/S98ab_misc`：开机 `update_misc spinand boot_ok` 补满当前槽 tries。
+
+应用后 `menuconfig` 打开 `Enable ab system`，执行 `build_uboot`、`build_all`（含 `pack_misc`）；分区偏移变化，
+所有镜像需重新打包并全量烧录。Linux 下 `update_misc spinand set_active b` 重启切到 B 槽。
+
 ## 更新与迁移
 
 旧的 0008–0028 Wi-Fi/SDK 系列已用 revert 撤销，新的 0008–0020 替代它；

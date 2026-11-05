@@ -1,0 +1,889 @@
+From 27223ac4d4c21096a7fcca23c319be92b57f3e1d Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Thu, 5 Nov 2026 16:16:33 +0800
+Subject: [PATCH] feat(ab): select the boot slot from the misc partition with
+ fallback
+
+[description ]:
+- cmd/cvi_boot_mode.c, include/cvi_boot_mode.h (new, CONFIG_CMD_BOOT_MODE,
+  built for SPL and u-boot): read/write the AvbABData A/B record stored in
+  the raw NAND "misc" partition (AB_MISC_OFFSET/AB_MISC_SIZE from
+  cvipart.h, first good block, erase+write+verify, bad block skipping);
+  pick the bootable slot with the highest priority, decrement its
+  tries_remaining, init defaults when the record is invalid; commands
+  ab_select (sets ${root}/${ab_boot_part} for nandboot), get_slot,
+  set_slot a|b, dump_abdata, reinit_abdata.
+- common/spl/spl_nand.c: with CONFIG_AB_SYSTEM the fast boot path loads
+  the kernel from boot_a/boot_b according to the misc record; when the
+  FIT cannot be loaded the slot is marked unbootable (tries=0) and the
+  other slot is loaded in the same run. CONFIG_B_SYSTEM without
+  AB_SYSTEM selects boot_b at build time.
+- common/fdt_support.c: SPL bootargs built per selected slot
+  (cvi_ab_spl_bootargs).
+- include/configs/cv181x-asic.h: ROOTARGS from ROOTFS_DEV/ROOTFS_DEV_B
+  (ROOTARGSA/ROOTARGSB with slot_suffix=_a/_b), nandboot reads
+  ${ab_boot_part} after ab_select, CVI_SPL_BOOTAGRS_NOROOT; legacy
+  BOOT/ROOTFS names remain the default.
+- cvitek.mk: pass CONFIG_AB_SYSTEM/CONFIG_B_SYSTEM from the SDK config.
+- drivers/mtd/nand/raw/cvitek/cvsnfc_spl.c: export the SPL mtd
+  (cvsnfc_spl_get_mtd). cvsnfc.c: report page program / block erase
+  failure (STATUS_P_FAIL/E_FAIL) so misc writes can detect bad blocks.
+- cmd/cvi_update.c: SET_DL_COMPLETE uses the SRAM flag when the env is
+  not stored (CONFIG_ENV_IS_NOWHERE) instead of calling saveenv.
+- cmd/Kconfig, cmd/Makefile, scripts/config_whitelist.txt: wiring.
+
+[root   cause]:
+- The SPL fast boot path always loaded the kernel from a single fixed
+  BOOT offset and the bootargs named a fixed ROOTFS partition, so a
+  damaged kernel/rootfs could not be recovered and A/B switching was not
+  possible. BF01 (SPI NAND, fast boot without full u-boot) needs the
+  decision inside the SPL.
+- Boards without an ENV partition printed "Unknown command 'saveenv'"
+  after USB download because SET_DL_COMPLETE only checked
+  CONFIG_CMD_SAVEENV.
+
+[JIRA      ID]:TBD-BF01-AB (to be provided)
+[chip project]:181x
+[side effects]:
+- All new code is under CONFIG_AB_SYSTEM / CONFIG_B_SYSTEM /
+  CONFIG_CMD_BOOT_MODE; other boards are unaffected. cvsnfc now returns
+  an error on program/erase failure instead of silently succeeding.
+- CONFIG_SPL_RAW_IMAGE_SUPPORT must be disabled on A/B boards, otherwise
+  an erased boot slot is executed as a raw image (board defconfig).
+- Verified on cv1815ja_bf01_spinand: slot A/B boot, slot switch from
+  Linux, erased boot_b -> fallback to A, USB download without saveenv
+  error.
+
+[Affected *.ko/*.so/*.a] :fip_spl.bin / fip.bin (u-boot-spl, u-boot); no .ko/.so/.a
+
+Change-Id: Icc722c12362f8272197e785b14566c2e6762a6e5
+---
+ cmd/Kconfig                              |   7 +
+ cmd/Makefile                             |   2 +
+ cmd/cvi_boot_mode.c                      | 402 +++++++++++++++++++++++
+ cmd/cvi_update.c                         |   3 +-
+ common/fdt_support.c                     |   7 +
+ common/spl/spl_nand.c                    |  31 ++
+ cvitek.mk                                |  10 +
+ drivers/mtd/nand/raw/cvitek/cvsnfc.c     |  26 +-
+ drivers/mtd/nand/raw/cvitek/cvsnfc_spl.c |   6 +
+ include/configs/cv181x-asic.h            |  53 ++-
+ include/cvi_boot_mode.h                  |  62 ++++
+ scripts/config_whitelist.txt             |   2 +
+ 12 files changed, 603 insertions(+), 8 deletions(-)
+ create mode 100644 cmd/cvi_boot_mode.c
+ create mode 100644 include/cvi_boot_mode.h
+
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+index 00dd08b89a2f552d0d8872df05c5cca6e992f4e9..1cb5678191d755981654e96022959f9959aa4a45 100644
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -2429,6 +2429,13 @@ config CMD_CVI_JPEG
+           and decode jpg file to yuv format to the
+           destination address
+ 
++config CMD_BOOT_MODE
++	bool "cvitek A/B boot slot commands (misc partition)"
++	help
++	  ab_select / get_slot / set_slot / dump_abdata / reinit_abdata.
++	  The A/B flow itself (SPL slot selection from the misc partition)
++	  is enabled by CONFIG_AB_SYSTEM from the SDK build config.
++
+ config CMD_CVI_UPDATE
+ 	bool "cvitek update command"
+ 	default y
+diff --git a/cmd/Makefile b/cmd/Makefile
+index 1d76f44bbfc5b8dc9062874379c96bf8307fc603..623a25d417d08a7eec3851abc57cecf541851e51 100644
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -220,6 +220,8 @@ obj-$(CONFIG_$(SPL_)CMD_TLV_EEPROM) += tlv_eeprom.o
+ 
+ # core command
+ obj-y += nvedit.o
++# A/B slot selection, also used by the SPL fast boot path
++obj-$(CONFIG_CMD_BOOT_MODE) += cvi_boot_mode.o
+ 
+ obj-$(CONFIG_CMD_BCM_EXT_UTILS) += broadcom/
+ 
+diff --git a/cmd/cvi_boot_mode.c b/cmd/cvi_boot_mode.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..21d59ddceb98b8323a9c8a904f21c002ef5e9a54
+--- /dev/null
++++ b/cmd/cvi_boot_mode.c
+@@ -0,0 +1,402 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * A/B boot slot selection controlled by the "misc" partition (SPI NAND).
++ *
++ * The misc partition (AB_MISC_OFFSET/AB_MISC_SIZE from cvipart.h) is used
++ * as raw NAND blocks: the AvbABData record sits at offset 0 of the first
++ * good block that holds a valid record, the rest of the block is 0xFF.
++ * Bad or worn blocks are skipped, so the partition should span several
++ * erase blocks. The same code runs in the SPL (fast boot path, where it
++ * decides which boot_a/boot_b partition to load the kernel from) and in
++ * u-boot proper (ab_select command used by nandboot, plus debug commands).
++ *
++ * Enabled by CONFIG_AB_SYSTEM ("Enable ab system" in the SDK menuconfig);
++ * CONFIG_B_SYSTEM ("Enable b system") selects the default/fallback slot.
++ */
++#include <common.h>
++#include <command.h>
++#include <env.h>
++#include <malloc.h>
++#include <nand.h>
++#include <linux/mtd/mtd.h>
++#include <u-boot/crc.h>
++#include "cvipart.h"
++#include "cvi_boot_mode.h"
++
++#if defined(CONFIG_AB_SYSTEM) && defined(AB_MISC_OFFSET)
++
++#ifdef CONFIG_B_SYSTEM
++#define AB_DEFAULT_SLOT CVI_AB_SLOT_B
++#else
++#define AB_DEFAULT_SLOT CVI_AB_SLOT_A
++#endif
++
++#define AB_MISC_END ((loff_t)AB_MISC_OFFSET + AB_MISC_SIZE)
++
++#ifdef CONFIG_SPL_BUILD
++struct mtd_info *cvsnfc_spl_get_mtd(void);
++#endif
++
++static struct mtd_info *ab_mtd;
++static int ab_current = -1;
++
++static char slot_name(int slot)
++{
++	return slot == CVI_AB_SLOT_B ? 'B' : 'A';
++}
++
++static struct mtd_info *ab_get_mtd(void)
++{
++	if (ab_mtd)
++		return ab_mtd;
++#ifdef CONFIG_SPL_BUILD
++	ab_mtd = cvsnfc_spl_get_mtd();
++#else
++	ab_mtd = get_nand_dev_by_index(0);
++#endif
++	if (!ab_mtd || !ab_mtd->erasesize || !ab_mtd->writesize) {
++		printf("ab: nand not ready\n");
++		ab_mtd = NULL;
++	} else if (AB_MISC_SIZE < ab_mtd->erasesize) {
++		printf("ab: misc partition smaller than one block\n");
++		ab_mtd = NULL;
++	}
++	return ab_mtd;
++}
++
++static uint32_t ab_crc(const AvbABData *d)
++{
++	return crc32(0, (const uint8_t *)d, sizeof(*d) - sizeof(d->crc32));
++}
++
++static int ab_valid(const AvbABData *d)
++{
++	return !memcmp(d->magic, AVB_AB_MAGIC, AVB_AB_MAGIC_LEN) &&
++	       ab_crc(d) == d->crc32;
++}
++
++static void ab_defaults(AvbABData *d, int active)
++{
++	memset(d, 0, sizeof(*d));
++	memcpy(d->magic, AVB_AB_MAGIC, AVB_AB_MAGIC_LEN);
++	d->version_major = AVB_AB_MAJOR_VERSION;
++	d->version_minor = AVB_AB_MINOR_VERSION;
++	d->slots[0].priority = active == CVI_AB_SLOT_A ?
++			       AVB_AB_MAX_PRIORITY : AVB_AB_MAX_PRIORITY - 1;
++	d->slots[1].priority = active == CVI_AB_SLOT_B ?
++			       AVB_AB_MAX_PRIORITY : AVB_AB_MAX_PRIORITY - 1;
++	d->slots[0].tries_remaining = AVB_AB_MAX_TRIES_REMAINING;
++	d->slots[1].tries_remaining = AVB_AB_MAX_TRIES_REMAINING;
++	d->crc32 = ab_crc(d);
++}
++
++static int ab_read(struct mtd_info *mtd, loff_t from, size_t len, void *buf)
++{
++	size_t retlen = 0;
++	int ret = mtd_read(mtd, from, len, &retlen, buf);
++
++	if (ret && !mtd_is_bitflip(ret))
++		return ret;
++	return retlen == len ? 0 : -EIO;
++}
++
++/*
++ * Find the block holding a valid record (returns 1 and fills *data) or
++ * the first good block (returns 0). *block gets the block offset.
++ */
++static int ab_find_block(struct mtd_info *mtd, loff_t *block, AvbABData *data)
++{
++	loff_t off, first_good = -1;
++	AvbABData tmp;
++
++	for (off = AB_MISC_OFFSET; off < AB_MISC_END; off += mtd->erasesize) {
++		if (mtd_block_isbad(mtd, off))
++			continue;
++		if (first_good < 0)
++			first_good = off;
++		if (ab_read(mtd, off + AVB_AB_OFFSET_IN_MISC, sizeof(tmp), &tmp))
++			continue;
++		if (ab_valid(&tmp)) {
++			*block = off;
++			if (data)
++				*data = tmp;
++			return 1;
++		}
++	}
++	if (first_good < 0)
++		return -ENOSPC;
++	*block = first_good;
++	return 0;
++}
++
++int cvi_ab_load(AvbABData *out)
++{
++	struct mtd_info *mtd = ab_get_mtd();
++	loff_t block;
++	int ret;
++
++	if (!mtd)
++		return -ENODEV;
++	ret = ab_find_block(mtd, &block, out);
++	if (ret < 0)
++		return ret;
++	return ret == 1 ? 0 : -ENOENT;
++}
++
++static int ab_store(AvbABData *data)
++{
++	struct mtd_info *mtd = ab_get_mtd();
++	struct erase_info instr;
++	loff_t block;
++	size_t retlen;
++	u8 *page;
++	int ret;
++
++	if (!mtd)
++		return -ENODEV;
++	data->crc32 = ab_crc(data);
++	ret = ab_find_block(mtd, &block, NULL);
++	if (ret < 0)
++		return ret;
++
++	page = malloc(mtd->writesize);
++	if (!page)
++		return -ENOMEM;
++	memset(page, 0xff, mtd->writesize);
++	memcpy(page + AVB_AB_OFFSET_IN_MISC, data, sizeof(*data));
++
++	ret = -EIO;
++	for (; block < AB_MISC_END; block += mtd->erasesize) {
++		AvbABData chk;
++
++		if (mtd_block_isbad(mtd, block))
++			continue;
++		memset(&instr, 0, sizeof(instr));
++		instr.mtd = mtd;
++		instr.addr = block;
++		instr.len = mtd->erasesize;
++		if (mtd_erase(mtd, &instr)) {
++			printf("ab: erase misc block 0x%lx failed, mark bad\n",
++			       (ulong)block);
++			mtd_block_markbad(mtd, block);
++			continue;
++		}
++		retlen = 0;
++		if (mtd_write(mtd, block, mtd->writesize, &retlen, page) ||
++		    retlen != mtd->writesize) {
++			printf("ab: write misc block 0x%lx failed\n", (ulong)block);
++			continue;
++		}
++		if (!ab_read(mtd, block + AVB_AB_OFFSET_IN_MISC, sizeof(chk), &chk) &&
++		    !memcmp(&chk, data, sizeof(chk))) {
++			ret = 0;
++			break;
++		}
++		printf("ab: verify misc block 0x%lx failed\n", (ulong)block);
++	}
++	free(page);
++	if (ret)
++		printf("ab: store misc failed (%d)\n", ret);
++	return ret;
++}
++
++static int slot_bootable(const AvbABSlotData *s)
++{
++	return s->priority > 0 && (s->successful_boot || s->tries_remaining > 0);
++}
++
++static int ab_pick(const AvbABData *d)
++{
++	int a = slot_bootable(&d->slots[0]);
++	int b = slot_bootable(&d->slots[1]);
++
++	if (a && b)
++		return d->slots[1].priority > d->slots[0].priority ?
++		       CVI_AB_SLOT_B : CVI_AB_SLOT_A;
++	if (a)
++		return CVI_AB_SLOT_A;
++	if (b)
++		return CVI_AB_SLOT_B;
++	return -1;
++}
++
++int cvi_ab_select_slot(void)
++{
++	AvbABData d;
++	int slot, ret;
++
++	ret = cvi_ab_load(&d);
++	if (ret) {
++		printf("ab: misc A/B data invalid (%d), init defaults\n", ret);
++		ab_defaults(&d, AB_DEFAULT_SLOT);
++		ab_store(&d);
++	}
++
++	slot = ab_pick(&d);
++	if (slot < 0) {
++		slot = AB_DEFAULT_SLOT;
++		printf("ab: no bootable slot, fallback to %c\n", slot_name(slot));
++	} else if (!d.slots[slot].successful_boot &&
++		   d.slots[slot].tries_remaining > 0) {
++		d.slots[slot].tries_remaining--;
++		ab_store(&d);
++	}
++
++	printf("ab: A prio=%u tries=%u ok=%u | B prio=%u tries=%u ok=%u -> boot slot %c\n",
++	       d.slots[0].priority, d.slots[0].tries_remaining, d.slots[0].successful_boot,
++	       d.slots[1].priority, d.slots[1].tries_remaining, d.slots[1].successful_boot,
++	       slot_name(slot));
++	ab_current = slot;
++	return slot;
++}
++
++int cvi_ab_current_slot(void)
++{
++	return ab_current < 0 ? AB_DEFAULT_SLOT : ab_current;
++}
++
++void cvi_ab_set_current_slot(int slot)
++{
++	ab_current = slot == CVI_AB_SLOT_B ? CVI_AB_SLOT_B : CVI_AB_SLOT_A;
++}
++
++int cvi_ab_mark_unbootable(int slot)
++{
++	AvbABData d;
++
++	if (cvi_ab_load(&d))
++		return -ENOENT;
++	d.slots[slot & 1].tries_remaining = 0;
++	d.slots[slot & 1].successful_boot = 0;
++	return ab_store(&d);
++}
++
++int cvi_ab_set_active(int slot)
++{
++	AvbABData d;
++
++	slot &= 1;
++	if (cvi_ab_load(&d))
++		ab_defaults(&d, slot);
++	d.slots[slot].priority = AVB_AB_MAX_PRIORITY;
++	d.slots[slot].tries_remaining = AVB_AB_MAX_TRIES_REMAINING;
++	d.slots[slot].successful_boot = 0;
++	d.slots[slot ^ 1].priority = AVB_AB_MAX_PRIORITY - 1;
++	return ab_store(&d);
++}
++
++int cvi_ab_reinit(void)
++{
++	AvbABData d;
++
++	ab_defaults(&d, AB_DEFAULT_SLOT);
++	return ab_store(&d);
++}
++
++void cvi_ab_dump(void)
++{
++	AvbABData d;
++	int i, ret = cvi_ab_load(&d);
++
++	if (ret) {
++		printf("ab: no valid A/B data in misc (%d)\n", ret);
++		return;
++	}
++	printf("version=%u.%u crc=%08x\n", d.version_major, d.version_minor, d.crc32);
++	for (i = 0; i < 2; i++)
++		printf("slot %c: priority=%u tries_remaining=%u successful_boot=%u%s\n",
++		       slot_name(i), d.slots[i].priority, d.slots[i].tries_remaining,
++		       d.slots[i].successful_boot,
++		       slot_bootable(&d.slots[i]) ? "" : " (not bootable)");
++	i = ab_pick(&d);
++	printf("next boot: %s\n", i < 0 ? "none (default)" : (i ? "B" : "A"));
++}
++
++const char *cvi_ab_rootargs(int slot)
++{
++	return slot == CVI_AB_SLOT_B ? ROOTARGSB : ROOTARGSA;
++}
++
++const char *cvi_ab_spl_bootargs(void)
++{
++	static char buf[768];
++
++	snprintf(buf, sizeof(buf), "%s %s %s", PARTS,
++		 cvi_ab_rootargs(cvi_ab_current_slot()), CVI_SPL_BOOTAGRS_NOROOT);
++	return buf;
++}
++
++#ifndef CONFIG_SPL_BUILD
++/* Used by nandboot: pick the slot and export root/ab_boot_part to the env. */
++static int do_ab_select(struct cmd_tbl *cmdtp, int flag, int argc,
++			char *const argv[])
++{
++	int slot = cvi_ab_select_slot();
++
++	env_set("root", cvi_ab_rootargs(slot));
++	env_set("ab_boot_part", slot == CVI_AB_SLOT_B ? BOOT_DEV_B : BOOT_DEV);
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(ab_select, 1, 0, do_ab_select,
++	   "select A/B boot slot from misc, set root and ab_boot_part env",
++	   "");
++
++static int do_get_slot(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	AvbABData d;
++	int slot;
++
++	if (cvi_ab_load(&d))
++		return CMD_RET_FAILURE;
++	slot = ab_pick(&d);
++	if (slot < 0)
++		return CMD_RET_FAILURE;
++	printf("slot_suffix = %s\n", slot == CVI_AB_SLOT_B ? "_b" : "_a");
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(get_slot, 1, 0, do_get_slot,
++	   "print the A/B slot that will boot next", "");
++
++static int do_set_slot(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	int slot;
++
++	if (argc != 2)
++		return CMD_RET_USAGE;
++	if (!strcmp(argv[1], "a") || !strcmp(argv[1], "A") || !strcmp(argv[1], "_a"))
++		slot = CVI_AB_SLOT_A;
++	else if (!strcmp(argv[1], "b") || !strcmp(argv[1], "B") || !strcmp(argv[1], "_b"))
++		slot = CVI_AB_SLOT_B;
++	else
++		return CMD_RET_USAGE;
++	return cvi_ab_set_active(slot) ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(set_slot, 2, 0, do_set_slot,
++	   "make A/B slot a|b the active one", "a|b");
++
++static int do_dump_abdata(struct cmd_tbl *cmdtp, int flag, int argc,
++			  char *const argv[])
++{
++	cvi_ab_dump();
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(dump_abdata, 1, 0, do_dump_abdata,
++	   "dump the A/B metadata stored in misc", "");
++
++static int do_reinit_abdata(struct cmd_tbl *cmdtp, int flag, int argc,
++			    char *const argv[])
++{
++	return cvi_ab_reinit() ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(reinit_abdata, 1, 0, do_reinit_abdata,
++	   "restore default A/B metadata in misc", "");
++#endif /* !CONFIG_SPL_BUILD */
++
++#endif /* CONFIG_AB_SYSTEM && AB_MISC_OFFSET */
+diff --git a/cmd/cvi_update.c b/cmd/cvi_update.c
+index 9d3b8af393de060f9f07c2a5774e37d33f3b25bb..468d18e509b857a6ed31342df2f159a216b843e9 100644
+--- a/cmd/cvi_update.c
++++ b/cmd/cvi_update.c
+@@ -32,7 +32,8 @@
+ #define SECTOR_SIZE 0x200
+ #define HEADER_MAGIC "CIMG"
+ #define MAX_LOADSIZE (16 * 1024 * 1024)
+-#ifdef CONFIG_CMD_SAVEENV
++/* env not stored (no ENV partition): no saveenv command, use the SRAM flag */
++#if defined(CONFIG_CMD_SAVEENV) && !defined(CONFIG_ENV_IS_NOWHERE)
+ #define SET_DL_COMPLETE()			\
+ 	do {							\
+ 		env_set("dl_flag", "prog");	\
+diff --git a/common/fdt_support.c b/common/fdt_support.c
+index d13e156965009b5d2870a0dfde1c13474f82bae7..ec2860856b072c0e6f6f23641199bedc9f775dc9 100644
+--- a/common/fdt_support.c
++++ b/common/fdt_support.c
+@@ -19,6 +19,9 @@
+ #include <fdt_support.h>
+ #include <exports.h>
+ #include <fdtdec.h>
++#if defined(CONFIG_SPL_BUILD) && defined(CONFIG_AB_SYSTEM)
++#include "cvi_boot_mode.h"
++#endif
+ 
+ /**
+  * fdt_getprop_u32_default_node - Return a node's property or a default
+@@ -294,7 +297,11 @@ int fdt_chosen(void *fdt)
+ 		return nodeoffset;
+ 
+ #ifdef CONFIG_SPL_BUILD
++#ifdef CONFIG_AB_SYSTEM
++	str = (char *)cvi_ab_spl_bootargs();
++#else
+ 	str = CVI_SPL_BOOTAGRS;
++#endif
+ #else
+ 	str = board_fdt_chosen_bootargs();
+ #endif
+diff --git a/common/spl/spl_nand.c b/common/spl/spl_nand.c
+index 8f20f59e669062463886563b67eee7c5b984e297..38ab0295354ca13bcc60a3e106b0c9509e7addce 100644
+--- a/common/spl/spl_nand.c
++++ b/common/spl/spl_nand.c
+@@ -13,6 +13,9 @@
+ #include <nand.h>
+ #include <linux/libfdt_env.h>
+ #include <fdt.h>
++#ifdef CONFIG_AB_SYSTEM
++#include "cvi_boot_mode.h"
++#endif
+ 
+ uint32_t __weak spl_nand_get_uboot_raw_page(void)
+ {
+@@ -167,7 +170,35 @@ static int spl_nand_load_image(struct spl_image_info *spl_image,
+ #endif
+ #ifdef DOUBLESDK
+ 		err = spl_nand_load_element(spl_image, SPL_BOOT_BAK_PART_OFFSET, header);
++#elif defined(CONFIG_AB_SYSTEM)
++	{
++		/* A/B slot from the misc partition; fall back to the other slot */
++		int slot = cvi_ab_select_slot();
++		ulong part_offset = slot == CVI_AB_SLOT_B ?
++				    SPL_BOOT_B_PART_OFFSET : SPL_BOOT_PART_OFFSET;
++
++		printf("spl: boot slot %c, kernel from 0x%lx\n",
++		       slot == CVI_AB_SLOT_B ? 'B' : 'A', part_offset);
++		err = spl_nand_load_element(spl_image, part_offset, header);
++		if (err) {
++			int other = slot ^ 1;
++
++			printf("spl: slot %c kernel load failed (%d), mark unbootable, try slot %c\n",
++			       slot == CVI_AB_SLOT_B ? 'B' : 'A', err,
++			       other == CVI_AB_SLOT_B ? 'B' : 'A');
++			cvi_ab_mark_unbootable(slot);
++			cvi_ab_set_current_slot(other);
++			part_offset = other == CVI_AB_SLOT_B ?
++				      SPL_BOOT_B_PART_OFFSET : SPL_BOOT_PART_OFFSET;
++			err = spl_nand_load_element(spl_image, part_offset, header);
++		}
++	}
++#elif defined(CONFIG_B_SYSTEM)
++		/* "Enable b system": fast boot loads the kernel from boot_b */
++		printf("spl: boot slot B, kernel from boot_b @ 0x%x\n", SPL_BOOT_B_PART_OFFSET);
++		err = spl_nand_load_element(spl_image, SPL_BOOT_B_PART_OFFSET, header);
+ #else
++		printf("spl: boot slot A, kernel from 0x%x\n", SPL_BOOT_PART_OFFSET);
+ 		err = spl_nand_load_element(spl_image, SPL_BOOT_PART_OFFSET, header);
+ #endif
+ 		return err;
+diff --git a/cvitek.mk b/cvitek.mk
+index 9233e8c9bebcad5d69dc0851b041aed33daf2050..c90180ea6dde19f571079ba2d7ef36508c0a1663 100644
+--- a/cvitek.mk
++++ b/cvitek.mk
+@@ -10,6 +10,16 @@ ifeq (${CONFIG_USE_DEFAULT_ENV},y)
+ KBUILD_CPPFLAGS += -DCONFIG_USE_DEFAULT_ENV=${CONFIG_USE_DEFAULT_ENV}
+ endif
+ 
++# build/Kconfig "ROOTFS options -> Enable b system": boot slot B (boot_b/rootfs_b)
++ifeq (${CONFIG_B_SYSTEM},y)
++KBUILD_CPPFLAGS += -DCONFIG_B_SYSTEM=1
++endif
++
++# build/Kconfig "ROOTFS options -> Enable ab system": misc partition controlled A/B boot
++ifeq (${CONFIG_AB_SYSTEM},y)
++KBUILD_CPPFLAGS += -DCONFIG_AB_SYSTEM=1
++endif
++
+ ifeq (${CONFIG_BUILD_FOR_DEBUG},y)
+ KBUILD_CPPFLAGS += -DCONFIG_BUILD_FOR_DEBUG=${CONFIG_BUILD_FOR_DEBUG}
+ endif
+diff --git a/drivers/mtd/nand/raw/cvitek/cvsnfc.c b/drivers/mtd/nand/raw/cvitek/cvsnfc.c
+index 3d0da879230c7a092f69ed17d1b8bd9130c10b0f..ad9c4b18fe36cbe258a1555071cbb3b172987b4f 100644
+--- a/drivers/mtd/nand/raw/cvitek/cvsnfc.c
++++ b/drivers/mtd/nand/raw/cvitek/cvsnfc.c
+@@ -714,8 +714,19 @@ static int cvsnfc_waitfunc(struct mtd_info *mtd, struct nand_chip *this)
+ 	do {
+ 		spi_feature_op(host, GET_OP, STATUS_ADDR, &regval);
+ 
+-		if (!(regval & STATUS_OIP_MASK))
++		if (!(regval & STATUS_OIP_MASK)) {
++			if (regval & STATUS_P_FAIL_MASK) {
++				printf("cvsnfc: page program failed! status[%#x]\n",
++				       regval);
++				return NAND_STATUS_FAIL;
++			}
++			if (regval & STATUS_E_FAIL_MASK) {
++				printf("cvsnfc: block erase failed! status[%#x]\n",
++				       regval);
++				return NAND_STATUS_FAIL;
++			}
+ 			return NAND_STATUS_READY;
++		}
+ 
+ 		udelay(1);
+ 	} while (deadline++ < (40 << 5));
+@@ -1565,6 +1576,7 @@ static uint8_t spi_nand_prog_load(struct cvsnfc_host *host, const uint8_t *buf,
+ static int spi_nand_prog_exec(struct cvsnfc_host *host, uint32_t row_addr)
+ {
+ 	uint32_t r_row_addr = ((row_addr & 0xff0000) >> 16) | (row_addr & 0xff00) | ((row_addr & 0xff) << 16);
++	unsigned int status;
+ 
+ 	if (DEBUG_WRITE)
+ 		pr_info("row_addr 0x%x\n", row_addr);
+@@ -1585,6 +1597,13 @@ static int spi_nand_prog_exec(struct cvsnfc_host *host, uint32_t row_addr)
+ 
+ 	cvsnfc_dev_ready(host->mtd);
+ 
++	spi_feature_op(host, GET_OP, STATUS_ADDR, &status);
++	if (status & STATUS_P_FAIL_MASK) {
++		printf("cvsnfc: page program failed! row_addr 0x%x status[%#x]\n",
++		       row_addr, status);
++		return -EIO;
++	}
++
+ 	if (DEBUG_WRITE)
+ 		pr_info("<=%s\n", __func__);
+ 
+@@ -1597,6 +1616,7 @@ static int write_page(struct mtd_info *mtd, struct nand_chip *chip,
+ 	struct cvsnfc_host *host = chip->priv;
+ 	struct cvsnfc_op *spi = host->spi;
+ 	uint32_t col_addr = 0;
++	int ret;
+ 
+ 	if (DEBUG_WRITE)
+ 		printf("=>%s, buf %p, page 0x%x\n", __func__, buf, page);
+@@ -1630,7 +1650,9 @@ static int write_page(struct mtd_info *mtd, struct nand_chip *chip,
+ 
+ 	WATCHDOG_RESET();
+ 
+-	spi_nand_prog_exec(host, row_addr);
++	ret = spi_nand_prog_exec(host, row_addr);
++	if (ret)
++		return ret;
+ 
+ 	if (DEBUG_WRITE)
+ 		pr_info("<=%s\n", __func__);
+diff --git a/drivers/mtd/nand/raw/cvitek/cvsnfc_spl.c b/drivers/mtd/nand/raw/cvitek/cvsnfc_spl.c
+index 6945acc99bfc127782769f08e4adfa898ffe51db..b104f4d069e8d3914521af5103e8a4fc5393c264 100644
+--- a/drivers/mtd/nand/raw/cvitek/cvsnfc_spl.c
++++ b/drivers/mtd/nand/raw/cvitek/cvsnfc_spl.c
+@@ -77,6 +77,12 @@ u32 nand_spl_adjust_offset(u32 sector, u32 offs)
+ 	return offs;
+ }
+ 
++/* The master NAND mtd of the SPL, used by cvi_boot_mode.c (misc A/B data). */
++struct mtd_info *cvsnfc_spl_get_mtd(void)
++{
++	return mtd;
++}
++
+ void nand_deselect(void)
+ {
+ 	if (nand_chip.select_chip) {
+diff --git a/include/configs/cv181x-asic.h b/include/configs/cv181x-asic.h
+index 0211a12c4895534e9496461d67eb4ce730eea9c9..a748a5b63e0748c9c3b30670a653b391dcd13373 100644
+--- a/include/configs/cv181x-asic.h
++++ b/include/configs/cv181x-asic.h
+@@ -209,15 +209,47 @@
+ 	#endif
+ 	/* config root */
+ 	#ifdef CONFIG_NAND_SUPPORT
++		/*
++		 * Boot/rootfs partition names come from cvipart.h (mkcvipart.py).
++		 * A/B layout: boot_a/boot_b + rootfs_a/rootfs_b, slot A by default;
++		 * CONFIG_B_SYSTEM ("Enable b system" in build menuconfig) boots slot B.
++		 * Legacy layout: BOOT/ROOTFS.
++		 */
++		#ifndef ROOTFS_DEV
++			#define ROOTFS_DEV "ROOTFS"
++		#endif
++		#ifndef BOOT_DEV
++			#define BOOT_DEV "BOOT"
++		#endif
++		#ifdef CONFIG_B_SYSTEM
++			#if !defined(ROOTFS_DEV_B) || !defined(BOOT_DEV_B)
++				#error "CONFIG_B_SYSTEM needs boot_b and rootfs_b partitions in partition.xml"
++			#endif
++			#define ROOTFS_SLOT ROOTFS_DEV_B
++			#define BOOT_SLOT BOOT_DEV_B
++		#else
++			#define ROOTFS_SLOT ROOTFS_DEV
++			#define BOOT_SLOT BOOT_DEV
++		#endif
+ 		#ifdef CONFIG_SKIP_RAMDISK
+ 			#ifdef CONFIG_ROOTFS_RW
+-				#define ROOTARGS "ubi.mtd=ROOTFS ubi.block=0,0 rw root=ubi0:ROOTFS rootfstype=ubifs"
++				#define ROOTARGS_FOR(dev) "ubi.mtd=" dev " ubi.block=0,0 rw root=ubi0:" dev " rootfstype=ubifs"
+ 			#else
+-				#define ROOTARGS "ubi.mtd=ROOTFS ubi.block=0,0 root=/dev/ubiblock0_0 rootfstype=squashfs"
++				#define ROOTARGS_FOR(dev) "ubi.mtd=" dev " ubi.block=0,0 root=/dev/ubiblock0_0 rootfstype=squashfs"
+ 			#endif
+ 		#else
+-			#define ROOTARGS "ubi.mtd=ROOTFS ubi.block=0,0"
++			#define ROOTARGS_FOR(dev) "ubi.mtd=" dev " ubi.block=0,0"
+ 		#endif /* CONFIG_SKIP_RAMDISK */
++		/* static slot (also the env default before ab_select runs) */
++		#define ROOTARGS ROOTARGS_FOR(ROOTFS_SLOT)
++		#ifdef CONFIG_AB_SYSTEM
++			/* misc controlled A/B: per slot root args, slot_suffix tells Linux which slot runs */
++			#if !defined(ROOTFS_DEV_B) || !defined(BOOT_DEV_B) || !defined(AB_MISC_OFFSET)
++				#error "CONFIG_AB_SYSTEM needs boot_b, rootfs_b and misc partitions in partition.xml"
++			#endif
++			#define ROOTARGSA ROOTARGS_FOR(ROOTFS_DEV) " slot_suffix=_a"
++			#define ROOTARGSB ROOTARGS_FOR(ROOTFS_DEV_B) " slot_suffix=_b"
++		#endif
+ 	#elif defined(CONFIG_EMMC_SUPPORT)
+ 		#ifdef CONFIG_ROOTFS_RW
+ 			#define ROOTARGS "rootfstype=ext4 rootwait rw root=" ROOTFS_DEV
+@@ -332,11 +364,21 @@
+ 	/* 0x4330058 : DMA reset */
+ 	/* 0x3000154 : restore DMA remap to 0 */
+ 
++		#ifdef CONFIG_AB_SYSTEM
++		/* ab_select picks the slot from misc and sets ${root} / ${ab_boot_part} */
+ 		#define CONFIG_NANDBOOTCOMMAND \
++				"ab_select;" \
+ 				SET_BOOTARGS \
+-				"nand read ${uImage_addr} BOOT;" \
++				"nand read ${uImage_addr} ${ab_boot_part};" \
+ 				"mw.l 4330058 1 1; md.l 4330058 1; mw.l 3000154 0 1;" \
+ 				UBOOT_VBOOT_BOOTM_COMMAND
++		#else
++		#define CONFIG_NANDBOOTCOMMAND \
++				SET_BOOTARGS \
++				"nand read ${uImage_addr} " BOOT_SLOT ";" \
++				"mw.l 4330058 1 1; md.l 4330058 1; mw.l 3000154 0 1;" \
++				UBOOT_VBOOT_BOOTM_COMMAND
++		#endif
+ 	#elif defined(CONFIG_SPI_FLASH)
+ 		#ifdef DOUBLESDK
+ 			#define CONFIG_NORBOOTCOMMAND \
+@@ -372,8 +414,9 @@
+ #endif /* CONFIG_USE_DEFAULT_ENV */
+ 
+ #define CVI_SPL_FDT_ADDR CVIMMAP_SPL_FDT_ADDR
++#define CVI_SPL_BOOTAGRS_NOROOT "console=ttyS0,115200 earlycon=sbi riscv.fwsz=0x80000" CONSOLE_LOGLEVEL
+ #define CVI_SPL_BOOTAGRS \
+         PARTS " "  \
+         ROOTARGS " " \
+-	"console=ttyS0,115200 earlycon=sbi riscv.fwsz=0x80000" CONSOLE_LOGLEVEL
++        CVI_SPL_BOOTAGRS_NOROOT
+ #endif /* __CV181X_ASIC_H__ */
+diff --git a/include/cvi_boot_mode.h b/include/cvi_boot_mode.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..89812086f34867e31b75cdc9b0ffa14299f99d3f
+--- /dev/null
++++ b/include/cvi_boot_mode.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * A/B boot slot selection controlled by the "misc" partition.
++ * The on-flash record (AvbABData) must stay in sync with
++ * build/tools/common/update_misc/update_misc.h and gen_abmisc.py.
++ */
++#ifndef __CVI_BOOT_MODE_H__
++#define __CVI_BOOT_MODE_H__
++
++#include <linux/types.h>
++
++#define AVB_AB_MAGIC "\0AB0"
++#define AVB_AB_MAGIC_LEN 4
++#define AVB_AB_MAJOR_VERSION 1
++#define AVB_AB_MINOR_VERSION 0
++#define AVB_AB_MAX_PRIORITY 15
++#define AVB_AB_MAX_TRIES_REMAINING 3
++#define AVB_AB_OFFSET_IN_MISC 0
++
++enum cvi_ab_slot {
++	CVI_AB_SLOT_A = 0,
++	CVI_AB_SLOT_B = 1,
++};
++
++#pragma pack(4)
++typedef struct AvbABSlotData {
++	uint8_t priority;		/* 0 = never boot, 15 = highest */
++	uint8_t tries_remaining;	/* boots left before the slot is given up */
++	uint8_t successful_boot;	/* 1 = tries are not consumed */
++	uint8_t reserved[1];
++} AvbABSlotData;
++
++typedef struct AvbABData {
++	uint8_t magic[AVB_AB_MAGIC_LEN];
++	uint8_t version_major;
++	uint8_t version_minor;
++	uint8_t reserved1[2];
++	AvbABSlotData slots[2];		/* [0] = A, [1] = B */
++	/* reserved2[0]/[1]: per slot retry count set by Linux update_misc, not used here */
++	uint8_t reserved2[12];
++	uint32_t crc32;			/* crc32 of the 28 bytes above */
++} AvbABData;
++#pragma pack()
++
++/* Read misc, pick the slot to boot (decrements its tries) and remember it. */
++int cvi_ab_select_slot(void);
++/* Slot chosen by cvi_ab_select_slot(), or the build default before that. */
++int cvi_ab_current_slot(void);
++void cvi_ab_set_current_slot(int slot);
++/* Slot could not be booted: tries_remaining = 0 so the other slot is used. */
++int cvi_ab_mark_unbootable(int slot);
++/* Give slot the highest priority and fresh tries. */
++int cvi_ab_set_active(int slot);
++int cvi_ab_reinit(void);
++int cvi_ab_load(AvbABData *out);
++void cvi_ab_dump(void);
++/* Kernel root arguments for a slot (ROOTARGSA / ROOTARGSB). */
++const char *cvi_ab_rootargs(int slot);
++/* Full SPL bootargs for the current slot. */
++const char *cvi_ab_spl_bootargs(void);
++
++#endif /* __CVI_BOOT_MODE_H__ */
+diff --git a/scripts/config_whitelist.txt b/scripts/config_whitelist.txt
+index 281350651a778ee0219a0bf6d5cbcfc4a7342ea6..edd39de1334adc4b6048df42782f5878e9005a28 100644
+--- a/scripts/config_whitelist.txt
++++ b/scripts/config_whitelist.txt
+@@ -9,6 +9,7 @@ CONFIG_83XX_PCI_STREAMING
+ CONFIG_88F5182
+ CONFIG_A003399_NOR_WORKAROUND
+ CONFIG_A008044_WORKAROUND
++CONFIG_AB_SYSTEM
+ CONFIG_ACX517AKN
+ CONFIG_ACX544AKN
+ CONFIG_ADDRESS
+@@ -136,6 +137,7 @@ CONFIG_BUFNO_AUTO_INCR_BIT
+ CONFIG_BUILD_ENVCRC
+ CONFIG_BUILD_FOR_DEBUG
+ CONFIG_BUS_WIDTH
++CONFIG_B_SYSTEM
+ CONFIG_CDP_APPLIANCE_VLAN_TYPE
+ CONFIG_CDP_CAPABILITIES
+ CONFIG_CDP_DEVICE_ID
+-- 
+2.25.1
+
