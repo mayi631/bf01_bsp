@@ -262,3 +262,16 @@ BF01 板级实现随后分为两个独立提交：
 
 补丁编号全局唯一且连续，`repos --applypatch` 按仓库过滤并按编号应用。
 IPCamera、个人说明文档、真实网络凭据和编译产物不在本次同步范围。
+
+## 0038：ION 的 RTOS 预留隔离
+
+`0038-linux_5.10--fix-ion-exclude-rtos-reservation.patch` 修复 carveout 驱动只调整
+清零范围、但分配池和统计仍包含完整 ION 的问题。分配池改用扣除 RTOS 预留后的
+起始地址、长度及 `total_size`，并检查非法预留及建池失败；不是放宽应用的隔离检查。
+该补丁不改变内核导出接口或模块结构体布局。修改 ION 总容量时，FIP、RTOS、Linux
+设备树必须使用同一内存图，不能只替换应用或混刷不同内存布局的镜像。
+
+BF01 当前 AliOS 的实际多媒体分配来自独立 `ALIOS_RESV` 堆，故板级
+`FREERTOS_RESERVED_ION_SIZE=0`，Linux `ION_SIZE=40 MiB`，不再扣除通用 fast-image
+默认的 13.625 MiB。此补丁仍对确实存在预留的配置执行隔离；零预留不缩小分配池。
+详见 `../docs/BF01_ION40_FINAL.md`，旧 48/56 MiB 说明为历史记录。
