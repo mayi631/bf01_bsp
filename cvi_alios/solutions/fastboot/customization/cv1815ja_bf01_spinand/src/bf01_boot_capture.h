@@ -72,4 +72,6 @@ static inline uint32_t bf01_burst_crc(uint32_t crc, const unsigned char *data, s
     return crc;
 }
 
+void APP_BootCaptureReject(void);
+
 #endif

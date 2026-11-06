@@ -6,13 +6,13 @@
 
 #define BF01_VIDEO_PORT 3
 #define BF01_VIDEO_MAGIC 0x42465631U
-#define BF01_VIDEO_VERSION 2
+#define BF01_VIDEO_VERSION 3
 #define BF01_VIDEO_WIDTH 1920
 #define BF01_VIDEO_HEIGHT 1440
 #define BF01_VIDEO_FPS 30
 #define BF01_VIDEO_CODEC_H265 265U
 #define BF01_VIDEO_DATA_SIZE (8U * 1024 * 1024)
-#define BF01_VIDEO_FRAME_CAPACITY 512U
+#define BF01_VIDEO_FRAME_CAPACITY 1024U
 #define BF01_VIDEO_MAX_FRAME (1024U * 1024)
 #define BF01_VIDEO_FLAG_KEY 1U
 #define BF01_AUDIO_RATE 16000U
@@ -107,5 +107,6 @@ static inline size_t bf01_video_ring_size(void)
 
 int APP_BootVideoInit(void);
 void APP_BootVideoStart(void);
+void APP_BootVideoReject(void);
 
 #endif

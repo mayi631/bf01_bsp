@@ -8,6 +8,7 @@
 #include <drv/tick.h>
 #include "bf01_boot_capture.h"
 #include "bf01_boot_video.h"
+#include "bf01_boot_ai.h"
 #include "cvi_ipcm.h"
 #include "cvi_sys.h"
 #include "cvi_venc.h"
@@ -30,6 +31,27 @@ static struct bf01_burst_reply burst = {
     .height = BF01_BURST_HEIGHT
 };
 static unsigned char *burst_images[BF01_BURST_COUNT];
+static int burst_rejected;
+
+static void discard_burst_locked(void)
+{
+    for (unsigned int index = 0; index < BF01_BURST_COUNT; index++) {
+        aos_ion_free(burst_images[index]);
+        burst_images[index] = NULL;
+    }
+    burst.state = BF01_BURST_RELEASED;
+    burst.error = ECANCELED;
+    burst.count = 0;
+}
+
+void APP_BootCaptureReject(void)
+{
+    pthread_mutex_lock(&burst_mutex);
+    burst_rejected = 1;
+    if (burst.state != BF01_BURST_CAPTURING)
+        discard_burst_locked();
+    pthread_mutex_unlock(&burst_mutex);
+}
 
 static int burst_message(void *private_data, IPCM_ANON_MSG_S *message)
 {
@@ -117,6 +139,8 @@ static int prime_jpeg_input(void)
     uint32_t completed_ms = (uint32_t)aos_now_ms();
     printf("[boot-capture] prime submitted: error=%d completed_ms=%u elapsed_ms=%u; excluded from burst\n",
         error, completed_ms, completed_ms - started_ms);
+    if (!error)
+        error = APP_BootAiCapture(0, 0);
     return error;
 }
 
@@ -154,6 +178,10 @@ static int capture_image(unsigned int index)
     }
     printf("[boot-capture] VI frame ready: %ux%u pts=%llu captured_ms=%u\n",
         frame.stVFrame.u32Width, frame.stVFrame.u32Height, (unsigned long long)pts, captured_ms);
+    error = APP_BootAiCapture(0, 0);
+    if (error)
+        goto done;
+    error = EIO;
     int64_t operation_started_ms = aos_now_ms();
     printf("[boot-capture] VPSS SendFrame begin: photo=%u group=%d timeout_ms=%d\n",
         index + 1, BURST_VPSS_GROUP, BURST_TIMEOUT_MS);
@@ -280,11 +308,18 @@ done:
             error = EIO;
         }
     }
+    if (!error)
+        error = APP_BootAiCapture(index + 1 == BF01_BURST_COUNT, pts);
     if (error) {
         aos_ion_free(image);
         return error;
     }
     pthread_mutex_lock(&burst_mutex);
+    if (burst_rejected) {
+        pthread_mutex_unlock(&burst_mutex);
+        aos_ion_free(image);
+        return ECANCELED;
+    }
     burst_images[index] = image;
     burst.images[index].size = (uint32_t)size;
     burst.images[index].crc = crc ^ UINT32_MAX;
@@ -339,6 +374,10 @@ static void *capture_burst(void *argument)
         error = prime_jpeg_input();
     }
     for (unsigned int index = 0; !error && index < BF01_BURST_COUNT; index++) {
+        if (APP_BootAiRejected()) {
+            error = ECANCELED;
+            break;
+        }
         if (index) {
             uint32_t elapsed_ms = (uint32_t)aos_now_ms() - burst.images[index - 1].captured_ms;
             if (elapsed_ms < BF01_BURST_INTERVAL_MS)
@@ -353,11 +392,15 @@ static void *capture_burst(void *argument)
     pthread_mutex_lock(&burst_mutex);
     burst.error = error;
     burst.state = error ? BF01_BURST_FAILED : BF01_BURST_READY;
+    if (burst_rejected)
+        discard_burst_locked();
     pthread_mutex_unlock(&burst_mutex);
     uint32_t completed_ms = (uint32_t)aos_now_ms();
     printf("[boot-capture] burst finished: count=%u error=%d completed_ms=%u elapsed_ms=%u; retained until SD commit\n",
         burst.count, error, completed_ms, completed_ms - started_ms);
-    if (!error)
+    if (error)
+        APP_BootAiFail(error);
+    else if (!APP_BootAiRejected())
         APP_BootVideoStart();
     return NULL;
 }
@@ -367,6 +410,12 @@ void APP_BootCaptureStart(int media_result)
     int video_result = APP_BootVideoInit();
     if (video_result != CVI_SUCCESS)
         printf("[boot-video] IPC registration failed: %d\n", video_result);
+    int ai_result = APP_BootAiInit();
+    if (ai_result != CVI_SUCCESS || video_result != CVI_SUCCESS) {
+        APP_BootAiFail(EIO);
+        printf("[boot-ai] IPC/watchdog init failed: %d; capture gate closed\n", ai_result);
+        return;
+    }
     uint32_t media_ready_ms = (uint32_t)aos_now_ms();
     pthread_mutex_lock(&burst_mutex);
     burst.state = media_result == CVI_SUCCESS ? BF01_BURST_CAPTURING : BF01_BURST_FAILED;
@@ -377,6 +426,7 @@ void APP_BootCaptureStart(int media_result)
         printf("[boot-capture] IPC registration failed: %d; capture continues in RAM\n", result);
     }
     if (media_result != CVI_SUCCESS) {
+        APP_BootAiFail(EIO);
         printf("[boot-capture] media init failed: ret=%#x\n", (unsigned int)media_result);
         return;
     }
@@ -397,6 +447,7 @@ void APP_BootCaptureStart(int media_result)
         burst.error = result > 0 ? result : EAGAIN;
         pthread_mutex_unlock(&burst_mutex);
         printf("[boot-capture] thread creation failed: %d\n", result);
+        APP_BootAiFail(result > 0 ? result : EAGAIN);
     } else {
         printf("[boot-capture] worker started: media_ready_ms=%u stack_bytes=%u\n",
             media_ready_ms, BURST_STACK_SIZE);
