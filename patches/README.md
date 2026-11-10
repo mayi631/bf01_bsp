@@ -295,3 +295,11 @@ RTC 首次校时、走时校准及断电保时仍需产品/原厂方案，本功
 `pthread.h` 补齐已实现、且已由 `libposix.a` 导出的 `pthread_getschedparam`
 声明，修复时间戳准备线程在 `-Werror=implicit-function-declaration` 下的编译错误。
 只补充函数声明，不修改实现、线程优先级或首拍时序，也不关闭编译告警。
+
+## 0041：保留 RTOS 压缩参数解析
+
+`0041-cvi_alios--fix-postbuild-compression-argument-parsing.patch` 为
+`aft_build.sh` 补齐 yoctools 传入的 `-u` 带参选项，避免其参数值提前终止
+`getopts`，导致后续 `-a` 中的 `CONFIG_COMPRESS_RTOS_BIN:1` 未被解析。
+保持现有 LZ4 压缩格式和未压缩 `prim` 的打包流程，不修改内存图或首拍 pipeline。
+只消费 `-u` 参数，不新增用户参数功能；无需更换压缩算法或修改 FSBL 解压配置。

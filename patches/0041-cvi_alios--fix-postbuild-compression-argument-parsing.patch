@@ -1,0 +1,51 @@
+From d15de4c8d026538beaa241b81fe0721b635772fd Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Tue, 10 Nov 2026 18:22:48 +0800
+Subject: [PATCH] fix(build): parse postbuild user argument before compression
+ flags
+
+[description ]:
+- Accept and consume the yoctools -u argument in aft_build.sh so getopts
+  continues parsing the following -a build-variable argument.
+- Preserve the existing LZ4 compression and raw prim packaging behavior.
+
+[root   cause]:
+- The caller supplies -u with a value, but the postbuild script does not
+  declare this option. Its value stops option parsing before -a, dropping
+  CONFIG_COMPRESS_RTOS_BIN and silently packaging an uncompressed yoc.bin.
+
+[JIRA      ID]:N/A (BF01 integration)
+[chip project]:181x
+[side effects]:
+- The user argument is consumed without changing its upstream behavior.
+- Existing compression selection now receives the requested build flags.
+- No compression format, boot memory layout or capture pipeline changes.
+- Shell syntax and argument parsing checked without running postbuild.
+
+[Affected *.ko/*.so/*.a] :yoc.bin packaging; no .ko/.so/.a
+---
+ boards/cv181xc_evb/script/aft_build.sh | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/boards/cv181xc_evb/script/aft_build.sh b/boards/cv181xc_evb/script/aft_build.sh
+index 18b0a41e..c70a4802 100644
+--- a/boards/cv181xc_evb/script/aft_build.sh
++++ b/boards/cv181xc_evb/script/aft_build.sh
+@@ -18,7 +18,7 @@ if [ -n "$EXE_EXT" ]; then
+     PRODUCT=$MK_BOARD_PATH/configs/product$EXE_EXT
+ else
+     echo "I am in Linux."
+-    while getopts ":s:b:c:a:" optname
++    while getopts ":s:b:c:u:a:" optname
+     do
+         case "$optname" in
+         "s")
+@@ -30,6 +30,8 @@ else
+         "c")
+             MK_CHIP_PATH=$OPTARG
+             ;;
++        "u")
++            ;;
+         "a")
+             # echo "the all variables from yoctools, value is $OPTARG"
+             MK_VARIABLE=$OPTARG
