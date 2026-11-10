@@ -275,3 +275,23 @@ BF01 当前 AliOS 的实际多媒体分配来自独立 `ALIOS_RESV` 堆，故板
 `FREERTOS_RESERVED_ION_SIZE=0`，Linux `ION_SIZE=40 MiB`，不再扣除通用 fast-image
 默认的 13.625 MiB。此补丁仍对确实存在预留的配置执行隔离；零预留不缩小分配池。
 详见 `../docs/BF01_ION40_FINAL.md`，旧 48/56 MiB 说明为历史记录。
+
+## 0039：BF01 画面时间戳配置内置
+
+`0039-cvi_alios--feat-generate-bf01-timestamp-configuration.patch` 在编译已选中的
+BF01 fastboot pipeline 前，从应用 `cv1815ja_bf01_gc4683.ini` 的 `[boot_timestamp]`
+生成小核配置头文件。生成器及 `out` 头文件搜索路径随 BSP 定制目录提供。
+不新增分区、不依赖 A/B 布局已删除的 CFG，也不在首拍路径等待 Linux 参数。
+切换开关、格式或时区后需重新编译并更新小核镜像；生成器失败会中止构建。
+此补丁不改变 ISP bypass、VI/VPSS/VENC pipeline、首拍预热或 ION 配置。
+配套 BF01 定制代码在 JPEG 和录像编码前叠加 RTC 时间，640×640 AI 输入不叠加；
+支持开关、三种日期格式及 UTC 偏移。RTC 无效时隐藏水印，拍录照常进行。
+RTC 首次校时、走时校准及断电保时仍需产品/原厂方案，本功能不解决断电丢时。
+应用侧配置和校时接口不在本次 SDK/BSP 提交内，集成时需使用配套应用版本。
+
+## 0040：补齐 POSIX 线程调度查询声明
+
+`0040-cvi_alios--fix-pthread-getschedparam-declaration.patch` 为 SDK 的公共
+`pthread.h` 补齐已实现、且已由 `libposix.a` 导出的 `pthread_getschedparam`
+声明，修复时间戳准备线程在 `-Werror=implicit-function-declaration` 下的编译错误。
+只补充函数声明，不修改实现、线程优先级或首拍时序，也不关闭编译告警。

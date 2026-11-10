@@ -8,6 +8,7 @@
 #include "bf01_boot_video.h"
 #include "bf01_boot_audio.h"
 #include "bf01_boot_ai.h"
+#include "bf01_boot_timestamp.h"
 #include "cvi_ipcm.h"
 #include "cvi_sys.h"
 #include "cvi_venc.h"
@@ -296,6 +297,7 @@ static void *record_video(void *opaque)
     if (error)
         goto done;
     audio_started = 1;
+    APP_BootTimestampStart(2, BF01_VIDEO_WIDTH, BF01_VIDEO_HEIGHT);
     result = CVI_SYS_Bind(&source, &encoder);
     if (result != CVI_SUCCESS) {
         error = EIO;
@@ -317,6 +319,7 @@ static void *record_video(void *opaque)
     uint32_t started_ms = (uint32_t)aos_now_ms();
     error = 0;
     while (!stopping() && (uint32_t)aos_now_ms() - started_ms < VIDEO_MAX_SECONDS * 1000U) {
+        APP_BootTimestampUpdate();
         error = APP_BootAudioError();
         if (error)
             break;
@@ -336,6 +339,7 @@ done:
     }
     if (receiving && CVI_VENC_StopRecvFrame(VIDEO_CHANNEL) != CVI_SUCCESS)
         error = EIO;
+    APP_BootTimestampStop();
     if (created && CVI_VENC_DestroyChn(VIDEO_CHANNEL) != CVI_SUCCESS)
         error = EIO;
     printf("[boot-video] stopped: error=%d driver_ret=%#x frames=%u boot_ms=%llu\n",

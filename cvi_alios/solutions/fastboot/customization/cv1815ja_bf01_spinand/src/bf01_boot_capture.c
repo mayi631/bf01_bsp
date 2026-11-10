@@ -9,6 +9,7 @@
 #include "bf01_boot_capture.h"
 #include "bf01_boot_video.h"
 #include "bf01_boot_ai.h"
+#include "bf01_boot_timestamp.h"
 #include "cvi_ipcm.h"
 #include "cvi_sys.h"
 #include "cvi_venc.h"
@@ -185,6 +186,7 @@ static int capture_image(unsigned int index)
     int64_t operation_started_ms = aos_now_ms();
     printf("[boot-capture] VPSS SendFrame begin: photo=%u group=%d timeout_ms=%d\n",
         index + 1, BURST_VPSS_GROUP, BURST_TIMEOUT_MS);
+    APP_BootTimestampUpdate();
     result = CVI_VPSS_SendFrame(BURST_VPSS_GROUP, &frame, BURST_TIMEOUT_MS);
     printf("[boot-capture] VPSS SendFrame end: photo=%u ret=%#x elapsed_ms=%llu\n",
         index + 1, (unsigned int)result, (unsigned long long)(aos_now_ms() - operation_started_ms));
@@ -368,6 +370,7 @@ static void *capture_burst(void *argument)
         error = EINVAL;
     }
     if (!error) {
+        APP_BootTimestampPrepare(BURST_VPSS_GROUP, BF01_BURST_WIDTH, BF01_BURST_HEIGHT);
         printf("[boot-capture] sample-style JPEG: size=%ux%u es_queue=%u; QueryStatus -> GetStream -> copy -> ReleaseStream\n",
             attributes.stVencAttr.u32PicWidth, attributes.stVencAttr.u32PicHeight,
             (unsigned int)attributes.stVencAttr.bEsBufQueueEn);
@@ -389,6 +392,7 @@ static void *capture_burst(void *argument)
             break;
         }
     }
+    APP_BootTimestampStop();
     pthread_mutex_lock(&burst_mutex);
     burst.error = error;
     burst.state = error ? BF01_BURST_FAILED : BF01_BURST_READY;
@@ -398,6 +402,7 @@ static void *capture_burst(void *argument)
     uint32_t completed_ms = (uint32_t)aos_now_ms();
     printf("[boot-capture] burst finished: count=%u error=%d completed_ms=%u elapsed_ms=%u; retained until SD commit\n",
         burst.count, error, completed_ms, completed_ms - started_ms);
+    APP_BootTimestampInitClockSync();
     if (error)
         APP_BootAiFail(error);
     else if (!APP_BootAiRejected())

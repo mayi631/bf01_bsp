@@ -1,0 +1,38 @@
+From 0169e55c8f8a6a8f4144ef2c2f9379b8c5c1bd41 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Tue, 10 Nov 2026 18:22:48 +0800
+Subject: [PATCH] fix(posix): declare pthread_getschedparam in public header
+
+[description ]:
+- Add the public declaration matching the existing pthread_getschedparam
+  implementation in the POSIX library.
+
+[root   cause]:
+- The function is implemented and exported by libposix.a, but pthread.h
+  omits its prototype. BF01 watermark preparation fails to compile with
+  -Werror=implicit-function-declaration when querying the capture priority.
+
+[JIRA      ID]:N/A (BF01 integration)
+[chip project]:181x
+[side effects]:
+- Declaration only; no ABI, library implementation or scheduling changes.
+- Existing compilation diagnostics remain enabled.
+- Existing source and archive symbol checked; no build or flash performed.
+
+[Affected *.ko/*.so/*.a] :none (public header only)
+---
+ components/posix/include/pthread.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/components/posix/include/pthread.h b/components/posix/include/pthread.h
+index 84aab482..13209e9d 100755
+--- a/components/posix/include/pthread.h
++++ b/components/posix/include/pthread.h
+@@ -140,6 +140,7 @@ int       pthread_setcancelstate(int state, int *oldstate);
+ int       pthread_setcanceltype(int type, int *oldtype);
+ int       pthread_kill(pthread_t thread, int sig);
+ int       pthread_equal(pthread_t t1, pthread_t t2);
++int       pthread_getschedparam(pthread_t thread, int *policy, struct sched_param *param);
+ int       pthread_setschedparam(pthread_t thread, int policy, const struct sched_param *pParam);
+ void      pthread_cleanup_pop(int execute);
+ void      pthread_cleanup_push(void (*routine)(void *), void *arg);

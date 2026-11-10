@@ -1,0 +1,43 @@
+From 263138979231596ebadc41f01305093d5fc22891 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Tue, 10 Nov 2026 18:22:48 +0800
+Subject: [PATCH] feat(build): embed BF01 boot timestamp configuration
+
+[description ]:
+- Generate the BF01 timestamp configuration header from the application's
+  boot_timestamp settings before invoking scons for the selected pipeline.
+- Keep an unchanged header's mtime and stop the build on invalid settings.
+- The generator and include path are maintained with the BF01 BSP files.
+
+[root   cause]:
+- The BF01 A/B layout has no CFG partition and does not preload param.bin.
+  The RTOS cannot obtain first-photo settings from Linux at boot time.
+
+[JIRA      ID]:N/A (BF01 integration)
+[chip project]:181x
+[side effects]:
+- BF01 builds require the companion BSP generator and application INI.
+  Other pipelines do not run the generator.
+- Changing timestamp settings requires rebuilding the RTOS image.
+- No pipeline, ISP bypass, JPEG priming, encoding or ION layout changes.
+- Static patch checks only during commit preparation; no build or flash.
+
+[Affected *.ko/*.so/*.a] :yoc.bin (BF01 configuration); no .ko/.so/.a
+---
+ solutions/fastboot/Makefile | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/solutions/fastboot/Makefile b/solutions/fastboot/Makefile
+index b23f37a8..cfaa1ee5 100644
+--- a/solutions/fastboot/Makefile
++++ b/solutions/fastboot/Makefile
+@@ -24,6 +24,9 @@ else
+ endif
+ 	@/usr/bin/env python ../../scripts/defconfig/defconfig.py
+ 	@/usr/bin/env python ../../scripts/yaml_update.py
++	$(CPRE) if grep -Fq 'customization/cv1815ja_bf01_spinand/src/*.c' package.yaml; then \
++		python3 customization/cv1815ja_bf01_spinand/generate_timestamp_config.py -s "$(CURDIR)"; \
++	fi
+ ifeq ($(RELEASE_FLAG),1)
+ 	@$(MAKE) -C ../../components/cvi_mpi clean
+ 	@$(MAKE) -C ../../components/cvi_mpi CHIP_ARCH=$(CHIP_ARCH) BOOT_SOLUTION=fastboot

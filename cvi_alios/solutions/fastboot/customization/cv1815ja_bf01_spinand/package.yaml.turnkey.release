@@ -110,6 +110,7 @@ build_config:
   include:
     - customization/include
   internal_include:
+    - out
     - application/common/include
     - ../../components/ipcm/message/alios
     - application/annon_msg/
