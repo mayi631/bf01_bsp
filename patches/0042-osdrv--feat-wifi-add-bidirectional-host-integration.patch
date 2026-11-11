@@ -1,0 +1,428 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mayi <3363523343@qq.com>
+Date: Wed, 11 Nov 2026 09:10:54 +0800
+Subject: [PATCH] feat(osdrv/wifi): support bidirectional BF01 host integration
+
+[description ]:
+- Deliver the complete SDIO driver support for the BF01 host/Wi-Fi protocol
+  as one feature, including the fixes required while integrating it.
+- Receive 0x083B indications through a bounded local ioctl queue and handle
+  0x003B Direct Buffer replies with explicit length and allocation limits.
+- Restore mismatched SDIO bus width during probe and synchronize startup
+  reception with firmware readiness instead of dropping four packets.
+- Preserve the module's TCP port filters when opening the host interface,
+  adding only the required ICMP/ARP/DNS flags and propagating failures.
+
+[root   cause]:
+- The original driver does not expose unsolicited host protocol messages
+  and assumes generic fixed-size replies for Direct Buffer exchanges.
+- A stale card bus width and fixed startup packet discards can prevent
+  enumeration or discard the firmware startup indication.
+- Host interface startup overwrites module-owned TCP port filters with
+  a port-5001 default, disrupting the module's existing cloud connections.
+
+[JIRA      ID]:N/A (BF01 integration)
+[chip project]:181x
+[side effects]:
+- Applies after the existing BSP osdrv patch series through 0020.
+- Requires the paired IPCamera production service for protocol handling.
+- Receive queue capacity is 16 messages, each at most 1600 bytes; a full
+  queue drops the new indication and emits a rate-limited warning.
+- Current host-to-module Direct Buffer JSON limit is 1595 bytes; oversized
+  requests are rejected rather than truncated.
+- Does not change module firmware, pinmux, memory layout or AI/capture policy.
+
+[Affected *.ko/*.so/*.a] :atbm6461_wifi_sdio.ko
+---
+ .../realtek/atbm6461/hal_apollo/apollo_sdio.c      | 25 ++++++++++
+ .../realtek/atbm6461/hal_apollo/atbm_ioctl.c       | 58 +++++++++++++++++++++-
+ .../wireless/realtek/atbm6461/hal_apollo/bh_sdio.c | 24 ++++-----
+ .../wireless/realtek/atbm6461/hal_apollo/iface.c   |  8 ++-
+ extdrv/wireless/realtek/atbm6461/hal_apollo/main.c | 40 +++++++++++----
+ extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c  | 46 +++++++++++++++--
+ 6 files changed, 172 insertions(+), 29 deletions(-)
+
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+index 54bcfe2e92c654a1ca12b9814f7ee26b685afa69..48f344e8bfde9789037e08840d5bd29080a637b3 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+@@ -1351,11 +1351,36 @@ static void jiffies_print(char *jiffies_name[], int is_init)
+ 
+ 
+ /* Probe Function to be called by SDIO stack when device is discovered */
++#ifdef LINUX_OS
++extern int sdio_reset_comm(struct mmc_card *card);
++#endif
++
+ static int atbm_sdio_probe(struct sdio_func *func,
+ 			      const struct sdio_device_id *id)
+ {
+ 	struct sbus_priv *self;
+ 	int status;
++#ifdef LINUX_OS
++	u8 bus_interface;
++	u8 expected_width;
++
++	sdio_claim_host(func);
++	bus_interface = sdio_f0_readb(func, SDIO_CCCR_IF, &status);
++	sdio_release_host(func);
++	if (status)
++		return status;
++	expected_width = func->card->host->ios.bus_width == MMC_BUS_WIDTH_4 ?
++		SDIO_BUS_WIDTH_4BIT : SDIO_BUS_WIDTH_1BIT;
++	if ((bus_interface & SDIO_BUS_WIDTH_MASK) != expected_width) {
++		atbm_printk_err("SDIO bus width mismatch: host=%u card_if=0x%02x; reinitializing communications\n",
++			func->card->host->ios.bus_width, bus_interface);
++		status = sdio_reset_comm(func->card);
++		atbm_printk_err("SDIO communications reinit: status=%d host_width=%u\n",
++			status, func->card->host->ios.bus_width);
++		if (status)
++			return status;
++	}
++#endif
+ 
+ 	atbm_dbg(ATBM_APOLLO_DBG_INIT, "Probe called\n");
+ 	#ifdef TIME_DEBUG
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/atbm_ioctl.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/atbm_ioctl.c
+index 0052694a393e7300d561f356b7fa3e5fd909fd35..0072102927f4b7773e7107e4925a18644339497b 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/atbm_ioctl.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/atbm_ioctl.c
+@@ -21,6 +21,61 @@
+ #ifdef LINUX_OS
+ #define MAX_STATUS_LSIT_CNT  (10)
+ 
++#define BF01_HOST_MESSAGE_MAX 1600
++#define BF01_HOST_QUEUE_SIZE 16
++static DEFINE_SPINLOCK(bf01_host_lock);
++static DEFINE_MUTEX(bf01_host_reader);
++static char bf01_host_queue[BF01_HOST_QUEUE_SIZE][BF01_HOST_MESSAGE_MAX + 1];
++static unsigned int bf01_host_head;
++static unsigned int bf01_host_count;
++
++int atbm_bf01_host_indication(const u8 *data, size_t size)
++{
++	size_t length = strnlen((const char *)data, size);
++	unsigned int slot;
++
++	if (!length || length > BF01_HOST_MESSAGE_MAX || length == size)
++		return -EMSGSIZE;
++	spin_lock_bh(&bf01_host_lock);
++	if (bf01_host_count == BF01_HOST_QUEUE_SIZE) {
++		spin_unlock_bh(&bf01_host_lock);
++		return -ENOBUFS;
++	}
++	slot = (bf01_host_head + bf01_host_count) % BF01_HOST_QUEUE_SIZE;
++	memset(bf01_host_queue[slot], 0, BF01_HOST_MESSAGE_MAX + 1);
++	memcpy(bf01_host_queue[slot], data, length);
++	bf01_host_count++;
++	spin_unlock_bh(&bf01_host_lock);
++	return 0;
++}
++
++static int bf01_host_dequeue(unsigned long address)
++{
++	unsigned int slot;
++	int result;
++
++	if (mutex_lock_interruptible(&bf01_host_reader))
++		return -ERESTARTSYS;
++	spin_lock_bh(&bf01_host_lock);
++	if (!bf01_host_count) {
++		spin_unlock_bh(&bf01_host_lock);
++		mutex_unlock(&bf01_host_reader);
++		return -EAGAIN;
++	}
++	slot = bf01_host_head;
++	spin_unlock_bh(&bf01_host_lock);
++	result = copy_to_user((void __user *)address, bf01_host_queue[slot],
++		BF01_HOST_MESSAGE_MAX + 1) ? -EFAULT : 0;
++	if (!result) {
++		spin_lock_bh(&bf01_host_lock);
++		bf01_host_head = (bf01_host_head + 1) % BF01_HOST_QUEUE_SIZE;
++		bf01_host_count--;
++		spin_unlock_bh(&bf01_host_lock);
++	}
++	mutex_unlock(&bf01_host_reader);
++	return result;
++}
++
+ struct atbm_info {
+ 	dev_t devid;
+ 	struct cdev *my_cdev;
+@@ -1980,6 +2035,8 @@ static long atbm_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned lo
+ 
+ 	switch (cmd)
+ 	{
++		case _IOR(121, 90, unsigned int):
++			return bf01_host_dequeue(arg);
+ 		case ATBM_PS_SET:
+ 			ret = atbm_wsm_ps(((struct atbm_info *)(filp->private_data))->hw_priv, arg);
+ 			break;
+@@ -2355,4 +2412,3 @@ void atbm_ioctl_free(void)
+ 	spin_unlock_bh(&s_status_queue_lock);
+ }
+ #endif
+-
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
+index f0d862f6469a1e47a6824f5d3a2ee1c0e5f7e380..59cec8ee4deb9828fd8a682561287e782a296658 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
+@@ -84,24 +84,25 @@ static int atbm_rx_directly(struct atbm_common *hw_priv,struct sk_buff *skb)
+ 	u32 wsm_len;
+ 	int wsm_id;
+ 	u8 wsm_seq;
+-	static int rx_resync = 1;
+ 	int status = 0;
+-	static int recv_cnt = 0;
+ 
+-	if (recv_cnt < 4) {//do not deal with first 4 invalid packets, soft reset bug
+-		wsm_seq = recv_cnt;
+-		hw_priv->wsm_rx_seq = (wsm_seq + 1) & 7;
+-		rx_resync = 0;
+-		recv_cnt++;
+-		atbm_control_dbg(ATBM_CONTROL_DEBUG_RX, "%s drop first 4 packets!\n", __func__); 
+-	}
+-	else {
++	{
++		if (skb->len < sizeof(*wsm)) {
++			status = -EINVAL;
++			goto exit;
++		}
+ 		data = skb->data;
+ 		wsm = (struct wsm_hdr *)data;
+ 		
+ 		wsm_len = __le32_to_cpu(wsm->len);
+ 		wsm_id  = __le32_to_cpu(wsm->id) & 0x1FFF;
+ 		wsm_seq = (__le32_to_cpu(wsm->id) >> 13) & 7;
++		if (wsm_len < sizeof(*wsm) || wsm_len > skb->len) {
++			status = -EINVAL;
++			goto exit;
++		}
++		if (!hw_priv->wsm_caps.firmwareReady && wsm_id != WSM_STARTUP_IND_ID && wsm_id != 0x0800)
++			goto exit;
+ 		
+ 		atbm_skb_trim(skb, wsm_len);
+ 		if (unlikely(wsm_id == 0x0800)) {
+@@ -110,7 +111,7 @@ static int atbm_rx_directly(struct atbm_common *hw_priv,struct sk_buff *skb)
+ 				wsm_len - sizeof(*wsm));
+ 				status = -1;
+ 				goto exit;
+-		} else if (unlikely(!rx_resync)) {
++		} else if (hw_priv->wsm_caps.firmwareReady && wsm_id != WSM_STARTUP_IND_ID) {
+ 			if (WARN_ON(wsm_seq != hw_priv->wsm_rx_seq)) {
+ 				atbm_printk_err("(wsm_seq %d != hw_priv->wsm_rx_seq %d) \n",wsm_seq , hw_priv->wsm_rx_seq);
+ 				status = -2;
+@@ -118,7 +119,6 @@ static int atbm_rx_directly(struct atbm_common *hw_priv,struct sk_buff *skb)
+ 			}
+ 		}
+ 		hw_priv->wsm_rx_seq = (wsm_seq + 1) & 7;
+-		rx_resync = 0;
+ 
+ 		if (wsm_id & 0x0400) {
+ 			int rc = wsm_release_tx_buffer(hw_priv, 1);
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/iface.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/iface.c
+index f7b6049f012c330dc55009886b4a86707f0efa03..79db244bbe7adc7715d9b06d804ec6b02c2b5ce1 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/iface.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/iface.c
+@@ -39,7 +39,7 @@ enum work_action {
+ };
+ 
+ void atbm_get_connectconfig(struct atbm_common *hw_priv);
+-void atbm_set_tcp_port_filter(struct atbm_common *hw_priv);
++int atbm_set_tcp_port_filter(struct atbm_common *hw_priv);
+ int atbm_notify_sta_connect_ok(struct atbm_common *hw_priv);
+ 
+ #ifndef CONFIG_ATBM_SDIO_ATCMD
+@@ -679,10 +679,14 @@ static void ieee80211_iface_work(struct work_struct *work)
+ static int atbm_open(struct net_device *dev)
+ {
+ 	struct atbm_vif *sdata = atbm_dev_to_vif(dev);
++	int ret;
++
++	ret = atbm_set_tcp_port_filter(sdata->hw_priv);
++	if (ret)
++		return ret;
+ 	atomic_set(&sdata->enabled,1);
+ 	
+ 	atbm_get_connectconfig(sdata->hw_priv);
+-	atbm_set_tcp_port_filter(sdata->hw_priv);
+ 
+ 	if(sdata->connect_success==0){
+ 		netif_carrier_off(dev);
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
+index d3f444cc913185c8cac134506c99a0d17d38c4ed..8084a885d09157447d7e8ba88c185da5ec1e2587 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
+@@ -1392,12 +1392,36 @@ static void atbm_configure_wifi_mode(struct atbm_common *hw_priv)
+ 
+  void dump_mem(u8 *data, int len);
+ 
+- void atbm_set_tcp_port_filter(struct atbm_common *hw_priv)
++int atbm_set_tcp_port_filter(struct atbm_common *hw_priv)
+ {
+-	wsm_set_tcp_filter(hw_priv,&hw_priv->tcp_filter_req,sizeof(hw_priv->tcp_filter_req));
+-	
+-	atbm_printk_init("tcp_port_filter addcnt.%x:\n",hw_priv->tcp_filter_req.des_cnt);
+-	//dump_mem((u8 *)(&hw_priv->tcp_filter_req),sizeof(hw_priv->tcp_filter_req));
++	struct wsm_tcp_filter_req filter = {0};
++	u16 required_flags = HI_SDIO_FILTER_F_ICMP | HI_SDIO_FILTER_F_ARP |
++		HI_SDIO_FILTER_F_DNS;
++	int ret;
++
++	ret = wsm_get_tcp_filter(hw_priv, &filter, sizeof(filter));
++	if (ret) {
++		atbm_printk_err("cannot read module TCP filter: %d; leaving it unchanged\n", ret);
++		return ret;
++	}
++	if (filter.status || filter.src_cnt > HI_SDIO_TCP_FILTER_PORT_MAX_CNT ||
++	    filter.des_cnt > HI_SDIO_TCP_FILTER_PORT_MAX_CNT) {
++		atbm_printk_err("invalid module TCP filter: status=%u src=%u dst=%u\n",
++			filter.status, filter.src_cnt, filter.des_cnt);
++		return -EINVAL;
++	}
++	if ((filter.Flags & required_flags) != required_flags) {
++		filter.Flags |= required_flags;
++		ret = wsm_set_tcp_filter(hw_priv, &filter, sizeof(filter));
++		if (ret) {
++			atbm_printk_err("cannot update module TCP filter flags: %d\n", ret);
++			return ret;
++		}
++	}
++	memcpy(&hw_priv->tcp_filter_req, &filter, sizeof(filter));
++	atbm_printk_init("module TCP filter preserved: flags=0x%x src=%u dst=%u\n",
++		filter.Flags, filter.src_cnt, filter.des_cnt);
++	return 0;
+ }
+ 
+  void atbm_set_psmode(struct atbm_common *hw_priv)
+@@ -1483,10 +1507,8 @@ int atbm_core_probe(const struct sbus_ops *sbus_ops,
+ 	hw_priv->pdev = pdev;
+ 	hw_priv->tcp_filter_req.Flags= HI_SDIO_FILTER_F_ICMP|HI_SDIO_FILTER_F_ARP|HI_SDIO_FILTER_F_DNS;
+ 	hw_priv->tcp_filter_req.status= 0;
+-	hw_priv->tcp_filter_req.des_cnt = 1;
+-	hw_priv->tcp_filter_req.src_cnt = 1;
+-	hw_priv->tcp_filter_req.des_tcpport[0] =  htons(5001);
+-	hw_priv->tcp_filter_req.src_tcpport[0] =  htons(5001);
++	hw_priv->tcp_filter_req.des_cnt = 0;
++	hw_priv->tcp_filter_req.src_cnt = 0;
+ 	
+ 	hw_priv->ps_mode_req.powerave_level = 1;
+ 	hw_priv->ps_mode_req.powersave_mode = HAL_NO_SLEEP;
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c
+index ca4872ac9b19156936cb88af28dfb35beeeeb52d..16935ae21aaf752a438ef05e30bdb190986138f7 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c
+@@ -35,6 +35,10 @@ void atbm_rx_cb(struct atbm_vif *priv,
+ 
+ extern int test_cnt_packet;
+ 
++#ifdef LINUX_OS
++extern int atbm_bf01_host_indication(const u8 *data, size_t size);
++#endif
++
+ #define WSM_CMD_TIMEOUT		(60 * HZ) /* With respect to interrupt loss */
+ #define WSM_CMD_SCAN_TIMEOUT	(15 * HZ) /* With respect to interrupt loss */
+ #define WSM_CMD_JOIN_TIMEOUT	(18 * HZ) /* Join timeout is 5 sec. in FW   */
+@@ -308,7 +312,8 @@ int wsm_cmd_send(struct atbm_common *hw_priv,
+ 	if (buf_len > SYS_MAX_INPUT_MSG_SIZE)
+ 	{
+ 		atbm_printk_err("wsm_cmd_send: cmd %x buf_len %zu too large\n", cmd, buf_len);
+-		return -4;
++		wsm_buf_reset(buf);
++		return -EMSGSIZE;
+ 	}
+ 
+ 	if(atbm_bh_is_term(hw_priv)){
+@@ -842,6 +847,20 @@ underflow:
+ 	return -EINVAL;
+ }
+ 
++static int wsm_direct_trans_confirm(struct wsm_generic_get_arg_s *arg,
++		struct wsm_buf *buf)
++{
++	size_t length = buf->end - buf->data;
++
++	if (arg->buf_size != sizeof(struct wsm_direct_trans_buffer_req) ||
++		length < sizeof(u32) || length > arg->buf_size)
++		return -EINVAL;
++	memset(arg->buf, 0, arg->buf_size);
++	memcpy(arg->buf, buf->data, length);
++	buf->data += length;
++	return 0;
++}
++
+ int wsm_confirm_for_sdio_alive(struct atbm_common *hw_priv, struct wsm_buf *buf)
+ {
+ 	u32 status = WSM_GET32(buf);
+@@ -969,7 +988,6 @@ int wsm_handle_rx(struct atbm_common *hw_priv, int id,
+ 		case WSM_GET_TIME_RESP_ID:
+ 		case WSM_GET_ETF_RX_INFO_RESP_ID:
+ 		case WSM_CONN_LOSE_RESP_ID:
+-		case WSM_DIRECT_TRANS_BUFFER_RESP_ID:
+ 		case WSM_CRYPTO_EXP_RESP_ID:
+ 			if (likely(wsm_arg))
+ 				ret = wsm_generic_get_confirm(hw_priv,
+@@ -977,6 +995,11 @@ int wsm_handle_rx(struct atbm_common *hw_priv, int id,
+ 									&wsm_buf);
+ 			break;
+ 			
++		case WSM_DIRECT_TRANS_BUFFER_RESP_ID:
++			ret = wsm_arg ? wsm_direct_trans_confirm(wsm_arg,
++					&wsm_buf) : -EINVAL;
++			break;
++
+ 		case WSM_JOIN_RESP_ID:
+ 		case WSM_SCAN_RESP_ID:
+ 		case WSM_WIFIMODE_RESP_ID:
+@@ -1048,6 +1071,15 @@ int wsm_handle_rx(struct atbm_common *hw_priv, int id,
+ 	} 
+ 	else if (id & WSM_IND_BASE) {
+ 		switch (id) {
++#ifdef LINUX_OS
++		case 0x083B:
++			ret = atbm_bf01_host_indication(wsm_buf.data,
++				wsm_buf.end - wsm_buf.data);
++			if (ret)
++				pr_warn_ratelimited("atbm: host indication dropped: %d\n", ret);
++			ret = 0;
++			break;
++#endif
+ 		case WSM_STARTUP_IND_ID:
+ 			ret = wsm_startup_indication(hw_priv, &wsm_buf);
+ 			break;
+@@ -1142,7 +1174,7 @@ static int wsm_buf_reserve(struct wsm_buf *buf, size_t extra_size)
+ 	size_t size = pos + extra_size;
+ 
+ 	if (size & (SDIO_BLOCK_SIZE - 1)) {
+-		size &= SDIO_BLOCK_SIZE;
++		size &= ~(SDIO_BLOCK_SIZE - 1);
+ 		size += SDIO_BLOCK_SIZE;
+ 	}
+ 
+@@ -2204,15 +2236,20 @@ nomem:
+ int wsm_direct_trans_buffer(struct atbm_common *hw_priv, void *buffer, size_t buf_size)
+ {
+ 	int ret;
++	struct wsm_direct_trans_buffer_req *request = buffer;
++	size_t length = strnlen(request->trans, sizeof(request->trans));
++	size_t payload_size = SYS_MAX_INPUT_MSG_SIZE - sizeof(struct wsm_hdr_tx);
+ 	struct wsm_buf *buf = &hw_priv->wsm_cmd_buf;
+ 	struct wsm_generic_get_arg_s wsm_shmem_arg = {
+ 		.buf = buffer,
+ 		.buf_size = buf_size,
+ 	};
+ 
++	if (buf_size != sizeof(*request) || sizeof(request->status) + length >= payload_size)
++		return -EMSGSIZE;
+ 	wsm_cmd_lock(hw_priv);
+ 
+-	WSM_PUT(buf,buffer, buf_size);
++	WSM_PUT(buf, buffer, payload_size);
+ 	ret = wsm_cmd_send(hw_priv, buf, &wsm_shmem_arg, WSM_DIRECT_TRANS_BUFFER_REQ_ID, WSM_CMD_TIMEOUT,0);
+ 
+ 	wsm_cmd_unlock(hw_priv);
+@@ -2516,4 +2553,3 @@ int wsm_get_tx(struct atbm_common *hw_priv, u8 **data,
+ 	
+ 	return count;
+ }
+-
