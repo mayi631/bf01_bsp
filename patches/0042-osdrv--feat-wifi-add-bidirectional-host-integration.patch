@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mayi <3363523343@qq.com>
-Date: Wed, 11 Nov 2026 09:10:54 +0800
+Date: Thu, 12 Nov 2026 15:10:23 +0800
 Subject: [PATCH] feat(osdrv/wifi): support bidirectional BF01 host integration
 
 [description ]:
@@ -12,6 +12,11 @@ Subject: [PATCH] feat(osdrv/wifi): support bidirectional BF01 host integration
   reception with firmware readiness instead of dropping four packets.
 - Preserve the module's TCP port filters when opening the host interface,
   adding only the required ICMP/ARP/DNS flags and propagating failures.
+- Keep the driver bound while a background worker retries the real WSM
+  startup handshake: a 1000 ms indication wait and 1000 ms between cleaned-up
+  failed attempts. Publish wlan0 and control readiness only after success.
+- Bound startup I/O failures, unwind per-attempt resources, expose startup
+  state in sysfs and cancel the worker safely during removal.
 
 [root   cause]:
 - The original driver does not expose unsolicited host protocol messages
@@ -20,6 +25,9 @@ Subject: [PATCH] feat(osdrv/wifi): support bidirectional BF01 host integration
   enumeration or discard the firmware startup indication.
 - Host interface startup overwrites module-owned TCP port filters with
   a port-5001 default, disrupting the module's existing cloud connections.
+- A one-shot probe can time out before the module sends its WSM startup
+  indication, leaving no wlan0 or control backend even after the module is
+  ready; nested startup bus retries also delay the next handshake attempt.
 
 [JIRA      ID]:N/A (BF01 integration)
 [chip project]:181x
@@ -30,23 +38,75 @@ Subject: [PATCH] feat(osdrv/wifi): support bidirectional BF01 host integration
   queue drops the new indication and emits a rate-limited warning.
 - Current host-to-module Direct Buffer JSON limit is 1595 bytes; oversized
   requests are rejected rather than truncated.
+- The startup retry path is limited to Linux RHEA SDIO builds; normal I/O
+  retry behavior after firmware readiness remains unchanged.
+- Replace the previous 0042 and replay from a clean SDK baseline; do not
+  apply this complete feature patch on top of an already-applied old 0042.
 - Does not change module firmware, pinmux, memory layout or AI/capture policy.
 
 [Affected *.ko/*.so/*.a] :atbm6461_wifi_sdio.ko
 ---
- .../realtek/atbm6461/hal_apollo/apollo_sdio.c      | 25 ++++++++++
- .../realtek/atbm6461/hal_apollo/atbm_ioctl.c       | 58 +++++++++++++++++++++-
- .../wireless/realtek/atbm6461/hal_apollo/bh_sdio.c | 24 ++++-----
- .../wireless/realtek/atbm6461/hal_apollo/iface.c   |  8 ++-
- extdrv/wireless/realtek/atbm6461/hal_apollo/main.c | 40 +++++++++++----
- extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c  | 46 +++++++++++++++--
- 6 files changed, 172 insertions(+), 29 deletions(-)
+ .../realtek/atbm6461/hal_apollo/apollo_sdio.c      | 175 +++++++++++++++++++++
+ .../realtek/atbm6461/hal_apollo/atbm_ioctl.c       |  58 ++++++-
+ .../wireless/realtek/atbm6461/hal_apollo/bh_sdio.c |  44 ++++--
+ .../realtek/atbm6461/hal_apollo/hwio_sdio.c        |   8 +
+ .../wireless/realtek/atbm6461/hal_apollo/iface.c   |   8 +-
+ extdrv/wireless/realtek/atbm6461/hal_apollo/main.c | 140 +++++++++++++++--
+ extdrv/wireless/realtek/atbm6461/hal_apollo/sbus.h |   6 +
+ extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c  |  46 +++++-
+ 8 files changed, 453 insertions(+), 32 deletions(-)
 
 diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
-index 54bcfe2e92c654a1ca12b9814f7ee26b685afa69..48f344e8bfde9789037e08840d5bd29080a637b3 100644
+index 54bcfe2e92c654a1ca12b9814f7ee26b685afa69..0914eca15c8a90181e1427471089b80884c2195d 100644
 --- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
 +++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
-@@ -1351,11 +1351,36 @@ static void jiffies_print(char *jiffies_name[], int is_init)
+@@ -32,6 +32,7 @@
+ #include <linux/freezer.h>
+ #include <linux/netdevice.h>
+ #include <linux/rtnetlink.h>
++#include <linux/workqueue.h>
+ #endif
+ 
+ 
+@@ -116,6 +117,13 @@ struct sbus_priv {
+ 	atomic_t startup_irq_count;
+ 	atomic_t startup_rx_count;
+ 	unsigned int startup_poll_count;
++#endif
++#ifdef ATBM_BF01_STARTUP_RETRY
++	struct delayed_work startup_work;
++	atomic_t startup_stopping;
++	unsigned int startup_attempts;
++	int startup_error;
++	bool startup_ready;
+ #endif
+ 	struct atbm_sdio_thread tx_thread;
+ 	struct atbm_sdio_thread rx_thread;
+@@ -171,6 +179,13 @@ static struct sbus_wtd         g_wtd={
+ 	.wtd_init  = 0,
+ 	.wtd_thread = NULL,
+ };
++#ifdef ATBM_BF01_STARTUP_RETRY
++static int atbm_bf01_startup_cancelled(struct sbus_priv *self)
++{
++	return atomic_read(&self->startup_stopping) ||
++		atomic_read(&g_wtd.wtd_term);
++}
++#endif
+ #ifdef LINUX_OS
+ static struct task_struct *atbm_kthread_get(struct atbm_sdio_thread *thread)
+ {
+@@ -1268,6 +1283,9 @@ static int atbm_sdio_lmac_restart(struct sbus_priv *self)
+ }
+ 
+ static struct sbus_ops atbm_sdio_sbus_ops = {
++#ifdef ATBM_BF01_STARTUP_RETRY
++	.startup_cancelled = atbm_bf01_startup_cancelled,
++#endif
+ 	.sbus_memcpy_fromio	= atbm_sdio_memcpy_fromio,
+ 	.sbus_memcpy_toio	= atbm_sdio_memcpy_toio,
+ 	.sbus_read_sync 	= atbm_sdio_memcpy_fromio,
+@@ -1351,11 +1369,140 @@ static void jiffies_print(char *jiffies_name[], int is_init)
  
  
  /* Probe Function to be called by SDIO stack when device is discovered */
@@ -54,12 +114,116 @@ index 54bcfe2e92c654a1ca12b9814f7ee26b685afa69..48f344e8bfde9789037e08840d5bd290
 +extern int sdio_reset_comm(struct mmc_card *card);
 +#endif
 +
++#ifdef ATBM_BF01_STARTUP_RETRY
++static ssize_t bf01_startup_state_show(struct device *dev,
++		struct device_attribute *attribute, char *buffer)
++{
++	struct sbus_priv *self = atbm_sdio_get_drvdata(dev_to_sdio_func(dev));
++	const char *state;
++	int status;
++
++	if (!self)
++		return -ENODEV;
++	status = READ_ONCE(self->startup_error);
++	if (atbm_bf01_startup_cancelled(self))
++		state = "stopped";
++	else if (smp_load_acquire(&self->startup_ready))
++		state = "ready";
++	else if (status == -EINPROGRESS)
++		state = "handshaking";
++	else
++		state = "retry";
++	return scnprintf(buffer, PAGE_SIZE, "%s attempt=%u error=%d\n", state,
++		READ_ONCE(self->startup_attempts), status);
++}
++static DEVICE_ATTR_RO(bf01_startup_state);
++
++static int atbm_bf01_prepare_function(struct sbus_priv *self)
++{
++	struct sdio_func *func = self->func;
++	u8 bus_interface, expected_width, enabled, ready;
++	int status;
++
++	sdio_claim_host(func);
++	bus_interface = sdio_f0_readb(func, SDIO_CCCR_IF, &status);
++	sdio_release_host(func);
++	if (status)
++		return status;
++	expected_width = func->card->host->ios.bus_width == MMC_BUS_WIDTH_4 ?
++		SDIO_BUS_WIDTH_4BIT : SDIO_BUS_WIDTH_1BIT;
++	if ((bus_interface & SDIO_BUS_WIDTH_MASK) != expected_width) {
++		atbm_printk_err("BF01 handshake bus configuration changed: host=%u IF=0x%02x; restoring SDIO communications\n",
++			func->card->host->ios.bus_width, bus_interface);
++		status = sdio_reset_comm(func->card);
++		if (status)
++			return status;
++	}
++	sdio_claim_host(func);
++	status = atbm_sdio_enable_func(func);
++	if (!status)
++		status = sdio_set_block_size(func, SDIO_BLOCK_SIZE);
++	if (!status) {
++		enabled = sdio_f0_readb(func, SDIO_CCCR_IOEx, &status);
++		if (!status) {
++			ready = sdio_f0_readb(func, SDIO_CCCR_IORx, &status);
++			if (!status && (!(enabled & BIT(func->num)) ||
++					!(ready & BIT(func->num))))
++				status = -EAGAIN;
++		}
++	}
++	sdio_release_host(func);
++	return status;
++}
++
++static void atbm_bf01_startup_work(struct work_struct *work)
++{
++	struct sbus_priv *self = container_of(to_delayed_work(work),
++		struct sbus_priv, startup_work);
++	unsigned int attempt;
++	int status;
++
++	if (atbm_bf01_startup_cancelled(self) ||
++	    smp_load_acquire(&self->startup_ready))
++		return;
++	attempt = READ_ONCE(self->startup_attempts) + 1;
++	WRITE_ONCE(self->startup_attempts, attempt);
++	WRITE_ONCE(self->startup_error, -EINPROGRESS);
++	atomic_set(&self->startup_irq_count, 0);
++	atomic_set(&self->startup_rx_count, 0);
++	self->startup_poll_count = 0;
++	self->io_error_logged = 0;
++	atbm_printk_always("BF01 handshake attempt=%u: preparing function and requesting real WSM startup\n", attempt);
++	status = atbm_bf01_prepare_function(self);
++	if (!status && !atbm_bf01_startup_cancelled(self))
++		status = atbm_core_probe(&atbm_sdio_sbus_ops,
++			self, &self->func->dev, &self->core);
++	else if (!status)
++		status = -ESHUTDOWN;
++	WRITE_ONCE(self->startup_error, status);
++	if (!status) {
++		smp_store_release(&self->startup_ready, true);
++		atomic_set(&g_wtd.wtd_probe, 1);
++		atbm_printk_always("BF01 handshake ready: attempt=%u; wlan0 and control backend available\n", attempt);
++		return;
++	}
++	sdio_claim_host(self->func);
++	atbm_sdio_disable_func(self->func);
++	sdio_release_host(self->func);
++	if (!atbm_bf01_startup_cancelled(self)) {
++		atbm_printk_err("BF01 handshake failed: attempt=%u error=%d; retry_in_ms=1000; driver remains bound\n",
++			attempt, status);
++		queue_delayed_work(system_long_wq, &self->startup_work,
++			msecs_to_jiffies(1000));
++	}
++}
++#endif
++
  static int atbm_sdio_probe(struct sdio_func *func,
  			      const struct sdio_device_id *id)
  {
  	struct sbus_priv *self;
  	int status;
-+#ifdef LINUX_OS
++#if defined(LINUX_OS) && !defined(ATBM_BF01_STARTUP_RETRY)
 +	u8 bus_interface;
 +	u8 expected_width;
 +
@@ -83,6 +247,69 @@ index 54bcfe2e92c654a1ca12b9814f7ee26b685afa69..48f344e8bfde9789037e08840d5bd290
  
  	atbm_dbg(ATBM_APOLLO_DBG_INIT, "Probe called\n");
  	#ifdef TIME_DEBUG
+@@ -1382,6 +1529,20 @@ static int atbm_sdio_probe(struct sdio_func *func,
+ 	atomic_set(&self->startup_rx_count, 0);
+ 	#endif
+ 	atbm_sdio_set_drvdata(func, self);
++#ifdef ATBM_BF01_STARTUP_RETRY
++	atomic_set(&self->startup_stopping, 0);
++	self->startup_error = -EAGAIN;
++	INIT_DELAYED_WORK(&self->startup_work, atbm_bf01_startup_work);
++	status = device_create_file(&func->dev, &dev_attr_bf01_startup_state);
++	if (status) {
++		atbm_sdio_set_drvdata(func, NULL);
++		atbm_kfree(self);
++		return status;
++	}
++	atbm_printk_always("BF01 SDIO driver bound; background handshake retries enabled\n");
++	queue_delayed_work(system_long_wq, &self->startup_work, 0);
++	return 0;
++#else
+ 	sdio_claim_host(func);
+ 	status = atbm_sdio_enable_func(func);
+ #ifdef LINUX_OS
+@@ -1424,6 +1585,7 @@ err_disable:
+ 	atbm_kfree(self);
+ 	atomic_set(&g_wtd.wtd_probe, -1);
+ 	return status;
++#endif
+ }
+ 
+ /* Disconnect Function to be called by SDIO stack when
+@@ -1442,6 +1604,11 @@ static void atbm_sdio_disconnect(struct sdio_func *func)
+ 	jiffies_update(0);
+ 	#endif
+ 	if (self) {
++#ifdef ATBM_BF01_STARTUP_RETRY
++		atomic_set(&self->startup_stopping, 1);
++		device_remove_file(&func->dev, &dev_attr_bf01_startup_state);
++		cancel_delayed_work_sync(&self->startup_work);
++#endif
+ 		atomic_set(&g_wtd.wtd_probe, 0);
+ 		
+ 		if (self->core) {
+@@ -1468,6 +1635,10 @@ static int atbm_suspend(struct device *dev)
+ 	struct sbus_priv *self = atbm_sdio_get_drvdata(func);
+ 	/* Notify SDIO that CW1200 will remain powered during suspend */
+ 	mmc_pm_flag_t flags=sdio_get_host_pm_caps(func);
++#ifdef ATBM_BF01_STARTUP_RETRY
++	if (!self || !smp_load_acquire(&self->startup_ready))
++		return -EBUSY;
++#endif
+ 	//printk("mmc_pm_flag=%x\n",flags);
+ 	if(!(flags&MMC_PM_KEEP_POWER)){
+ 		atbm_dbg(ATBM_APOLLO_DBG_ERROR,
+@@ -1503,6 +1674,10 @@ static int atbm_resume(struct device *dev)
+ 	struct sbus_priv *self = atbm_sdio_get_drvdata(func);
+ 	int ret = 0;
+ 	
++#ifdef ATBM_BF01_STARTUP_RETRY
++	if (!self || !smp_load_acquire(&self->startup_ready))
++		return 0;
++#endif
+ 	atbm_printk_err("sdio resume\n");
+ 	atbm_sdio_lock(self);
+ 	atbm_printk_err("%s:disable irq\n",__func__);
 diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/atbm_ioctl.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/atbm_ioctl.c
 index 0052694a393e7300d561f356b7fa3e5fd909fd35..0072102927f4b7773e7107e4925a18644339497b 100644
 --- a/extdrv/wireless/realtek/atbm6461/hal_apollo/atbm_ioctl.c
@@ -164,7 +391,7 @@ index 0052694a393e7300d561f356b7fa3e5fd909fd35..0072102927f4b7773e7107e4925a1864
  #endif
 -
 diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
-index f0d862f6469a1e47a6824f5d3a2ee1c0e5f7e380..59cec8ee4deb9828fd8a682561287e782a296658 100644
+index f0d862f6469a1e47a6824f5d3a2ee1c0e5f7e380..90f5916dc88c49d4a7d04556c4efc8c041486d80 100644
 --- a/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
 +++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/bh_sdio.c
 @@ -84,24 +84,25 @@ static int atbm_rx_directly(struct atbm_common *hw_priv,struct sk_buff *skb)
@@ -220,6 +447,82 @@ index f0d862f6469a1e47a6824f5d3a2ee1c0e5f7e380..59cec8ee4deb9828fd8a682561287e78
  
  		if (wsm_id & 0x0400) {
  			int rc = wsm_release_tx_buffer(hw_priv, 1);
+@@ -186,15 +186,27 @@ static int atbm_sdio_process_read_data(struct atbm_common *hw_priv,reed_ctrl_han
+ 	u32 alloc_len;
+ 	u8 *data;
+ 	u8 rx_continue_cnt = 0;
++#ifdef ATBM_BF01_STARTUP_RETRY
++	int control_status;
++#endif
+ 
+ 	BUG_ON(read_ctrl_func == NULL);
+ 	BUG_ON(read_data_func == NULL);
+ 	BUG_ON(rx_handle == NULL);
+ rx_check:
++#ifdef ATBM_BF01_STARTUP_RETRY
++	control_status = read_ctrl_func(hw_priv, &ctrl_reg);
++	if (control_status) {
++		if (READ_ONCE(hw_priv->wsm_caps.firmwareReady))
++			WARN_ON(control_status);
++		goto err;
++	}
++#else
+ 	if (WARN_ON(read_ctrl_func(
+ 			hw_priv, &ctrl_reg))){
+ 			goto err;
+ 	}
++#endif
+ rx_continue:
+ 	read_len_lsb = (ctrl_reg & ATBM_HIFREG_CONT_NEXT_LEN_LSB_MASK)*2;
+ 	read_len_msb = (ctrl_reg & ATBM_HIFREG_CONT_NEXT_LEN_MSB_MASK)*2;
+@@ -850,6 +862,10 @@ int atbm_bh_read_ctrl_reg(struct atbm_common *hw_priv,
+ 	while (retry <= MAX_RETRY) {
+ 		ret = atbm_reg_read_16(hw_priv,
+ 				ATBM_HIFREG_CONTROL_REG_ID, ctrl_reg);
++#ifdef ATBM_BF01_STARTUP_RETRY
++		if (ret && !READ_ONCE(hw_priv->wsm_caps.firmwareReady))
++			return ret;
++#endif
+ 		if(!ret){
+ 				break;
+ 		}else{
+@@ -875,6 +891,10 @@ int atbm_bh_read_ctrl_reg_unlock(struct atbm_common *hw_priv,
+ 	while (retry <= MAX_RETRY) {
+ 		ret = atbm_reg_read_16_unlock(hw_priv,
+ 				ATBM_HIFREG_CONTROL_REG_ID, ctrl_reg);
++#ifdef ATBM_BF01_STARTUP_RETRY
++		if (ret && !READ_ONCE(hw_priv->wsm_caps.firmwareReady))
++			return ret;
++#endif
+ 		if(!ret){
+ 				break;
+ 		}else{
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/hwio_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/hwio_sdio.c
+index 360ff19917ae0f09ef3c26b7ff3f4a63913a50f6..a7b87f6502af976f23cb337d151da28c92963277 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/hwio_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/hwio_sdio.c
+@@ -294,6 +294,10 @@ int atbm_reg_read_unlock(struct atbm_common *hw_priv, u16 addr, void *buf,
+ 	while (retry <= 3) {
+ 		ret = __atbm_reg_read(hw_priv, addr, buf, buf_len);
+ 		if(ret){
++#ifdef ATBM_BF01_STARTUP_RETRY
++			if (!READ_ONCE(hw_priv->wsm_caps.firmwareReady))
++				return ret;
++#endif
+ 			atbm_printk_err("%s\n",__func__);
+ 			retry++;
+ 		}else{
+@@ -312,6 +316,10 @@ int atbm_reg_write_unlock(struct atbm_common *hw_priv, u16 addr, const void *buf
+ 	while (retry <= 3) {
+ 		ret = __atbm_reg_write(hw_priv, addr, buf, buf_len);
+ 		if(ret){
++#ifdef ATBM_BF01_STARTUP_RETRY
++			if (!READ_ONCE(hw_priv->wsm_caps.firmwareReady))
++				return ret;
++#endif
+ 			atbm_printk_err("%s\n",__func__);
+ 			retry++;
+ 		}else{
 diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/iface.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/iface.c
 index f7b6049f012c330dc55009886b4a86707f0efa03..79db244bbe7adc7715d9b06d804ec6b02c2b5ce1 100644
 --- a/extdrv/wireless/realtek/atbm6461/hal_apollo/iface.c
@@ -250,10 +553,23 @@ index f7b6049f012c330dc55009886b4a86707f0efa03..79db244bbe7adc7715d9b06d804ec6b0
  	if(sdata->connect_success==0){
  		netif_carrier_off(dev);
 diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
-index d3f444cc913185c8cac134506c99a0d17d38c4ed..8084a885d09157447d7e8ba88c185da5ec1e2587 100644
+index d3f444cc913185c8cac134506c99a0d17d38c4ed..9185f92b6444e98a632c4a51f3b7c33df76dec65 100644
 --- a/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
 +++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
-@@ -1392,12 +1392,36 @@ static void atbm_configure_wifi_mode(struct atbm_common *hw_priv)
+@@ -1150,6 +1150,12 @@ struct atbm_common *atbm_init_common(size_t hw_priv_data_len)
+ 		8  /* TKIP IV */ +
+ 		12 /* TKIP ICV and MIC */;
+ 	hw_priv->workqueue = create_singlethread_workqueue("atbm_wq");	
++#ifdef ATBM_BF01_STARTUP_RETRY
++	if (!hw_priv->workqueue) {
++		kfree(hw_priv);
++		return NULL;
++	}
++#endif
+ 	init_waitqueue_head(&hw_priv->wsm_cmd_wq);
+ 	spin_lock_init(&hw_priv->event_queue_lock);
+ 	INIT_LIST_HEAD(&hw_priv->event_queue);
+@@ -1392,12 +1398,36 @@ static void atbm_configure_wifi_mode(struct atbm_common *hw_priv)
  
   void dump_mem(u8 *data, int len);
  
@@ -295,7 +611,30 @@ index d3f444cc913185c8cac134506c99a0d17d38c4ed..8084a885d09157447d7e8ba88c185da5
  }
  
   void atbm_set_psmode(struct atbm_common *hw_priv)
-@@ -1483,10 +1507,8 @@ int atbm_core_probe(const struct sbus_ops *sbus_ops,
+@@ -1468,6 +1498,13 @@ int atbm_core_probe(const struct sbus_ops *sbus_ops,
+ 	struct atbm_common *hw_priv=NULL;
+ 	u32 val32 = 0;
+ 	int ret = 0;
++#ifdef ATBM_BF01_STARTUP_RETRY
++	bool startup_xmit_initialized = false;
++	bool startup_recv_initialized = false;
++#ifdef CONFIG_PM
++	bool startup_pm_initialized = false;
++#endif
++#endif
+ 
+ 	#ifdef TIME_DEBUG
+ 	jiffies_update(0);
+@@ -1476,17 +1513,17 @@ int atbm_core_probe(const struct sbus_ops *sbus_ops,
+ 	if (!hw_priv)
+ 		goto err;
+ 
++#ifndef ATBM_BF01_STARTUP_RETRY
+ 	atbm_hw_priv_assign_pointer(hw_priv);
++#endif
+ 	hw_priv->init_done = 0;
+ 	hw_priv->sbus_ops = sbus_ops;
+ 	hw_priv->sbus_priv = sbus;
  	hw_priv->pdev = pdev;
  	hw_priv->tcp_filter_req.Flags= HI_SDIO_FILTER_F_ICMP|HI_SDIO_FILTER_F_ARP|HI_SDIO_FILTER_F_DNS;
  	hw_priv->tcp_filter_req.status= 0;
@@ -308,6 +647,209 @@ index d3f444cc913185c8cac134506c99a0d17d38c4ed..8084a885d09157447d7e8ba88c185da5
  	
  	hw_priv->ps_mode_req.powerave_level = 1;
  	hw_priv->ps_mode_req.powersave_mode = HAL_NO_SLEEP;
+@@ -1502,6 +1539,9 @@ int atbm_core_probe(const struct sbus_ops *sbus_ops,
+ 				err);
+ 		goto err1;
+ 	}
++#ifdef ATBM_BF01_STARTUP_RETRY
++	startup_pm_initialized = true;
++#endif
+ #endif
+ 
+ 	if (has_func_enable) {
+@@ -1562,10 +1602,18 @@ int atbm_core_probe(const struct sbus_ops *sbus_ops,
+ 	#ifdef TIME_DEBUG
+ 	jiffies_update(0);
+ 	#endif
+-	if(hw_priv->sbus_ops->sbus_xmit_func_init)
++	if(hw_priv->sbus_ops->sbus_xmit_func_init) {
++#ifdef ATBM_BF01_STARTUP_RETRY
++		startup_xmit_initialized = true;
++#endif
+ 		err = hw_priv->sbus_ops->sbus_xmit_func_init(hw_priv->sbus_priv);
+-	if(hw_priv->sbus_ops->sbus_rev_func_init)
++	}
++	if(hw_priv->sbus_ops->sbus_rev_func_init) {
++#ifdef ATBM_BF01_STARTUP_RETRY
++		startup_recv_initialized = true;
++#endif
+ 		err |= hw_priv->sbus_ops->sbus_rev_func_init(hw_priv->sbus_priv);
++	}
+ 
+ 	if(err){
+ 		atbm_printk_err("rev and xmit init err\n");
+@@ -1598,6 +1646,10 @@ reload_fw:
+ 	if (ret < 0) {
+ 		atbm_dbg(ATBM_APOLLO_DBG_ERROR,
+ 			"%s: can't register IRQ handler.\n", __func__);
++		#ifdef ATBM_BF01_STARTUP_RETRY
++		err = ret;
++		goto err3;
++		#endif
+ 		//goto out;
+ 	}
+ 
+@@ -1612,13 +1664,31 @@ __wait_start_up:
+ #endif
+ //fix mstar CVT suspend bug,in CVT mstar suspend wait_event_interruptible_timeout sometime will not delay
+ 	{
++		#ifdef ATBM_BF01_STARTUP_RETRY
++		unsigned long startup_started = jiffies;
++		unsigned long startup_deadline = startup_started + msecs_to_jiffies(1000);
++		atbm_printk_always("WSM handshake attempt: timeout_ms=1000; retry worker owns startup\n");
++		#else
+ 		int loop =0;
+ 		atbm_printk_always("mdelay wait wsm_startup_done  !!\n");
++		#endif
+ 		while(hw_priv->wsm_caps.firmwareReady !=1){
++			#ifdef ATBM_BF01_STARTUP_RETRY
++			if (hw_priv->sbus_ops->startup_cancelled(hw_priv->sbus_priv)) {
++				err = -ESHUTDOWN;
++				goto err3;
++			}
++			msleep(20);
++			if (time_after_eq(jiffies, startup_deadline) &&
++			    !READ_ONCE(hw_priv->wsm_caps.firmwareReady)) {
++				atbm_printk_err("WSM handshake attempt expired: elapsed_ms=%u\n",
++					jiffies_to_msecs(jiffies - startup_started));
++			#else
+ 			mdelay(10);
+ 			schedule_timeout_interruptible(msecs_to_jiffies(20));
+ 			if(loop++>300){
+ 				atbm_printk_init("wait_event_interruptible_timeout wsm_startup_done timeout ERROR !!\n");
++			#endif
+ 				#if (PROJ_TYPE == RHEA) && defined(LINUX_OS) && defined(SDIO_BUS)
+ 				{
+ 					u32 startup_control = 0;
+@@ -1654,6 +1724,10 @@ __wait_start_up:
+ 				}
+ 			}
+ 		}
++		#ifdef ATBM_BF01_STARTUP_RETRY
++		atbm_printk_always("WSM handshake accepted: elapsed_ms=%u\n",
++			jiffies_to_msecs(jiffies - startup_started));
++		#endif
+ 	}
+ 	if (err) {
+ 		goto err3;
+@@ -1679,13 +1753,19 @@ __wait_start_up:
+ 	rtnl_lock();
+ 	err = atbm_netdev_add(hw_priv,"wlan0");
+ 	rtnl_unlock();
++#ifdef ATBM_BF01_STARTUP_RETRY
++	if (err)
++		goto err3;
++#endif
+ #if (ATBM_WIFI_PLATFORM == PLATFORM_ANKAI_RTOS)
+ 	atbm_config_ak_net_mac(hw_priv->vif_list[0]->ndev);
+ #endif
+ 	//atbm_setup_mac(hw_priv);
+ #endif //CONFIG_ATBM_SDIO_ATCMD
+ 
++#ifndef ATBM_BF01_STARTUP_RETRY
+ 	hw_net_cfg_ok = 1;
++#endif
+ 	#ifdef TIME_DEBUG
+ 	jiffies_update(0);
+ 	#endif
+@@ -1693,6 +1773,10 @@ __wait_start_up:
+ 	if(hw_priv->wsm_caps.firmwareCap&CAPABLITIES_HOST_CONFIG){
+ 		atbm_set_hostconfig(hw_priv);
+ 	}
++#ifdef ATBM_BF01_STARTUP_RETRY
++	atbm_hw_priv_assign_pointer(hw_priv);
++	smp_store_release(&hw_net_cfg_ok, 1);
++#endif
+ 	return err;
+ 
+ err3:
+@@ -1701,22 +1785,50 @@ err3:
+ err2:
+ 	atbm_unregister_bh(hw_priv);
+ err1:
++#ifdef ATBM_BF01_STARTUP_RETRY
++	hw_priv->init_done = 0;
++	hw_priv->close_driver = 1;
++#endif
+ 	/*
+ 	*init bus tx/rx
+ 	*/
++#ifdef ATBM_BF01_STARTUP_RETRY
++	if (startup_xmit_initialized)
++		hw_priv->sbus_ops->sbus_xmit_func_deinit(hw_priv->sbus_priv);
++	if (startup_recv_initialized)
++		hw_priv->sbus_ops->sbus_rev_func_deinit(hw_priv->sbus_priv);
++#else
+ 	if(hw_priv->sbus_ops->sbus_xmit_func_deinit)
+ 		hw_priv->sbus_ops->sbus_xmit_func_deinit(hw_priv->sbus_priv);
+ 	if(hw_priv->sbus_ops->sbus_rev_func_deinit)
+ 		hw_priv->sbus_ops->sbus_rev_func_deinit(hw_priv->sbus_priv);	
++#endif
++#ifdef ATBM_BF01_STARTUP_RETRY
++	cancel_work_sync(&hw_priv->event_handler);
++	flush_workqueue(hw_priv->workqueue);
++	destroy_workqueue(hw_priv->workqueue);
++	hw_priv->workqueue = NULL;
++	atbm_free_event_queue(hw_priv);
++	atbm_rx_bh_flush(hw_priv);
++	atbm_tx_bh_flush(hw_priv);
++	atbm_skb_queue_purge(&hw_priv->rx_skb_queue);
++	if (hw_priv->skb_cache)
++		atbm_dev_kfree_skb(hw_priv->skb_cache);
++#endif
+ 	wsm_buf_deinit(&hw_priv->wsm_cmd_buf);
+ #ifdef CONFIG_PM
+-	atbm_pm_deinit(&hw_priv->pm_state);
++#ifdef ATBM_BF01_STARTUP_RETRY
++	if (startup_pm_initialized)
++#endif
++		atbm_pm_deinit(&hw_priv->pm_state);
+ #endif
+ 	atbm_free_common(hw_priv);
+ err:
+ 	*pself=NULL;
++#ifndef ATBM_BF01_STARTUP_RETRY
+ 	if(hw_priv)
+ 		hw_priv->init_done = 0;
++#endif
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(atbm_core_probe);
+@@ -1724,6 +1836,10 @@ EXPORT_SYMBOL_GPL(atbm_core_probe);
+ void atbm_core_release(struct atbm_common *self)
+ {
+ 	struct atbm_vif *priv =__ABwifi_hwpriv_to_vifpriv(self,0);
++#ifdef ATBM_BF01_STARTUP_RETRY
++	WRITE_ONCE(hw_net_cfg_ok, 0);
++	atbm_hw_priv_assign_pointer(NULL);
++#endif
+ 	atbm_reorder_func_exit(priv);
+ 	atbm_unregister_common(self);
+ 	atbm_free_common(self);
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/sbus.h b/extdrv/wireless/realtek/atbm6461/hal_apollo/sbus.h
+index df5aa25bd82359359ad74aa43c58d1710d01da57..a212a5f7239da1abab58020fd4ca2ecb075356a4 100644
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/sbus.h
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/sbus.h
+@@ -16,6 +16,9 @@
+ #ifndef ATBM_APOLLO_SBUS_H
+ #define ATBM_APOLLO_SBUS_H
+ #include "apollo_plat.h"
++#if defined(LINUX_OS) && (PROJ_TYPE == RHEA) && defined(SDIO_BUS)
++#define ATBM_BF01_STARTUP_RETRY
++#endif
+ /*
+  * sbus priv forward definition.
+  * Implemented and instantiated in particular modules.
+@@ -27,6 +30,9 @@ typedef void (*sbus_callback_handler)(void *priv,void * arg);
+ 
+ 
+ struct sbus_ops {
++#ifdef ATBM_BF01_STARTUP_RETRY
++	int (*startup_cancelled)(struct sbus_priv *self);
++#endif
+ #ifndef SPI_BUS
+ 	int (*sbus_memcpy_fromio)(struct sbus_priv *self, unsigned int addr,void *dst, int count);/*rx queue mode*/
+ 	int (*sbus_memcpy_toio)(struct sbus_priv *self, unsigned int addr,const void *src, int count);/*tx queue mode*/
 diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c
 index ca4872ac9b19156936cb88af28dfb35beeeeb52d..16935ae21aaf752a438ef05e30bdb190986138f7 100644
 --- a/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c
