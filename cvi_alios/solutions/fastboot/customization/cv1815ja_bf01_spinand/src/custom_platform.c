@@ -1,9 +1,88 @@
 #include "platform.h"
 #include <drv/pin.h>
 #include <pinctrl-mars.h>
+#include <drv/adc.h>
 #include "cvi_type.h"
 
 #define GPIO_PIN_MASK(_gpio_num) (1 << _gpio_num)
+#define BF01_PWR_ADC_LOW_CHECK_ENABLE 1
+
+#if BF01_PWR_ADC_LOW_CHECK_ENABLE
+#define BF01_PWR_ADC_INDEX 1U
+#define BF01_PWR_ADC_CHANNEL 3U
+#define BF01_PWR_ADC_REFERENCE_MV 1500U
+#define BF01_PWR_ADC_SCALE 4096U
+#define BF01_PWR_ADC_LOW_MV 0U
+
+static int _ReadPwrAdc3(uint32_t *raw, uint32_t *mv)
+{
+	csi_adc_t adc = {0};
+	csi_error_t ret;
+	int32_t value;
+
+	ret = csi_adc_init(&adc, BF01_PWR_ADC_INDEX);
+	if (ret != CSI_OK) {
+		printf("[BF01] PWR_VBAT_DET ADC init failed: %d\r\n", ret);
+		if (adc.priv)
+			csi_adc_uninit(&adc);
+		return -1;
+	}
+
+	ret = csi_adc_channel_enable(&adc, BF01_PWR_ADC_CHANNEL, true);
+	if (ret != CSI_OK) {
+		printf("[BF01] PWR_VBAT_DET ADC channel failed: %d\r\n", ret);
+		goto err_uninit;
+	}
+
+	csi_adc_trim(&adc);
+	ret = csi_adc_start(&adc);
+	if (ret != CSI_OK) {
+		printf("[BF01] PWR_VBAT_DET ADC start failed: %d\r\n", ret);
+		goto err_uninit;
+	}
+
+	value = csi_adc_read(&adc);
+	csi_adc_stop(&adc);
+	if (value < 0) {
+		printf("[BF01] PWR_VBAT_DET ADC read failed: %d\r\n", value);
+		goto err_uninit;
+	}
+
+	*raw = (uint32_t)value;
+	*mv = *raw * BF01_PWR_ADC_REFERENCE_MV / BF01_PWR_ADC_SCALE;
+	csi_adc_uninit(&adc);
+	return 0;
+
+err_uninit:
+	csi_adc_uninit(&adc);
+	return -1;
+}
+
+static void _PwrVbatCheck(void)
+{
+	uint32_t raw;
+	uint32_t mv;
+
+	PINMUX_CONFIG(PWR_VBAT_DET, PWR_VBAT_DET);
+	if (_ReadPwrAdc3(&raw, &mv) != 0) {
+		printf("[BF01] PWR_VBAT_DET check unavailable, continue boot\r\n");
+		return;
+	}
+
+	printf("[BF01] PWR_VBAT_DET raw=%u, pin=%umV, cutoff=%umV\r\n",
+	       raw, mv, BF01_PWR_ADC_LOW_MV);
+	if (mv >= BF01_PWR_ADC_LOW_MV)
+		return;
+
+	printf("[BF01] low battery, requesting RTC poweroff\r\n");
+	mmio_setbits_32(0x050260c0, 0x1);
+	while ((mmio_read_32(0x050260c0) & 0x1) == 0)
+		;
+	mmio_write_32(0x05025004, 0xab18);
+	while (1)
+		mmio_write_32(0x05025008, 0x10001);
+}
+#endif
 
 void _GPIOSetValue(u8 gpio_grp, u8 gpio_num, u8 level)
 {
@@ -157,6 +236,9 @@ void JTAG_PinmuxIn()
 
 void PLATFORM_IoInit(void)
 {
+#if BF01_PWR_ADC_LOW_CHECK_ENABLE
+	_PwrVbatCheck();
+#endif
 //pinmux 切换接口
     _UartPinmux();
     _MipiRxPinmux();
