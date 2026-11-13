@@ -17,7 +17,8 @@
 enum bf01_burst_command {
     BF01_BURST_STATUS = 1,
     BF01_BURST_READ,
-    BF01_BURST_COMMIT
+    BF01_BURST_COMMIT,
+    BF01_BURST_DISCARD
 };
 
 enum bf01_burst_state {

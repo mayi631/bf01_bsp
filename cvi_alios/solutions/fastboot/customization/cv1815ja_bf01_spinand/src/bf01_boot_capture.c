@@ -75,7 +75,17 @@ static int burst_message(void *private_data, IPCM_ANON_MSG_S *message)
     reply->index = request.index;
     reply->offset = request.offset;
     reply->length = 0;
-    if (request.command == BF01_BURST_READ) {
+    if (request.command == BF01_BURST_DISCARD) {
+        burst_rejected = 1;
+        if (burst.state != BF01_BURST_CAPTURING)
+            discard_burst_locked();
+        *reply = burst;
+        reply->sequence = request.sequence;
+        reply->command = request.command;
+        reply->index = request.index;
+        reply->offset = request.offset;
+        reply->error = burst.state == BF01_BURST_RELEASED ? 0 : EBUSY;
+    } else if (request.command == BF01_BURST_READ) {
         if (burst.state != BF01_BURST_READY || request.index >= burst.count ||
             request.offset >= burst.images[request.index].size) {
             reply->error = EINVAL;
@@ -310,8 +320,8 @@ done:
             error = EIO;
         }
     }
-    if (!error)
-        error = APP_BootAiCapture(index + 1 == BF01_BURST_COUNT, pts);
+    if (!error && index == 0)
+        error = APP_BootAiCapture(1, pts);
     if (error) {
         aos_ion_free(image);
         return error;
