@@ -159,7 +159,7 @@ static void _UartPinmux()
 {
 	// uart1 pinmux
 	PINMUX_CONFIG(IIC0_SCL, UART1_TX);
-	PINMUX_CONFIG(IIC0_SDA, UART1_RX);
+	PINMUX_CONFIG(IIC0_SDA, XGPIOA_29);
 }
 
 static void _SensorPinmux()
@@ -248,6 +248,7 @@ void PLATFORM_IoInit(void)
 	#if (CONFIG_APP_DEBUG_JTAG == 1)
 	JTAG_PinmuxIn();
 	#endif
+	PINMUX_CONFIG(IIC0_SDA, XGPIOA_29);
 
 #if 0 //evb mipi switch
 	PINMUX_CONFIG(SD1_CMD, IIC3_SCL);
