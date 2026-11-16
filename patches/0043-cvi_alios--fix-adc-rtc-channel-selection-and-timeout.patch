@@ -1,0 +1,102 @@
+From: mayi <3363523343@qq.com>
+Date: Mon, 16 Nov 2026 17:22:03 +0800
+Subject: [PATCH] fix(adc): select RTC channel 3 with the correct mask and timeout
+
+[description ]:
+- Allow channels 1 through 3, including RTC ADC device 1 channel 3 used
+  by the existing BF01 PWR_VBAT_DET startup sampling path.
+- Use ADC_CHANNEL_SEL_CH for selection, ownership checks and release;
+  validate the channel before constructing its mask.
+- Check ownership only when enabling a channel and preserve unrelated
+  channel selection bits when releasing the current channel.
+- Use a 1000 ms synchronous read timeout with csi_tick_get_ms.
+
+[root   cause]:
+- The driver rejects RTC channel 3 and computes its selection as
+  channel << 5, which selects bits 5 and 6 instead of channel 3 bit 7.
+- The same incorrect mask is used for ownership and release.
+- The timeout is compared against milliseconds, so 1000000 means
+  approximately 1000 seconds rather than the documented one second.
+
+[JIRA      ID]:N/A (BF01 integration)
+[chip project]:181x
+[side effects]:
+- This is the shared AliOS ADC driver; it also changes other callers'
+  channel selection and synchronous read timeout behavior.
+- Existing EFUSE trim and shared-controller power state are preserved.
+- No board threshold or sampling enable flag is changed. BF01 currently
+  samples with a zero cutoff and does not power off via this comparison.
+- Patch replay and isolated checks do not replace electrical validation
+  of RTC channel 3, reference voltage, divider or battery cutoff.
+
+[Affected *.ko/*.so/*.a] :AliOS ADC driver linked into yoc; no Linux module
+---
+ .../chip_cv181x/src/drivers/adc/cvi/src/cvi_adc.c  | 27 +++++++++++-----------
+ 1 file changed, 14 insertions(+), 13 deletions(-)
+
+diff --git a/components/chip_cv181x/src/drivers/adc/cvi/src/cvi_adc.c b/components/chip_cv181x/src/drivers/adc/cvi/src/cvi_adc.c
+index 6391d546..6096c827 100644
+--- a/components/chip_cv181x/src/drivers/adc/cvi/src/cvi_adc.c
++++ b/components/chip_cv181x/src/drivers/adc/cvi/src/cvi_adc.c
+@@ -14,7 +14,7 @@
+ #include <csi_config.h>
+ 
+ #define ADC_FREQ_DEFAULT 25000000
+-#define DEFUALT_CVI_ADC_OPERATION_TIMEOUT    1000000U   // 1 second
++#define DEFUALT_CVI_ADC_OPERATION_TIMEOUT    1000U   // 1 second
+ #define MAX_CHANNEL_NUM                      3U
+ 
+ #define EFUSE_ADC_TRIM_REG 0x18
+@@ -177,7 +177,8 @@ cvi_error_t cvi_adc_init(cvi_adc_t *adc)
+ void cvi_adc_uninit(cvi_adc_t *adc)
+ {
+     unsigned long reg_base = GET_DEV_REG_BASE(adc);
+-    adc_reset_sel_channel(reg_base, ((uint32_t)adc->ch_id << (ADC_CTRL_ADC_SEL_Pos + 1)));
++    if (adc->ch_id >= 1 && adc->ch_id <= MAX_CHANNEL_NUM)
++        adc_reset_sel_channel(reg_base, ADC_CHANNEL_SEL_CH(adc->ch_id));
+     adc->ch_id = 0;
+     // Avoid shutdown the channel used by linux
+ #if 0
+@@ -287,6 +288,11 @@ cvi_error_t cvi_adc_channel_enable(cvi_adc_t *adc, uint8_t ch_id, bool is_enable
+ 
+     unsigned reg_base = GET_DEV_REG_BASE(adc);
+ 
++    if (ch_id < 1 || ch_id > MAX_CHANNEL_NUM) {
++        pr_err("invalid ch_id\n");
++        return CVI_ERROR;
++    }
++
+ #if 0
+     #if CONFIG_BOARD_CV181XC
+     if (adc->dev.idx == 0 && ch_id != 1) {
+@@ -297,7 +303,7 @@ cvi_error_t cvi_adc_channel_enable(cvi_adc_t *adc, uint8_t ch_id, bool is_enable
+ #endif
+ 
+     // channel is used by linux
+-    if ((adc_get_sel_channel(reg_base) & ((uint32_t)ch_id << (ADC_CTRL_ADC_SEL_Pos + 1)))
++    if (is_enable && (adc_get_sel_channel(reg_base) & ADC_CHANNEL_SEL_CH(ch_id))
+         && (ch_id != adc->ch_id)) {
+         pr_err("adc chip: %d, ch: %d is used!", adc->dev.idx, ch_id);
+         // ignore rtc adc channel
+@@ -305,16 +311,11 @@ cvi_error_t cvi_adc_channel_enable(cvi_adc_t *adc, uint8_t ch_id, bool is_enable
+             return CVI_ERROR;
+     }
+ 
+-    if (ch_id < 1 || ch_id > 3 || (adc->dev.idx == 1 && ch_id > 2)) {
+-        pr_err("invalid ch_id\n");
+-        ret = CVI_ERROR;
+-    } else {
+-        adc->ch_id = ch_id;
+-        if (is_enable)
+-            adc_set_sel_channel(reg_base, ((uint32_t)ch_id << (ADC_CTRL_ADC_SEL_Pos + 1)));
+-        else
+-            adc_reset_sel_channel(reg_base, ((uint32_t)ch_id << (ADC_CTRL_ADC_SEL_Pos + 1)));
+-    }
++    adc->ch_id = ch_id;
++    if (is_enable)
++        adc_set_sel_channel(reg_base, ADC_CHANNEL_SEL_CH(ch_id));
++    else
++        adc_reset_sel_channel(reg_base, ADC_CHANNEL_SEL_CH(ch_id));
+ 
+     return ret;
+ }
