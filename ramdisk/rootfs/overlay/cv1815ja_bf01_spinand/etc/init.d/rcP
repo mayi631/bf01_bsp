@@ -1,0 +1,33 @@
+#!/bin/sh
+
+${CVI_SHOPTS}
+if [ -e /run/bf01-preview/early-started ]; then
+    read -r UPTIME REST < /proc/uptime
+    DEADLINE=$((${UPTIME%%.*} + 12))
+    while [ ! -e /run/bf01-poweroff/requested ]; do
+        if [ -S /run/ipcamera-wifi/camera.sock ] &&
+           [ -e /run/bf01-preview/camera-loop.ready ]; then
+            if [ ! -e /run/ipcamera-wifi/live-mode ] ||
+               [ -e /run/ipcamera-wifi/live-first-frame ]; then
+                break
+            fi
+        fi
+        read -r UPTIME REST < /proc/uptime
+        [ "${UPTIME%%.*}" -lt "$DEADLINE" ] || break
+        sleep 0.1
+    done
+    [ ! -e /run/bf01-poweroff/requested ] || exit 0
+    /system/ko/bf01-modules late >>/run/bf01-preview/modules.log 2>&1
+    for SCRIPT in /etc/init.d/S20network /etc/init.d/S23ntp /etc/init.d/S24cvidaemon /etc/init.d/S50dropbear; do
+        [ ! -e /run/bf01-poweroff/requested ] || exit 0
+        [ ! -f "$SCRIPT" ] || "$SCRIPT" start
+    done
+fi
+for SCRIPT in /etc/init.d/P??*; do
+    [ ! -e /run/bf01-poweroff/requested ] || exit 0
+    [ -f "$SCRIPT" ] || continue
+    case "$SCRIPT" in
+        *.sh) (trap - INT QUIT TSTP; set start; . "$SCRIPT") ;;
+        *) "$SCRIPT" start ;;
+    esac
+done

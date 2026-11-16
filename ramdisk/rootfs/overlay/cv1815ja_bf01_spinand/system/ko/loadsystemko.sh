@@ -1,4 +1,10 @@
 #!/bin/sh
+if [ -r /mnt/data/bf01-boot-priority ] && [ -x /system/ko/bf01-modules ]; then
+    exec /system/ko/bf01-modules core
+fi
+if [ -r /mnt/data/bf01-boot-priority ] && [ -x /mnt/system/ko/bf01-modules ]; then
+    exec /mnt/system/ko/bf01-modules core
+fi
 ${CVI_SHOPTS}
 #
 # Define kernel modules sequence
@@ -22,7 +28,6 @@ if [ -n "$modules_seq" ]; then
     done
 fi
 
-echo 3 > /proc/sys/vm/drop_caches
 dmesg -n 4
 
 exit $?

@@ -1,0 +1,21 @@
+#!/bin/sh
+
+set -eu
+mkdir -p /run/bf01-preview
+exec 9>/run/bf01-preview/modules.lock
+flock 9
+case "${1:-core}" in
+    core) MODULES='cv181x_sys cvi_ipcm cv181x_wdt' ;;
+    ai) MODULES='cv181x_tpu' ;;
+    late) MODULES='cv181x_clock_cooling cv181x_ive' ;;
+    *) exit 2 ;;
+esac
+for MODULE in $MODULES; do
+    [ ! -e /run/bf01-poweroff/requested ] || exit 1
+    if [ "${1:-core}" = ai ]; then
+        [ ! -e /run/ipcamera-wifi/boot-media-cancelled ] || exit 125
+        [ ! -e /run/ipcamera-wifi/live-mode ] || exit 125
+    fi
+    [ ! -d "/sys/module/$MODULE" ] || continue
+    insmod "/mnt/system/ko/$MODULE.ko"
+done

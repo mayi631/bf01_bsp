@@ -9,6 +9,9 @@ export SYSTEMPATH=/system/
 
 case "$1" in
   start)
+        if [ -e /run/bf01-preview/early-started ]; then
+                exit 0
+        fi
         echo "init mpp system..."
         if [ -f $SYSTEMPATH/ko/loadsystemko.sh ]; then
                 sh $SYSTEMPATH/ko/loadsystemko.sh

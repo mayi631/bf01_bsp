@@ -1,0 +1,13 @@
+#!/bin/sh
+
+case "${1:-start}" in
+    start)
+        [ -x /mnt/data/auto.sh ] && [ -x /mnt/data/ipcamera ] || exit 0
+        [ -r /mnt/data/bf01-boot-priority ] || exit 0
+        [ ! -e /run/bf01-poweroff/requested ] || exit 0
+        mkdir -p /run/bf01-preview
+        /system/ko/bf01-modules core >>/run/bf01-preview/modules.log 2>&1 || exit 1
+        touch /run/bf01-preview/early-started
+        /mnt/data/auto.sh </dev/null >>/run/bf01-preview/boot.log 2>&1 &
+        ;;
+esac
