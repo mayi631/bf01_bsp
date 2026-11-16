@@ -1,0 +1,44 @@
+From: mayi <3363523343@qq.com>
+Date: Mon, 16 Nov 2026 17:22:03 +0800
+Subject: [PATCH] fix(rtc): initialize power VBAT detect control to zero
+
+[description ]:
+- Initialize RTC_EN_PWR_VBAT_DET at 0x050260d0 with a full zero write
+  in set_rtc_en_registers, matching the requested BF01 boot-time value.
+
+[root   cause]:
+- Clearing bit 2 preserves all other register bits and does not establish
+  the requested zero value when those bits are set on entry.
+- This records the initialization policy; it does not establish that
+  this register caused any particular observed power-loss event.
+
+[JIRA      ID]:N/A (BF01 integration)
+[chip project]:181x
+[side effects]:
+- The change is in the common CV181X path, not a BF01-only conditional.
+  All builds executing this initialization write the entire register.
+- Other bits are deliberately not preserved. Other boards must review
+  their RTC power design before reusing this policy.
+- No ADC sampling threshold or Linux GPIO29 shutdown behavior changes.
+- Rebuild FSBL and the corresponding FIP; replacing the application
+  alone cannot update this boot-time register initialization.
+- Patch replay is not an electrical or cold-boot power validation.
+
+[Affected *.ko/*.so/*.a] :FSBL / FIP; no .ko/.so/.a
+---
+ plat/cv181x/platform.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/plat/cv181x/platform.c b/plat/cv181x/platform.c
+index 0073304..fdb10fd 100644
+--- a/plat/cv181x/platform.c
++++ b/plat/cv181x/platform.c
+@@ -639,7 +639,7 @@ void set_rtc_en_registers(void)
+ 	mmio_write_32(REG_RTC_CTRL_BASE + RTC_CTRL0, write_data);
+ 
+ 	// Avoid power up again after poweroff
+-	mmio_clrbits_32(REG_RTC_BASE + RTC_EN_PWR_VBAT_DET, BIT(2));
++	mmio_write_32(REG_RTC_BASE + RTC_EN_PWR_VBAT_DET, 0x0);
+ }
+ 
+ void apply_analog_trimming_data(void)
