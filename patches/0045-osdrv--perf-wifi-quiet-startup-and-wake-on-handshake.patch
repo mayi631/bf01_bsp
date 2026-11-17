@@ -1,0 +1,244 @@
+From: mayi <3363523343@qq.com>
+Date: Mon, 16 Nov 2026 19:28:13 +0800
+Subject: [PATCH] perf(wifi): quiet startup console and wake on validated handshake
+
+[description ]:
+- Route routine Linux RHEA SDIO startup messages to KERN_DEBUG and keep
+  bound, accepted timing and real backend readiness as KERN_INFO records.
+- Keep genuine error-level atbm_dbg calls on the error path.
+- Replace the BF01 fixed startup sleep with a wait on the existing WSM
+  queue, woken after successful parsing and validation of the indication.
+
+[root   cause]:
+- Routine initialization banners use KERN_ERR and remain synchronous
+  console traffic with the board's loglevel=4 at 115200 baud.
+- The startup waiter sleeps for 20 ms even when the real indication has
+  already arrived; firmwareReady is published before final validation.
+- The measured successful attempt waits only 50 ms, with much of the
+  boot-to-live latency before driver initialization, not in retry waits.
+
+[JIRA      ID]:N/A (BF01 integration)
+[chip project]:181x
+[side effects]:
+- Applies after the latest 0042. Keeps bus recovery, function checks,
+  IRQ polling, cancellation, shutdown and the 1000 ms timeout/retry policy.
+- Normal INIT messages remain in dmesg, not the default serial console.
+  Error-level atbm_dbg routing is shared; event waiting is BF01-only.
+- No application, cloud parameter, AI, media, pinmux or power-policy change.
+- No board deployment, forced unload or hot reload. Physical latency gain
+  and live/AI/shutdown regression still require real board measurements.
+[test]:
+- Matching Linux 5.10 ARM module build; 183 isolated source-derived startup
+  and indication cases with UBSan, plus BF01/other-platform log checks.
+- Isolated controls use mock transport, not hardware/business acceptance.
+
+---
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/debug.h b/extdrv/wireless/realtek/atbm6461/hal_apollo/debug.h
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/debug.h
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/debug.h
+@@ -33,9 +33,14 @@
+ #define FUNC_EXIT() //printk("%s %d--\n",__func__,__LINE__)
+ 
+ 
+-#define atbm_dbg(level, ...)				\
+- if ((level) & ATBM_APOLLO_DBG_LEVEL)		\
+-		atbm_printk_init(__VA_ARGS__);	\
++#define atbm_dbg(level, ...) do { \
++	if ((level) & ATBM_APOLLO_DBG_LEVEL) { \
++		if ((level) & ATBM_APOLLO_DBG_ERROR) \
++			atbm_printk_err(__VA_ARGS__); \
++		else \
++			atbm_printk_init(__VA_ARGS__); \
++	} \
++} while (0)
+ 
+ extern u32 atbm_control_debug_mask;
+ 
+@@ -76,6 +81,16 @@
+ #define atbm_printk_err(...) 		atbm_printk(ATBM_PRINTK_MASK_ERR,__VA_ARGS__)
+ #define atbm_printk_warn(...)		atbm_printk(ATBM_PRINTK_MASK_WARN,__VA_ARGS__)
+ #define atbm_printk_init(...)		atbm_printk(ATBM_PRINTK_MASK_INIT,__VA_ARGS__)
++#if defined(LINUX_OS) && (PROJ_TYPE == RHEA) && defined(SDIO_BUS)
++#undef atbm_printk_init
++#define atbm_printk_init(fmt, arg...) do { \
++	if (atbm_printk_mask & ATBM_PRINTK_MASK_INIT) \
++		printk(KERN_DEBUG ATBM_TAG fmt, ##arg); \
++} while (0)
++#define atbm_printk_boot(...)		atbm_printk_init(__VA_ARGS__)
++#else
++#define atbm_printk_boot(...)		atbm_printk_always(__VA_ARGS__)
++#endif
+ #define atbm_printk_exit(...)		atbm_printk(ATBM_PRINTK_MASK_EXIT,__VA_ARGS__)
+ #define atbm_printk_bus(...)		atbm_printk(ATBM_PRINTK_MASK_BUS,__VA_ARGS__)
+ #define atbm_printk_scan(...)		atbm_printk(ATBM_PRINTK_MASK_SCAN,__VA_ARGS__)
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/main.c
+@@ -1667,12 +1667,17 @@
+ 		#ifdef ATBM_BF01_STARTUP_RETRY
+ 		unsigned long startup_started = jiffies;
+ 		unsigned long startup_deadline = startup_started + msecs_to_jiffies(1000);
+-		atbm_printk_always("WSM handshake attempt: timeout_ms=1000; retry worker owns startup\n");
++		long startup_remaining;
++		atbm_printk_init("WSM handshake attempt: timeout_ms=1000; retry worker owns startup\n");
+ 		#else
+ 		int loop =0;
+ 		atbm_printk_always("mdelay wait wsm_startup_done  !!\n");
+ 		#endif
++		#ifdef ATBM_BF01_STARTUP_RETRY
++		while (!smp_load_acquire(&hw_priv->wsm_caps.firmwareReady)) {
++		#else
+ 		while(hw_priv->wsm_caps.firmwareReady !=1){
++		#endif
+ 			#ifdef ATBM_BF01_STARTUP_RETRY
+ 			if (hw_priv->sbus_ops->startup_cancelled(hw_priv->sbus_priv)) {
+ 				err = -ESHUTDOWN;
+@@ -1684,9 +1689,15 @@
+ 					err, jiffies_to_msecs(jiffies - startup_started));
+ 				goto err3;
+ 			}
+-			msleep(20);
++			startup_remaining = startup_deadline - jiffies;
++			if (startup_remaining > 0)
++				wait_event_timeout(hw_priv->wsm_cmd_wq,
++					smp_load_acquire(&hw_priv->wsm_caps.firmwareReady) ||
++					hw_priv->sbus_ops->startup_cancelled(hw_priv->sbus_priv) ||
++					hw_priv->sbus_ops->startup_status(hw_priv->sbus_priv),
++					min_t(long, startup_remaining, msecs_to_jiffies(20)));
+ 			if (time_after_eq(jiffies, startup_deadline) &&
+-			    !READ_ONCE(hw_priv->wsm_caps.firmwareReady)) {
++			    !smp_load_acquire(&hw_priv->wsm_caps.firmwareReady)) {
+ 				atbm_printk_err("WSM handshake attempt expired: elapsed_ms=%u\n",
+ 					jiffies_to_msecs(jiffies - startup_started));
+ 				err = -ETIMEDOUT;
+@@ -1734,7 +1745,7 @@
+ 			}
+ 		}
+ 		#ifdef ATBM_BF01_STARTUP_RETRY
+-		atbm_printk_always("WSM handshake accepted: elapsed_ms=%u\n",
++		pr_info(ATBM_TAG "WSM handshake accepted: elapsed_ms=%u\n",
+ 			jiffies_to_msecs(jiffies - startup_started));
+ 		err = hw_priv->sbus_ops->startup_status(hw_priv->sbus_priv);
+ 		#endif
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/wsm.c
+@@ -713,14 +713,14 @@
+ 		/* if user force disable ba param sync, can open this line  */
+ 		//hw_priv->wsm_caps.firmwareCap &= ~CAPABLITIES_HOST_BA_PARAM;
+ 	}
+-	printk("CAPABLITIES_SDIO_TX_LIST_CHECK 	%d\n", (hw_priv->wsm_caps.firmwareCap & CAPABLITIES_SDIO_TX_LIST_CHECK));
+-	printk("CAPABLITIES_TX_CONFIRM_NOTIFY 	%d\n", (hw_priv->wsm_caps.firmwareCap & CAPABLITIES_TX_CONFIRM_NOTIFY));
+-	printk("CAPABLITIES_HOST_CONFIG 		%d\n", (hw_priv->wsm_caps.firmwareCap & CAPABLITIES_HOST_CONFIG));
+-	printk("CAPABLITIES_HOST_BA_PARAM 		%d\n", (hw_priv->wsm_caps.firmwareCap & CAPABLITIES_HOST_BA_PARAM));
++	atbm_printk_boot("CAPABLITIES_SDIO_TX_LIST_CHECK 	%d\n", (hw_priv->wsm_caps.firmwareCap & CAPABLITIES_SDIO_TX_LIST_CHECK));
++	atbm_printk_boot("CAPABLITIES_TX_CONFIRM_NOTIFY 	%d\n", (hw_priv->wsm_caps.firmwareCap & CAPABLITIES_TX_CONFIRM_NOTIFY));
++	atbm_printk_boot("CAPABLITIES_HOST_CONFIG 		%d\n", (hw_priv->wsm_caps.firmwareCap & CAPABLITIES_HOST_CONFIG));
++	atbm_printk_boot("CAPABLITIES_HOST_BA_PARAM 		%d\n", (hw_priv->wsm_caps.firmwareCap & CAPABLITIES_HOST_BA_PARAM));
+ 	hw_priv->hw_bufs_free_init = hw_priv->hw_bufs_free;
+ //	BUG_ON(hw_priv->wsm_caps.NumOfHwXmitedAddr == 0);
+ //	printk("wsm_caps.firmwareCap %x firmware used %s-rate policy\n",hw_priv->wsm_caps.firmwareCap,hw_priv->wsm_caps.firmwareCap&CAPABILITIES_NEW_RATE_POLICY?"new":"old");
+-	atbm_printk_always("wsm_caps.firmwareCap %x",hw_priv->wsm_caps.firmwareCap);
++	atbm_printk_boot("wsm_caps.firmwareCap %x",hw_priv->wsm_caps.firmwareCap);
+ 
+ 	if (WARN_ON(status))
+ 		return -EINVAL;
+@@ -728,7 +728,7 @@
+ 	if (WARN_ON(hw_priv->wsm_caps.firmwareType > 4))
+ 		return -EINVAL;
+ 
+-	atbm_printk_always("apollo wifi WSM init done.\n"
++	atbm_printk_boot("apollo wifi WSM init done.\n"
+ 		"   Input buffers: %d x %d bytes\n"
+ 		"   Hardware: %d.%d\n"
+ 		"   %s firmware [%s], ver: %d, build: %d,"
+@@ -743,7 +743,9 @@
+ 		hw_priv->wsm_caps.firmwareBuildNumber,
+ 		hw_priv->wsm_caps.firmwareApiVer,
+ 		hw_priv->wsm_caps.firmwareCap,Config[0],Config[1],hw_priv->hw_xmits);
++		#ifndef ATBM_BF01_STARTUP_RETRY
+ 		hw_priv->wsm_caps.firmwareReady = 1;
++		#endif
+ 		hw_priv->wsm_caps.exceptionaddr =Config[1];
+ 		//hw_priv->wsm_caps.HiHwCnfBufaddr = Config[2];//ep0 addr
+ #if 0	
+@@ -818,6 +820,10 @@
+ 		goto underflow;
+ 	}
+ 
++	#ifdef ATBM_BF01_STARTUP_RETRY
++	smp_store_release(&hw_priv->wsm_caps.firmwareReady, 1);
++	wake_up(&hw_priv->wsm_cmd_wq);
++	#endif
+ 	return 0;
+ 
+ underflow:
+diff --git a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+--- a/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
++++ b/extdrv/wireless/realtek/atbm6461/hal_apollo/apollo_sdio.c
+@@ -82,7 +82,7 @@
+ 	atbm_printk_always("----drvier support chip HERA \n");
+ #endif
+ #if (PROJ_TYPE==RHEA)
+-	atbm_printk_always("----drvier support chip RHEA \n");
++	atbm_printk_boot("----drvier support chip RHEA \n");
+ #endif
+ #if (PROJ_TYPE==EROS)
+ 	atbm_printk_always("----drvier support chip EROS \n");
+@@ -356,7 +356,11 @@
+ 	#ifdef LINUX_OS
+ 	int status;
+ 
++	#ifdef ATBM_BF01_STARTUP_RETRY
++	printk_once(KERN_DEBUG "[atbm_log]:rx timeout\n");
++	#else
+ 	printk_once("[atbm_log]:rx timeout\n");
++	#endif
+ 	
+ 	hw_priv->sbus_ops->lock(hw_priv->sbus_priv);
+ 	/*
+@@ -371,7 +375,7 @@
+ 		self->startup_poll_count++;
+ 		if (self->startup_poll_count == 1 ||
+ 		    self->startup_poll_count % 33 == 0)
+-			atbm_printk_err("WSM startup poll: ctrl=0x%04x err=%d polls=%u irqs=%d rx_runs=%d init_done=%d\n",
++			atbm_printk_init("WSM startup poll: ctrl=0x%04x err=%d polls=%u irqs=%d rx_runs=%d init_done=%d\n",
+ 				ctrl_reg, status, self->startup_poll_count,
+ 				atomic_read(&self->startup_irq_count),
+ 				atomic_read(&self->startup_rx_count),
+@@ -1534,7 +1538,7 @@
+ 	atomic_set(&self->startup_rx_count, 0);
+ 	self->startup_poll_count = 0;
+ 	self->io_error_logged = 0;
+-	atbm_printk_always("BF01 handshake attempt=%u: preparing function and requesting real WSM startup\n", attempt);
++	atbm_printk_init("BF01 handshake attempt=%u: preparing function and requesting real WSM startup\n", attempt);
+ 	status = atbm_bf01_prepare_function(self);
+ 	if (!status && !atbm_bf01_startup_cancelled(self))
+ 		status = atbm_core_probe(&atbm_sdio_sbus_ops,
+@@ -1545,7 +1549,7 @@
+ 	if (!status) {
+ 		smp_store_release(&self->startup_ready, true);
+ 		atomic_set(&g_wtd.wtd_probe, 1);
+-		atbm_printk_always("BF01 handshake ready: attempt=%u; wlan0 and control backend available\n", attempt);
++		pr_info(ATBM_TAG "BF01 handshake ready: attempt=%u; wlan0 and control backend available\n", attempt);
+ 		return;
+ 	}
+ 	sdio_claim_host(self->func);
+@@ -1622,7 +1626,7 @@
+ 		atbm_kfree(self);
+ 		return status;
+ 	}
+-	atbm_printk_always("BF01 SDIO driver bound; background handshake retries enabled\n");
++	pr_info(ATBM_TAG "BF01 SDIO driver bound; background handshake retries enabled; startup=event-v1\n");
+ 	queue_delayed_work(system_long_wq, &self->startup_work, 0);
+ 	return 0;
+ #else
+@@ -1942,7 +1946,7 @@
+ {
+ 	int ret;
+ 
+-	printk("\nDRIVER VER: %s.\n", PRIV_VERSION);
++	atbm_printk_boot("DRIVER VER: %s.\n", PRIV_VERSION);
+ 	#ifdef TIME_DEBUG
+ 	jiffies_update(1);
+ 	#endif
