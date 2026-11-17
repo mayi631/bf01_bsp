@@ -11,6 +11,7 @@
 #include <mmio.h>
 #include "bf01_boot_timestamp.h"
 #include "bf01_boot_timestamp_config.h"
+#include "bf01_boot_rtc.h"
 #include "cvi_ipcm.h"
 #include "cvi_region.h"
 #include "hal_rtc.h"
@@ -61,13 +62,56 @@ static int timestamp_prepare_warned;
 static int timestamp_prepare_group;
 static unsigned int timestamp_prepare_width;
 static unsigned int timestamp_prepare_height;
+static unsigned long timestamp_clock_seconds;
+static uint64_t timestamp_clock_started_us;
+static int timestamp_clock_valid;
 
-static int read_clock_seconds(unsigned long *seconds)
+static int read_internal_clock_seconds(unsigned long *seconds)
 {
     size_t interrupt_state = csi_irq_save();
     int result = hal_cvi_rtc_get_time_sec(CVI_RTC_BASE, seconds);
     csi_irq_restore(interrupt_state);
     return result;
+}
+
+static void set_clock_seconds(unsigned long seconds)
+{
+    size_t interrupt_state = csi_irq_save();
+    timestamp_clock_seconds = seconds;
+    timestamp_clock_started_us = csi_tick_get_us();
+    timestamp_clock_valid = 1;
+    csi_irq_restore(interrupt_state);
+}
+
+static int read_clock_seconds(unsigned long *seconds)
+{
+    size_t interrupt_state = csi_irq_save();
+    int valid = timestamp_clock_valid;
+    unsigned long base_seconds = timestamp_clock_seconds;
+    uint64_t started_us = timestamp_clock_started_us;
+    uint64_t now_us = csi_tick_get_us();
+    csi_irq_restore(interrupt_state);
+    if (!valid)
+        return read_internal_clock_seconds(seconds);
+    if (now_us < started_us)
+        return EIO;
+    uint64_t current = (uint64_t)base_seconds + (now_us - started_us) / 1000000U;
+    if (current < BF01_TIMESTAMP_MIN_SECONDS || current >= BF01_TIMESTAMP_MAX_SECONDS)
+        return ERANGE;
+    *seconds = (unsigned long)current;
+    return 0;
+}
+
+void APP_BootTimestampInitExternalRtc(void)
+{
+    unsigned long seconds = 0;
+    int result = APP_BootRtcRead(&seconds);
+    if (result) {
+        printf("[boot-timestamp] BM8563 unavailable: errno=%d; keeping existing RTC/Linux sync path\n", result);
+        return;
+    }
+    set_clock_seconds(seconds);
+    printf("[boot-timestamp] clock source=BM8563+monotonic utc_seconds=%lu error=0\n", seconds);
 }
 
 static int load_timestamp_settings(void)
@@ -366,13 +410,15 @@ static int synchronize_clock(void *private_data, IPCM_ANON_MSG_S *message)
         csi_irq_restore(interrupt_state);
         for (unsigned int attempt = 0; attempt < 10; attempt++) {
             unsigned long observed = 0;
-            if (read_clock_seconds(&observed) == 0 &&
+            if (read_internal_clock_seconds(&observed) == 0 &&
                 observed >= seconds && observed - seconds <= 1) {
                 confirmed = (uint32_t)observed;
                 break;
             }
             aos_msleep(1);
         }
+        if (confirmed)
+            set_clock_seconds(confirmed);
     }
     printf("[boot-timestamp] RTC sync: requested=%u confirmed=%u error=%d\n",
         seconds, confirmed, confirmed ? 0 : EIO);

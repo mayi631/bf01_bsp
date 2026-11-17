@@ -14,14 +14,18 @@ def generate(solution):
     enabled = parser.getint("boot_timestamp", "enabled", fallback=0)
     date_format = parser.getint("boot_timestamp", "format", fallback=0)
     utc_offset = parser.getint("boot_timestamp", "utc_offset_minutes", fallback=480)
+    rtc_offset = parser.getint("boot_timestamp", "external_rtc_utc_offset_minutes", fallback=480)
     if enabled not in (0, 1) or date_format not in (0, 1, 2) or not -720 <= utc_offset <= 840:
         raise ValueError("invalid boot_timestamp enabled/format/utc_offset_minutes")
+    if not -720 <= rtc_offset <= 840:
+        raise ValueError("invalid boot_timestamp external_rtc_utc_offset_minutes")
     content = (
         "#ifndef BF01_BOOT_TIMESTAMP_CONFIG_H\n"
         "#define BF01_BOOT_TIMESTAMP_CONFIG_H\n"
         f"#define BF01_TIMESTAMP_ENABLED {enabled}\n"
         f"#define BF01_TIMESTAMP_FORMAT {date_format}\n"
         f"#define BF01_TIMESTAMP_UTC_OFFSET_MINUTES {utc_offset}\n"
+        f"#define BF01_EXTERNAL_RTC_UTC_OFFSET_MINUTES {rtc_offset}\n"
         "#endif\n"
     )
     output.parent.mkdir(parents=True, exist_ok=True)

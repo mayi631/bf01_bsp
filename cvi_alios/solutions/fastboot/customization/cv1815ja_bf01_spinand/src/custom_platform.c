@@ -176,6 +176,12 @@ static void _SensorPinmux()
 	_GPIOSetValue(1, 16, 0);
 }
 
+static void _ExternalRtcPinmux(void)
+{
+	PINMUX_CONFIG(PAD_MIPI_TXP2, IIC1_SCL);
+	PINMUX_CONFIG(PAD_MIPI_TXM2, IIC1_SDA);
+}
+
 static void _MipiRxPinmux(void)
 {
 
@@ -243,6 +249,7 @@ void PLATFORM_IoInit(void)
     _UartPinmux();
     _MipiRxPinmux();
     _MipiTxPinmux();
+    _ExternalRtcPinmux();
     _SensorPinmux();
     _AudioPinmux();
 	#if (CONFIG_APP_DEBUG_JTAG == 1)

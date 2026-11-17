@@ -420,6 +420,12 @@ static void *capture_burst(void *argument)
     return NULL;
 }
 
+int APP_BootCapturePrepare(void)
+{
+    APP_BootTimestampInitExternalRtc();
+    return 0;
+}
+
 void APP_BootCaptureStart(int media_result)
 {
     int video_result = APP_BootVideoInit();

@@ -8,6 +8,7 @@
 #define BF01_TIMESTAMP_MIN_SECONDS 1577836800ULL
 #define BF01_TIMESTAMP_MAX_SECONDS 4102444800ULL
 
+void APP_BootTimestampInitExternalRtc(void);
 void APP_BootTimestampPrepare(int vpss_group, unsigned int width, unsigned int height);
 void APP_BootTimestampInitClockSync(void);
 void APP_BootTimestampStart(int vpss_group, unsigned int width, unsigned int height);
