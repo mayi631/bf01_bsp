@@ -1,0 +1,183 @@
+From 2dc0af8b0b79036d8ef7fe4ec78df4e172013bb2 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Tue, 17 Nov 2026 10:45:03 +0800
+Subject: [PATCH] feat(bl2): add boot-time breakdown prints for the 2nd image
+ and NAND setup
+
+[description ]:
+- plat/cv181x/bl2/bl2_opt.c load_blcp_2nd(): time the 128-byte header
+  read, the image read from SPI NAND, the CRC/memmove step and the
+  decompression, and print them with one ERROR line
+  "BLCP2ND/hdr=<ms>/rd=<ms>(<bytes>)/crc=<ms>/dcp=<ms>(<bytes>)".
+- plat/cv181x/bl2/bl2_opt.c load_user_param_and_logo(): print the
+  time spent reading the user parameter and logo partitions as
+  "UPL/<ms>(param=<size> logo=<size>)".
+- plat/cv181x/bl2/cvi_spinand.c get_nand_info(): print the SPI NAND
+  clock, divider, TRX_CTRL1 and BOOT_CTRL state that fsbl actually runs
+  with as "SNAND/byp0=/div=/ctrl1=/boot=/flags=".
+- plat/cv181x/include/platform_def.h and plat/cv180x/include/platform_def.h:
+  add user_process_init_start to struct _time_records so the fsbl view
+  matches the kernel and /etc/init.d/P99boottime (14 fields).
+
+[root   cause]:
+- The only fsbl boot-time point was release_blcp_2nd, which merges the
+  yoc.bin NAND read, CRC and decompression into one number, so the
+  largest single stage could not be attributed to I/O or CPU work.
+- BF01 builds with CONFIG_FSBL_LOG_LEVEL=0, which filters NOTICE and
+  INFO, so the new diagnostics use ERROR; otherwise they would never
+  reach the console.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME (to be provided)
+[chip project]:181x
+[side effects]:
+- Adds one ERROR line per stage on the FSBL console; no functional or
+  timing change to the load path.
+- The diagnostics should be moved back to NOTICE once boot-time tuning
+  is finished, otherwise they stay visible with LOG_LEVEL=0.
+- Verified on cv1815ja_bf01_spinand: boot succeeds and /tmp/boottime is
+  unchanged.
+
+[Affected *.ko/*.so/*.a] :fip.bin / fip_spl.bin (bl2); no .ko/.so/.a
+
+Change-Id: I9a4e7b2d6c1f8305a7d2e9b4c6f10a83d5e7b924
+---
+ plat/cv180x/include/platform_def.h |  1 +
+ plat/cv181x/bl2/bl2_opt.c          | 24 ++++++++++++++++++++++++
+ plat/cv181x/bl2/cvi_spinand.c      | 13 +++++++++++++
+ plat/cv181x/include/platform_def.h |  1 +
+ 4 files changed, 39 insertions(+)
+
+diff --git a/plat/cv180x/include/platform_def.h b/plat/cv180x/include/platform_def.h
+index fc558a318b20445f5226c7e929ff1e58086a0032..69a716c0b6ecc2add55f6e908e188403fc9f873a 100644
+--- a/plat/cv180x/include/platform_def.h
++++ b/plat/cv180x/include/platform_def.h
+@@ -215,6 +215,7 @@ struct _time_records {
+ 	uint16_t decompress_kernel_start;
+ 	uint16_t kernel_start;
+ 	uint16_t kernel_run_init_start;
++	uint16_t user_process_init_start;
+ } __packed;
+ 
+ struct _macros_misc {
+diff --git a/plat/cv181x/bl2/bl2_opt.c b/plat/cv181x/bl2/bl2_opt.c
+index d38e522c10eebb03567bf01c7faa5491e565883e..e25a5209b2e55e2d47c2e4dff15ab9a8d3d564c8 100644
+--- a/plat/cv181x/bl2/bl2_opt.c
++++ b/plat/cv181x/bl2/bl2_opt.c
+@@ -243,6 +243,7 @@ int load_blcp_2nd(int retry)
+ 	uint32_t load_pos_com;
+ 	uint32_t header_size_2nd = 0;
+ 	uint32_t part_offset_2nd;
++	uint16_t t_hdr0 = 0, t_hdr1 = 0, t_rd0 = 0, t_rd1 = 0, t_crc1 = 0, t_dcp0 = 0, t_dcp1 = 0;
+ 
+ 	part_offset_2nd = macros_misc.blcp_2nd_loadaddr;
+ 
+@@ -290,9 +291,11 @@ int load_blcp_2nd(int retry)
+ 		 * header out of it instead of reading into header_2nd directly.
+ 		 */
+ 		header_size_2nd = sizeof(struct head);
++		t_hdr0 = read_time_ms();
+ 		ret = load_data_from_storage((void *)(uintptr_t)load_pos_com,
+ 					     part_offset_2nd, header_size_2nd,
+ 					     retry, 0);
++		t_hdr1 = read_time_ms();
+ 		if (ret < 0) {
+ 			ERROR("error: load header, ret=0x%x\n", ret);
+ 			goto exit;
+@@ -317,10 +320,12 @@ int load_blcp_2nd(int retry)
+ 	 * back to the page boundary anyway. The header (if any) is skipped
+ 	 * through image_2nd.
+ 	 */
++	t_rd0 = read_time_ms();
+ 	ret = load_data_from_storage((void *)(uintptr_t)load_pos_com,
+ 				     part_offset_2nd,
+ 				     fip_param2.blcp_2nd_size + header_size_2nd,
+ 				     retry, 0);
++	t_rd1 = read_time_ms();
+ 
+ 	if (ret < 0) {
+ 		goto exit;
+@@ -336,12 +341,27 @@ int load_blcp_2nd(int retry)
+ 			image_2nd = (uint8_t *)(uintptr_t)fip_param2.blcp_2nd_runaddr;
+ 		}
+ 	}
++	t_crc1 = read_time_ms();
+ 	uint64_t data = *(uint64_t *)image_2nd;
+ 	NOTICE("\nthe first 8 bytes data of yoc is:0x%lx\n", data);
+ 
++	t_dcp0 = read_time_ms();
+ 	ret = bl2_decompress((void *)(uintptr_t)fip_param2.blcp_2nd_runaddr,
+ 			     &dst_size, image_2nd,
+ 			     (size_t)fip_param2.blcp_2nd_size, COMP_LZ4);
++	t_dcp1 = read_time_ms();
++
++	/*
++	 * Boot-time breakdown for the 2nd (yoc.bin) image. ERROR level so it
++	 * is visible with LOG_LEVEL=0; drop to NOTICE once tuning is done.
++	 * hdr: 128B header page read; rd: NAND read of size bytes;
++	 * crc: CRC16 (+memmove for uncompressed); dcp: decompression.
++	 */
++	ERROR("BLCP2ND/hdr=%ums/rd=%ums(%u B)/crc=%ums/dcp=%ums(%u B)\n",
++	      (unsigned int)(t_hdr1 - t_hdr0),
++	      (unsigned int)(t_rd1 - t_rd0), fip_param2.blcp_2nd_size,
++	      (unsigned int)(t_crc1 - t_rd1),
++	      (unsigned int)(t_dcp1 - t_dcp0), (unsigned int)dst_size);
+ 
+ 	/*
+ 	crc = p_rom_api_image_crc((void *)(uintptr_t)fip_param2.blcp_2nd_runaddr, fip_param2.blcp_2nd_size);
+@@ -389,6 +409,7 @@ exit:
+ int load_user_param_and_logo(int retry)
+ {
+ 	int ret = -1;
++	uint16_t t0 = read_time_ms();
+ 
+ 	NOTICE("UPS/0x%x/0x%x/0x%x/0x%x/0x%x/0x%x/0x%x/0x%x/.\n",
+ 	       macros_misc.bl_param_runaddr, macros_misc.bl_param_loadaddr,
+@@ -447,6 +468,9 @@ int load_user_param_and_logo(int retry)
+ 
+ 	NOTICE("UPE.\n");
+ 
++	ERROR("UPL/%ums(param=0x%x logo=0x%x)\n",
++	      (unsigned int)(read_time_ms() - t0),
++	      macros_misc.bl_param_size, macros_misc.bl_logo_size);
+ 	return 0;
+ }
+ 
+diff --git a/plat/cv181x/bl2/cvi_spinand.c b/plat/cv181x/bl2/cvi_spinand.c
+index e0acd385d6ecafd04713f47afa2cdb2b5547b404..c533931db5e4257fad1da011467db0ed04449ca4 100644
+--- a/plat/cv181x/bl2/cvi_spinand.c
++++ b/plat/cv181x/bl2/cvi_spinand.c
+@@ -353,6 +353,19 @@ int get_nand_info(void)
+ 			spinand_info.flags &= ~(FLAGS_ENABLE_X4_BIT | FLAGS_ENABLE_X2_BIT);
+ 	}
+ 	dump_nand_info();
++	/*
++	 * Boot-time tuning: dump the clock/SCK state fsbl actually runs the
++	 * SPI NAND with. ERROR level so it shows with LOG_LEVEL=0.
++	 *   byp0 bit8   : 1 = clk_spi_nand still bypassed to 25MHz XTAL
++	 *   div_088     : clk_spi_nand divider reg (0x03002088)
++	 *   TRX_CTRL1   : [23:16] sck_h/sck_l, SCK = clk_spi_nand / (sck_h+sck_l+2)
++	 *   BOOT_CTRL   : bit0 PRD, delay-line / sample settings
++	 */
++	ERROR("SNAND/byp0=0x%x/div=0x%x/ctrl1=0x%x/boot=0x%x/flags=0x%x\n",
++	      mmio_read_32(0x03002030), mmio_read_32(0x03002088),
++	      mmio_read_32(spi_nand_ctrl_base + REG_SPI_NAND_TRX_CTRL1),
++	      mmio_read_32(spi_nand_ctrl_base + REG_SPI_NAND_BOOT_CTRL),
++	      spinand_info.flags);
+ 	return 0;
+ }
+ 
+diff --git a/plat/cv181x/include/platform_def.h b/plat/cv181x/include/platform_def.h
+index 92a364653f3dd2cc22b69144efc3773b38e3af4b..0ec2d878e2d53efd1eafd368793a6fcf4b2dd518 100644
+--- a/plat/cv181x/include/platform_def.h
++++ b/plat/cv181x/include/platform_def.h
+@@ -223,6 +223,7 @@ struct _time_records {
+ 	uint16_t decompress_kernel_start;
+ 	uint16_t kernel_start;
+ 	uint16_t kernel_run_init_start;
++	uint16_t user_process_init_start;
+ } __packed;
+ 
+ struct _macros_misc {
+-- 
+2.25.1
+

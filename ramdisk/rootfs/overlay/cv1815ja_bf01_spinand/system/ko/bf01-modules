@@ -17,5 +17,9 @@ for MODULE in $MODULES; do
         [ ! -e /run/ipcamera-wifi/live-mode ] || exit 125
     fi
     [ ! -d "/sys/module/$MODULE" ] || continue
+    # The driver may be built into the kernel under another module name
+    # (cv181x_wdt is cvi_wdt, cv181x_tpu/ive/clock_cooling have no sysfs entry),
+    # in which case the .ko file is gone and there is nothing to load.
+    [ -f "/mnt/system/ko/$MODULE.ko" ] || continue
     insmod "/mnt/system/ko/$MODULE.ko"
 done

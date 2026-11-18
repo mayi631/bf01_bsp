@@ -1,6 +1,12 @@
 #!/bin/bash
 
 SYSTEM_DIR=$1
+# Refuse to run with an empty or non-directory argument: every rm below is
+# rooted at $SYSTEM_DIR, so an empty value would operate on the host /.
+if [ -z "$SYSTEM_DIR" ] || [ ! -d "$SYSTEM_DIR" ]; then
+    echo "clean_rootfs.sh: invalid SYSTEM_DIR '$SYSTEM_DIR'" >&2
+    exit 1
+fi
 rm -f $SYSTEM_DIR/mnt/system/usr/lib/libz*
 rm -f $SYSTEM_DIR/mnt/system/lib/libz*
 
@@ -63,6 +69,11 @@ else
     rm -f $SYSTEM_DIR/mnt/system/lib/libssl*
     rm -f $SYSTEM_DIR/mnt/system/lib/libcrypto*
 fi
+
+# BF01: these drivers are built into the kernel, the .ko files are dead weight
+for k in cv181x_sys cv181x_clock_cooling cvi_ipcm cv181x_tpu cv181x_ive cv181x_wdt; do
+    rm -f $SYSTEM_DIR/mnt/system/ko/$k.ko
+done
 
 du -sh $SYSTEM_DIR/* |sort -rh
 du -sh $SYSTEM_DIR/mnt/* |sort -rh

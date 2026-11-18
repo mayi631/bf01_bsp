@@ -1,0 +1,62 @@
+From 2db9de040097e97f9267990868aa912c8425f94c Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Tue, 17 Nov 2026 16:56:11 +0800
+Subject: [PATCH] feat(build): honor CONFIG_ROOTFS_FORMAT_OPTIMIZATION on
+ spinand rootfs
+
+[description ]:
+- Select the mksquashfs compressor from CONFIG_ROOTFS_FORMAT_OPTIMIZATION
+  for the spinand read-only rootfs path, gzip when the option is enabled and
+  xz otherwise.
+- The option was only consulted in the spinor branch, so spinand always
+  packed with xz regardless of the board configuration.
+
+[root   cause]:
+- The spinand branch hardcoded "-comp xz" in both the HAS_CFG and the plain
+  mksquashfs invocations, so enabling CONFIG_ROOTFS_FORMAT_OPTIMIZATION on a
+  spinand board had no effect.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME
+[chip project]:181x
+[side effects]:
+- Only affects rootfs image compression for spinand builds when the option
+  is enabled; xz remains the default for every board that does not set it.
+- Verified on cv1815ja_bf01_spinand: image packs gzip, boots, mounts
+  squashfs read-only, application and three RTSP streams run normally.
+
+[Affected *.ko/*.so/*.a] :none, build script only
+
+Change-Id: I928faf07d5410c9ec6973d1fc804c14d971d7132
+---
+ Makefile | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 7abe32bfa8558e57ab97535d56788004fffdf401..922805ec42906c30ce239d4927c1d252fbe6409b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -684,6 +684,8 @@ ifneq ($(wildcard $(FLASH_PARTITION_XML)),)
+ HAS_CFG := $(shell grep -q 'label="CFG"' $(FLASH_PARTITION_XML) && echo y)
+ endif
+ 
++ROOTFS_COMP_OPT := $(if $(findstring y,${CONFIG_ROOTFS_FORMAT_OPTIMIZATION}),-comp gzip,-comp xz)
++
+ rootfs-pack:export CROSS_COMPILE_KERNEL=$(patsubst "%",%,$(CONFIG_CROSS_COMPILE_KERNEL))
+ rootfs-pack:export CROSS_COMPILE_SDK=$(patsubst "%",%,$(CONFIG_CROSS_COMPILE_SDK))
+ rootfs-pack:export OSDRV_BUILD_IN:=$(CONFIG_OSDRV_BUILD_IN)
+@@ -717,10 +719,10 @@ else
+ endif
+ else
+ ifeq ($(HAS_CFG),y)
+-	${Q}mksquashfs $(ROOTFS_DIR) $(OUTPUT_DIR)/rawimages/rootfs.sqsh -root-owned -comp xz -e mnt/cfg/*
++	${Q}mksquashfs $(ROOTFS_DIR) $(OUTPUT_DIR)/rawimages/rootfs.sqsh -root-owned $(ROOTFS_COMP_OPT) -e mnt/cfg/*
+ else
+ 	${Q}rm -rf $(ROOTFS_DIR)/mnt/cfg/*
+-	${Q}mksquashfs $(ROOTFS_DIR) $(OUTPUT_DIR)/rawimages/rootfs.sqsh -root-owned -comp xz
++	${Q}mksquashfs $(ROOTFS_DIR) $(OUTPUT_DIR)/rawimages/rootfs.sqsh -root-owned $(ROOTFS_COMP_OPT)
+ endif
+ endif
+ ifeq ($(STORAGE_TYPE),spinand)
+-- 
+2.25.1
+

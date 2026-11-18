@@ -10,14 +10,11 @@ ${CVI_SHOPTS}
 # Define kernel modules sequence
 #
 
-modules_seq="
-/mnt/system/ko/cv181x_sys.ko
-/mnt/system/ko/cv181x_clock_cooling.ko
-/mnt/system/ko/cvi_ipcm.ko
-/mnt/system/ko/cv181x_tpu.ko
-/mnt/system/ko/cv181x_ive.ko
-/mnt/system/ko/cv181x_wdt.ko
-"
+# cv181x_sys / cv181x_clock_cooling / cvi_ipcm / cv181x_tpu / cv181x_ive and
+# cv181x_wdt are built into the kernel (CONFIG_CV181X_* / CONFIG_CV181X_WDT = y
+# in the board defconfig), so the .ko files no longer exist. The script stays
+# because S99user calls it and the bf01-modules early-boot path above uses it.
+modules_seq=""
 
 #
 # Start to insert kernel modules

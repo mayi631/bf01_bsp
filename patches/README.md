@@ -261,7 +261,7 @@ BF01 板级实现随后分为两个独立提交：
 编译前应加载 BF01 fastboot 板级配置，确认 `CONFIG_ATBM6461_BF01=y`，
 再编译 osdrv，检查 rootfs 中的驱动和 `mnt/system/wifi` 工具后打包。
 
-补丁编号全局唯一且连续，`repos --applypatch` 按仓库过滤并按编号应用。
+补丁编号全局唯一且连续，`repos --applypatch` 按仓库过滤并按编号应用。0048–0052 是在 0047 之后顺延分配的一组启动时间与 rootfs 压缩补丁，内部 SDK 使用相同编号。
 IPCamera、个人说明文档、真实网络凭据和编译产物不在本次同步范围。
 
 ## 0038：ION 的 RTOS 预留隔离
@@ -397,6 +397,77 @@ SYSTEM尾部缩小512KiB，新建两个256KiB槽，DATA物理位置不变但mtd8
 首次升级保留APP参数需从实存JSON生成种子，详见
 `../docs/BF01_TIMESTAMP_BOOT_SETTINGS.md`。当前SDK已正向修改；本机回归和
 构建不等于刷机、真实APP交互或首拍媒体验收，本次未进行板端写入。
+
+## 0048–0050：启动时间打点
+
+三个仓库各一笔，构成完整 boottime 测量链；不改板级配置，可单独应用。
+
+- `0048-u-boot-2021.10--fix-spl-record-kernel-start-time-in-the-SPL-fast-boo.patch`：
+  `arch/arm/lib/spl.c` 的 ARM64/ARM32 `jump_to_image_linux()` 在跳转内核前记录
+  `kernel_start`；`arch/arm/lib/bootm.c` 的写点提前到设备移除与 cache/MMU 拆除之前。
+  BF01 快启由 SPL 直接起内核、不经过 `bootm`，此前该字段恒为 0。
+- `0049-linux_5.10--fix-cost_time-always-build-the-time-record-helpers-a.patch`：
+  `cost_time.o` 改为无条件编译；`struct _time_records` 补第 14 个字段
+  `user_process_init_start`；`run_init_process()` 去掉 `CONFIG_CVITEK_FASTBOOT`
+  条件并分两次写 16 位字段；`read_time_ms()`/`read_time_us()` 改为 `uint64_t`，
+  用 `do_div` 替代 `DIV_ROUND_UP`。
+- `0050-fsbl--feat-bl2-add-boot-time-breakdown-prints-for-the-2nd-.patch`：
+  `bl2_opt.c` 新增 `BLCP2ND/hdr=rd=crc=dcp=` 与 `UPL/` 分段耗时打印，
+  `cvi_spinand.c` 新增 `SNAND/byp0=div=ctrl1=boot=flags=` 时钟状态打印；
+  均用 `ERROR` 级别以穿透 `CONFIG_FSBL_LOG_LEVEL=0`。
+
+应用 0048 需重编 U-Boot 并重新生成 `fip.bin`/`fip_spl.bin`；0049 需重编内核生成
+`boot.itb`；0050 随 fsbl 编入 fip。板上验证 `kernel_start` 由此前恒为 0
+变为约 12360ms，`kernel_run_init_start`/`user_process_init_start` 约 12750ms。
+调优结束后应把 `BLCP2ND`/`UPL`/`SNAND` 三条打印降回 `NOTICE`。
+
+## 0051：内核 watchdog 内置
+
+- `0051-linux_5.10--feat-wdt-build-the-DW-watchdog-in-and-port-the-CVITE.patch`：
+  把 `osdrv/interdrv/wdt/cv181x/cvi_wdt.c` 移植进 Linux 树
+  `drivers/soc/cvitek/wdt/`，新增 `CONFIG_CV181X_WDT`（`select WATCHDOG_CORE`），
+  保留 CVITEK 的 `cv_top_setting()`（TOP 寄存器 WDT 复位路由，
+  0x03000008 / 0x03003004）。内核树自带的 `drivers/watchdog/dw_wdt.c`
+  缺这段逻辑，不能直接开 `CONFIG_DW_WATCHDOG` 替代。
+  板级 defconfig 需同时打开 `CONFIG_CV181X_WDT=y`，
+  并把 `/mnt/system/ko/cv181x_wdt.ko` 从加载列表去掉。
+
+## 0052：rootfs 压缩算法可配置
+
+- `0052-build--feat-build-honor-CONFIG_ROOTFS_FORMAT_OPTIMIZATION-o.patch`：
+  `build/Makefile` 的 spinand 分支原来固定 `-comp xz`，
+  `CONFIG_ROOTFS_FORMAT_OPTIMIZATION` 只在 spinor 分支生效。
+  改为 `ROOTFS_COMP_OPT := $(if $(findstring y,${CONFIG_ROOTFS_FORMAT_OPTIMIZATION}),-comp gzip,-comp xz)`，
+  两个 mksquashfs 调用共用该变量。板级打开该选项时需同时打开内核
+  `CONFIG_SQUASHFS_ZLIB=y`，否则 gzip 镜像无法挂载。
+  实测 gzip 镜像由 8.8MB 增至 10.5MB，启动时间无可测差异。
+
+## BF01 板级配置：内核内置模块与 rootfs 压缩
+
+随 0048–0052 一起交付的板级配置改动，按板级目录直接交付，不新增公共仓库补丁：
+
+`build/boards/cv181x/cv1815ja_bf01_spinand/`
+
+- `cv1815ja_bf01_spinand_fastboot_defconfig`：打开 `CONFIG_ROOTFS_FORMAT_OPTIMIZATION=y`，
+  内核压缩由 `CONFIG_KERNEL_LZMA` 改为 `CONFIG_KERNEL_LZ4`。LZ4 解压快约 690ms，
+  镜像由 2.58MB 增至 3.62MB。
+- `linux/cvitek_cv1815ja_bf01_spinand_defconfig`：打开 `CONFIG_SQUASHFS_ZLIB=y`
+  （与 0052 的 gzip rootfs 配套）、`CONFIG_USB_DWC2=y`（原为 `=m`），
+  并追加 `CONFIG_CV181X_{SYS,CLK_COOLING,IPCM,TPU,IVE,WDT}=y` 把这 6 个 osdrv
+  基础驱动编进内核。
+- `rootfs_script/clean_rootfs.sh`：给 `SYSTEM_DIR` 加空值与目录校验（此前空参数会让
+  脚本对宿主机根目录执行 `rm -rf`）；打包时删除上述 6 个已内置的 `.ko`。
+
+`ramdisk/rootfs/overlay/cv1815ja_bf01_spinand/system/ko/`
+
+- `loadsystemko.sh`：`modules_seq` 置空。这些驱动已内置，`.ko` 不再存在。
+- `bf01-modules`：insmod 前增加 `.ko` 文件存在判断。内置后 `cv181x_wdt` 的 sysfs 名是
+  `cvi_wdt`，`cv181x_tpu`/`cv181x_ive`/`cv181x_clock_cooling` 没有 sysfs 条目，
+  原判断不足以跳过，脚本带 `set -eu` 会让早启流程直接失败。
+
+这套改动与原「通信与直播优先启动」方案并存：`S11bf01` 早启、`bf01-modules` 分组加载、
+`rcP` 延迟都保留，只是不再加载已内置的驱动。板级实测内置后 `lsmod` 为空，
+ipcamera 三路 RTSP 正常。
 
 ## BF01 板级 overlay：通信与直播优先启动
 

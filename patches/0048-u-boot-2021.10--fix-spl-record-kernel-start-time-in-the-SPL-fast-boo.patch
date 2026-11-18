@@ -1,0 +1,98 @@
+From d341def532ece880d5d96ebf4ce6dcfb9baaf3cf Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Tue, 17 Nov 2026 10:44:25 +0800
+Subject: [PATCH] fix(spl): record kernel start time in the SPL fast boot path
+
+[description ]:
+- arch/arm/lib/spl.c: the ARM64 jump_to_image_linux() stores
+  TIME_RECORDS_FIELD_KERNEL_START before armv8_switch_to_el2(); the ARM32
+  branch does the same before entering the kernel.
+- arch/arm/lib/bootm.c: announce_and_cleanup() records the kernel start
+  time before dm_remove_devices_flags() and cleanup_before_linux(), so the
+  AXI SRAM write still runs while MMU and caches are usable.
+
+[root   cause]:
+- The arch override of jump_to_image_linux() in arch/arm/lib/spl.c
+  replaces the weak implementation in common/spl/spl.c, which is the one
+  that records TIME_RECORDS_FIELD_KERNEL_START; the override had no such
+  write.
+- BF01 fast boot goes SPL -> Linux and never runs do_bootm_linux(), so
+  board_save_time_record(TIME_RECORDS_FIELD_KERNEL_START) in
+  arch/arm/lib/bootm.c was unreachable and /tmp/boottime always reported
+  kernel_start=0ms, leaving the SPL decompress-and-jump gap unmeasured.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME (to be provided)
+[chip project]:181x
+[side effects]:
+- Only the fast boot and bootm handoff paths are touched; u-boot proper,
+  SPL load and A/B selection are unchanged.
+- Verified on cv1815ja_bf01_spinand: /tmp/boottime reports
+  kernel_start=12362ms consistently across two boots
+  (decompress_kernel_start=11586ms).
+
+[Affected *.ko/*.so/*.a] :fip_spl.bin / fip.bin (u-boot-spl, u-boot); no .ko/.so/.a
+
+Change-Id: I3f2b8e1c7d4a05b96e8c1a7f2d3b4c5e6f70819a
+---
+ arch/arm/lib/bootm.c |  9 ++++++---
+ arch/arm/lib/spl.c   | 10 ++++++++++
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm/lib/bootm.c b/arch/arm/lib/bootm.c
+index 9143404cdf9e35a9de31510bce6ac422f7b04ad6..e6600bf7e3bb1118a40236f24ebc2ed931b37e9b 100644
+--- a/arch/arm/lib/bootm.c
++++ b/arch/arm/lib/bootm.c
+@@ -98,6 +98,12 @@ __weak void board_quiesce_devices(void)
+  */
+ static void announce_and_cleanup(int fake)
+ {
++	/*
++	 * Save kernel start time before devices are removed and MMU/cache are
++	 * torn down; /etc/init.d/P99boottime expects this field to be valid.
++	 */
++	board_save_time_record(TIME_RECORDS_FIELD_KERNEL_START);
++
+ 	bootstage_mark_name(BOOTSTAGE_ID_BOOTM_HANDOFF, "start_kernel");
+ #ifdef CONFIG_BOOTSTAGE_FDT
+ 	bootstage_fdt_add_report();
+@@ -125,9 +131,6 @@ static void announce_and_cleanup(int fake)
+ 	dm_remove_devices_flags(DM_REMOVE_ACTIVE_ALL);
+ 
+ 	cleanup_before_linux();
+-
+-	// Save kernel start time
+-	board_save_time_record(TIME_RECORDS_FIELD_KERNEL_START);
+ }
+ 
+ static void setup_start_tag (struct bd_info *bd)
+diff --git a/arch/arm/lib/spl.c b/arch/arm/lib/spl.c
+index 3480462deab02787753067c46655f40b40bccd79..a76eede8d0c263f8399e3e523fcb2bd1a5544545 100644
+--- a/arch/arm/lib/spl.c
++++ b/arch/arm/lib/spl.c
+@@ -71,6 +71,14 @@ void __noreturn jump_to_image_linux(struct spl_image_info *spl_image)
+ 	fdt_addr = (u64)(spl_image->fdt_addr);
+ 	entry_point = (u64)(spl_image->entry_point);
+ 
++	/*
++	 * Save kernel start time. This arch override replaces the weak
++	 * jump_to_image_linux() in common/spl/spl.c, which records it;
++	 * fast boot (SPL -> Linux) never runs bootm, so without this the
++	 * field read by /etc/init.d/P99boottime stays 0.
++	 */
++	board_save_time_record(TIME_RECORDS_FIELD_KERNEL_START);
++
+ 	armv8_switch_to_el2((u64)fdt_addr, 0, 0, 0,
+ 			    (u64)switch_to_el1, ES_TO_AARCH64);
+ }
+@@ -88,6 +96,8 @@ void __noreturn jump_to_image_linux(struct spl_image_info *spl_image)
+ 	image_entry_arg_t image_entry =
+ 		(image_entry_arg_t)(uintptr_t) spl_image->entry_point;
+ 	cleanup_before_linux();
++	// Save kernel start time
++	board_save_time_record(TIME_RECORDS_FIELD_KERNEL_START);
+ 	image_entry(0, machid, spl_image->arg);
+ }
+ #endif	/* CONFIG_ARM64 */
+-- 
+2.25.1
+
