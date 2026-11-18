@@ -12,6 +12,8 @@
 #include "bf01_boot_timestamp.h"
 #include "bf01_boot_timestamp_config.h"
 #include "bf01_boot_rtc.h"
+#include "bf01_timestamp_settings.h"
+#include "cvi_board_memmap.h"
 #include "cvi_ipcm.h"
 #include "cvi_region.h"
 #include "hal_rtc.h"
@@ -65,6 +67,10 @@ static unsigned int timestamp_prepare_height;
 static unsigned long timestamp_clock_seconds;
 static uint64_t timestamp_clock_started_us;
 static int timestamp_clock_valid;
+static uint32_t timestamp_app_settings;
+static uint32_t timestamp_applied_settings;
+static int timestamp_output_valid;
+static int timestamp_enabled;
 
 static int read_internal_clock_seconds(unsigned long *seconds)
 {
@@ -104,6 +110,21 @@ static int read_clock_seconds(unsigned long *seconds)
 
 void APP_BootTimestampInitExternalRtc(void)
 {
+#ifdef CVIMMAP_BF01_TIMESTAMP_BOOT_SETTINGS
+    struct bf01_ts_record records[2];
+    memcpy(&records[0], (const void *)(uintptr_t)(CVIMMAP_SHARE_PARAM_ADDR + BF01_TS_RECORD_OFFSET),
+        sizeof(records[0]));
+    memcpy(&records[1], (const void *)(uintptr_t)(CVIMMAP_SHARE_PARAM_ADDR_BAK + BF01_TS_RECORD_OFFSET),
+        sizeof(records[1]));
+    int selected = bf01_ts_record_choose(records);
+    if (selected >= 0) {
+        __atomic_store_n(&timestamp_app_settings, records[selected].policy, __ATOMIC_RELEASE);
+        printf("[boot-timestamp] boot-cache slot=%d generation=%lu policy=0x%08lx before first capture\n",
+            selected, (unsigned long)records[selected].generation, (unsigned long)records[selected].policy);
+    } else {
+        printf("[boot-timestamp] boot-cache invalid; using embedded defaults\n");
+    }
+#endif
     unsigned long seconds = 0;
     int result = APP_BootRtcRead(&seconds);
     if (result) {
@@ -116,11 +137,15 @@ void APP_BootTimestampInitExternalRtc(void)
 
 static int load_timestamp_settings(void)
 {
+    uint32_t settings = __atomic_load_n(&timestamp_app_settings, __ATOMIC_ACQUIRE);
     timestamp_utc_offset = BF01_TIMESTAMP_UTC_OFFSET_MINUTES;
-    timestamp_format = (enum timestamp_date_format)BF01_TIMESTAMP_FORMAT;
-    printf("[boot-timestamp] enabled=%d format=%d utc_offset_minutes=%d config=embedded source=RTC\n",
-        BF01_TIMESTAMP_ENABLED, BF01_TIMESTAMP_FORMAT, BF01_TIMESTAMP_UTC_OFFSET_MINUTES);
-    return BF01_TIMESTAMP_ENABLED;
+    timestamp_enabled = settings & 0x100U ? (int)(settings & 1U) : BF01_TIMESTAMP_ENABLED;
+    timestamp_format = settings & 0x200U ? (enum timestamp_date_format)((settings >> 1) & 3U) :
+        (enum timestamp_date_format)BF01_TIMESTAMP_FORMAT;
+    timestamp_applied_settings = settings;
+    printf("[boot-timestamp] enabled=%d format=%d utc_offset_minutes=%d config=%s source=RTC\n",
+        timestamp_enabled, (int)timestamp_format, timestamp_utc_offset, settings ? "APP" : "embedded");
+    return timestamp_enabled;
 }
 
 static const uint8_t *timestamp_glyph(char character)
@@ -205,6 +230,7 @@ void APP_BootTimestampStop(void)
         }
         timestamp_prepare_started = 0;
     }
+    timestamp_output_valid = 0;
     stop_timestamp();
 }
 
@@ -276,6 +302,8 @@ static void update_timestamp(void)
     timestamp_last_seconds = seconds;
 }
 
+static void start_timestamp(int vpss_group, unsigned int width, unsigned int height);
+
 void APP_BootTimestampUpdate(void)
 {
     if (__atomic_load_n(&timestamp_preparing, __ATOMIC_ACQUIRE)) {
@@ -285,11 +313,18 @@ void APP_BootTimestampUpdate(void)
         }
         return;
     }
+    if (timestamp_output_valid && timestamp_applied_settings !=
+        __atomic_load_n(&timestamp_app_settings, __ATOMIC_ACQUIRE))
+        start_timestamp(timestamp_prepare_group, timestamp_prepare_width, timestamp_prepare_height);
     update_timestamp();
 }
 
 static void start_timestamp(int vpss_group, unsigned int width, unsigned int height)
 {
+    timestamp_prepare_group = vpss_group;
+    timestamp_prepare_width = width;
+    timestamp_prepare_height = height;
+    timestamp_output_valid = 1;
     stop_timestamp();
     if (!load_timestamp_settings())
         return;
@@ -352,8 +387,6 @@ static void *prepare_timestamp(void *argument)
 
 void APP_BootTimestampPrepare(int vpss_group, unsigned int width, unsigned int height)
 {
-    if (!BF01_TIMESTAMP_ENABLED)
-        return;
     APP_BootTimestampStop();
     if (timestamp_prepare_started)
         return;
@@ -394,6 +427,15 @@ void APP_BootTimestampPrepare(int vpss_group, unsigned int width, unsigned int h
 static int synchronize_clock(void *private_data, IPCM_ANON_MSG_S *message)
 {
     (void)private_data;
+    if (message && message->u8PortID == BF01_TIMESTAMP_CLOCK_PORT &&
+        message->u8DataType == IPCM_MSG_TYPE_RAW_PARAM && message->u8MsgID == BF01_TIMESTAMP_SETTINGS_MESSAGE) {
+        uint32_t settings = message->u32Param;
+        if ((settings & ~0x307U) != BF01_TIMESTAMP_SETTINGS_MAGIC ||
+            ((settings >> 1) & 3U) > 2U || !(settings & 0x300U))
+            return -EINVAL;
+        __atomic_store_n(&timestamp_app_settings, settings, __ATOMIC_RELEASE);
+        return CVI_IPCM_AnonSendParam(BF01_TIMESTAMP_CLOCK_REPLY_PORT, BF01_TIMESTAMP_SETTINGS_MESSAGE, settings);
+    }
     if (!message || message->u8PortID != BF01_TIMESTAMP_CLOCK_PORT ||
         message->u8DataType != IPCM_MSG_TYPE_RAW_PARAM ||
         (message->u8MsgID != BF01_TIMESTAMP_CLOCK_SET &&

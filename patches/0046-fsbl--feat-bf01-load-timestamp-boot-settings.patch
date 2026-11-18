@@ -1,0 +1,165 @@
+From: mayi <3363523343@qq.com>
+Date: Tue, 17 Nov 2026 19:05:00 +0800
+Subject: [PATCH] feat(bf01): preload timestamp settings before RTOS capture
+
+[description ]:
+- Preload the two dedicated BF01 timestamp slots into existing shared
+  parameter buffers before releasing RTOS in normal and mirror paths.
+- Check NAND geometry and first-page data-area bad-block markers, bound
+  each read to its slot, and read the record from the second 2 KiB page.
+- Clear failed copies and continue boot; never write flash in FSBL.
+
+[root   cause]:
+- RTOS encodes startup photos before Linux can load saved APP settings
+  or apply timestamp policy over IPC. Later confirmation cannot change
+  already encoded JPEGs or the beginning of the recorded video.
+
+[JIRA      ID]:N/A (BF01 integration)
+[chip project]:181x
+[side effects]:
+- Enabled only by the BF01 memory-map marker and matching dedicated
+  partitions. Requires the companion BSP layout, RTOS and APP changes.
+- Uses existing shared buffers without moving memory addresses; leaves
+  A/B misc metadata, AI gating, capture scheduling and live unchanged.
+- Adds bounded NAND reads before RTOS release. Physical boot latency,
+  real flash power-loss behavior and first-frame media remain untested.
+- The new layout shrinks SYSTEM by 512 KiB and changes DATA from mtd8
+  to mtd10; migration requires matching boot/rootfs/SYSTEM images.
+
+[Affected *.ko/*.so/*.a] :FSBL / FIP; no .ko/.so/.a
+[test]:
+- ARM application, RTOS, BL2 and FIP built on the integration SDK.
+- Isolated source-derived reader/import, bad-block bounds, CRC and
+  cache failure cases passed; these are not physical board acceptance.
+- No partition writes, board flashing, reboot or live interruption.
+
+---
+
+--- a/include/cv_spi_nand.h
++++ b/include/cv_spi_nand.h
+@@ -449,4 +449,5 @@
+ void cv_spi_nand_set_freq(struct spi_nand_info_t nand_info);
+ int get_nand_info(void);
+ int cv_spi_nand_read_data(void * buffer, uint32_t offset, uint32_t size);
++int cv_spi_nand_read_bf01_timestamp(void *buffer, uint32_t offset, uint32_t size);
+ #endif	/* __CV_SPI_NAND_H__ */
+--- a/plat/cv181x/bl2/bl2_opt.c
++++ b/plat/cv181x/bl2/bl2_opt.c
+@@ -235,6 +235,40 @@
+ }
+ #endif
+ 
++#ifdef CVIMMAP_BF01_TIMESTAMP_BOOT_SETTINGS
++#if !defined(BF01_TS0_OFFSET) || !defined(BF01_TS1_OFFSET)
++#error BF01 timestamp boot settings require both dedicated flash partitions
++#endif
++_Static_assert(CVIMMAP_SHARE_PARAM_SIZE >= 4096, "timestamp preload buffer size");
++_Static_assert(BF01_TS0_SIZE == 0x40000 && BF01_TS1_SIZE == 0x40000, "timestamp slot size");
++_Static_assert(BF01_TS0_OFFSET == 0x08d80000 && BF01_TS1_OFFSET == 0x08dc0000,
++	"timestamp slot layout");
++#endif
++
++void load_bf01_timestamp_settings(void)
++{
++#ifdef CVIMMAP_BF01_TIMESTAMP_BOOT_SETTINGS
++	const uint32_t offsets[2] = {BF01_TS0_OFFSET, BF01_TS1_OFFSET};
++	const uintptr_t addresses[2] = {CVIMMAP_SHARE_PARAM_ADDR, CVIMMAP_SHARE_PARAM_ADDR_BAK};
++	unsigned int index;
++
++	if (macros_misc.storage_type == BOOT_SRC_SPI_NAND)
++		get_nand_info();
++	for (index = 0; index < 2; index++) {
++		void *buffer = (void *)addresses[index];
++		int result = -1;
++
++		memset(buffer, 0, 4096);
++		if (macros_misc.storage_type == BOOT_SRC_SPI_NAND)
++			result = cv_spi_nand_read_bf01_timestamp(buffer, offsets[index], 0x40000);
++		if (result != 0)
++			memset(buffer, 0, 4096);
++		flush_dcache_range(addresses[index], 4096);
++		NOTICE("BF01 TS%u preload=%d\n", index, result);
++	}
++#endif
++}
++
+ int load_blcp_2nd(int retry)
+ {
+ 	uint32_t rtos_base;
+@@ -359,6 +393,7 @@
+ 
+ 	flush_dcache_range(fip_param2.blcp_2nd_runaddr, dst_size);
+ 
++	load_bf01_timestamp_settings();
+ 	rtos_base = mmio_read_32(AXI_SRAM_RTOS_BASE);
+ 	init_comm_info(0);
+ 
+--- a/plat/cv181x/bl2/bl2_double_opt.c
++++ b/plat/cv181x/bl2/bl2_double_opt.c
+@@ -29,6 +29,7 @@
+ 
+ extern struct _macros_misc macros_misc;
+ extern union SRAMBuffer sram_union_buf;
++extern void load_bf01_timestamp_settings(void);
+ 
+ int init_comm_info(int ret) __attribute__((weak));
+ int init_comm_info(int ret)
+@@ -233,6 +234,7 @@
+ 				   fip_param2.freertos_a_size);
+ 	}
+ 
++	load_bf01_timestamp_settings();
+ 	rtos_base = mmio_read_32(AXI_SRAM_RTOS_BASE);
+ 	init_comm_info(0);
+ 
+@@ -566,4 +568,4 @@
+ 
+ 	return 0;
+ }
+-#endif
+\ No newline at end of file
++#endif
+--- a/plat/cv181x/bl2/cvi_spinand.c
++++ b/plat/cv181x/bl2/cvi_spinand.c
+@@ -9,6 +9,7 @@
+ #include <string.h>
+ #include <platform.h>
+ #include <security/security.h>
++#include "cvi_board_memmap.h"
+ 
+ static unsigned long spi_nand_ctrl_base = SPINAND_BASE;
+ /* default value */
+@@ -398,3 +399,33 @@
+ 	}
+ 	return ret;
+ }
++
++#ifdef CVIMMAP_BF01_TIMESTAMP_BOOT_SETTINGS
++int cv_spi_nand_read_bf01_timestamp(void *buffer, uint32_t offset, uint32_t size)
++{
++	uint32_t block;
++	uint32_t limit = offset + size;
++	uint8_t *bytes = buffer;
++
++	if (spinand_info.page_size != 2048 || spinand_info.block_size != 0x20000 ||
++	    size != 0x40000 || offset % spinand_info.block_size)
++		return -1;
++	for (block = offset; block < limit; block += spinand_info.block_size) {
++		uint32_t row = block / spinand_info.page_size;
++		uint32_t column = 0;
++
++		if ((spinand_info.flags & FLAGS_SET_PLANE_BIT) &&
++		    ((block / spinand_info.block_size) & 1))
++			column |= SPI_NAND_PLANE_BIT_OFFSET;
++		spi_nand_ctrl_ecc(0);
++		if (spi_nand_read_page_by_row_addr(row, buffer, spinand_info.page_size))
++			return -1;
++		flush_dcache_range((uintptr_t)buffer, spinand_info.page_size);
++		spi_nand_read_from_cache(0, 0, column, spinand_info.page_size, buffer);
++		if (bytes[0] != 0xff || bytes[1] != 0xff)
++			continue;
++		return cv_spi_nand_read_data(bytes + 2048, block + 2048, 2048);
++	}
++	return -1;
++}
++#endif

@@ -383,6 +383,21 @@ ADC 驱动，配套已存在的 BF01 `PWR_VBAT_DET` 启动采样：允许 RTC �
 安装及相应镜像，不能仅编译 U-Boot。依据、构建及真实板测边界见
 `../docs/BF01_SDIO_STARTUP_OPT.md`；隔离编译和回归不是板端启动耗时验收。
 
+## 0046 / 0047：APP 时间戳首拍启动缓存
+
+`0046-fsbl--feat-bf01-load-timestamp-boot-settings.patch` 为BF01的普通/镜像
+启动路径增加有界只读预加载，在释放小核前读取两个专用原始缓存槽；读取失败保持
+启动可继续。`0047-build--feat-bf01-timestamp-boot-cache-images.patch` 生成
+严格布局常量，并随小核构建自动打包两个缓存镜像。板级marker仅在BF01设置，
+不复用媒体PARAM、RTC寄存器或A/B的misc，不改抓拍/AI/直播。
+
+两补丁需配套BSP新布局、共享头/生成器/小核定制及应用的JSON派生缓存写入。
+SYSTEM尾部缩小512KiB，新建两个256KiB槽，DATA物理位置不变但mtd8改mtd10，
+需完整重建相关引导参数及两套A/B挂载脚本；不能在线截断旧UBI或只更新应用。
+首次升级保留APP参数需从实存JSON生成种子，详见
+`../docs/BF01_TIMESTAMP_BOOT_SETTINGS.md`。当前SDK已正向修改；本机回归和
+构建不等于刷机、真实APP交互或首拍媒体验收，本次未进行板端写入。
+
 ## BF01 板级 overlay：通信与直播优先启动
 
 此项按板级目录直接交付，不新增公共仓库补丁：

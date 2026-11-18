@@ -13,6 +13,8 @@
     <partition label="misc" size_in_kb="512" file="misc.spinand"/>
     <partition label="rootfs_a" size_in_kb="40960" file="rootfs.spinand" />
     <partition label="rootfs_b" size_in_kb="40960" file="rootfs_b.spinand" />
-    <partition label="SYSTEM" size_in_kb="40960" file="system.spinand" mountpoint="" type="ubifs" />
+    <partition label="SYSTEM" size_in_kb="40448" file="system.spinand" mountpoint="" type="ubifs" />
+    <partition label="BF01_TS0" size_in_kb="256" file="timestamp.bin" />
+    <partition label="BF01_TS1" size_in_kb="256" file="timestamp_bak.bin" />
     <partition label="DATA" size_in_kb="112768" file="data.spinand" mountpoint="/mnt/data" type="ubifs" />
 </physical_partition>

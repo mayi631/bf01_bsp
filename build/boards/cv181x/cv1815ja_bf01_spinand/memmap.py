@@ -4,6 +4,7 @@ SIZE_1K = 1024
 
 # Only attributes in class MemoryMap are generated to .h
 class MemoryMap:
+    BF01_TIMESTAMP_BOOT_SETTINGS = 1
     # No prefix "CVIMMAP_" for the items in _no_prefix[]
     _no_prefix = [
         "CONFIG_SYS_TEXT_BASE"  # u-boot's CONFIG_SYS_TEXT_BASE is used without CPP.
