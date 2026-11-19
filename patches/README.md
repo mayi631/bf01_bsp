@@ -442,6 +442,24 @@ SYSTEM尾部缩小512KiB，新建两个256KiB槽，DATA物理位置不变但mtd8
   `CONFIG_SQUASHFS_ZLIB=y`，否则 gzip 镜像无法挂载。
   实测 gzip 镜像由 8.8MB 增至 10.5MB，启动时间无可测差异。
 
+## 0053：UBI 镜像给 fastmap 预留 PEB
+
+- `0053-build--feat-build-add-fm-reserve-to-leave-PEBs-for-UBI-fastmap.patch`：
+  `spinand_tool/mkubiimg.py` 新增可选参数 `--fm-reserve N`。给出该参数时放弃
+  `vol_flags=autoresize`，显式写 `vol_size = internal_part_size - N * PEB`，
+  在卷尾留出 N 个空闲 PEB 供 UBI fastmap 写 anchor。
+  不带参数时行为与原来完全一致，生成的 ubinize 配置逐字节相同。
+
+  背景：rootfs 卷带 `autoresize` 会占满几乎所有空闲 PEB，UBI 找不到 anchor 落点，
+  每次 attach 都打印 `could not find any anchor PEB`。目前没有调用方使用该参数，
+  板级仍保持现有布局，留作后续按设备粒度重试 fastmap 时使用。
+
+## 0054：记录 rootfs 不用 lz4 的实测原因
+
+- `0054-build--docs-build-record-why-BF01-rootfs-packs-with-gzip-inst.patch`：
+  在 `ROOTFS_COMP_OPT` 上方补注释，记录 BF01 上 lz4 反而更慢的实测数据，
+  避免后续被当作"更快的压缩算法"重新尝试。只改注释，不影响构建行为。
+
 ## BF01 板级配置：内核内置模块与 rootfs 压缩
 
 随 0048–0052 一起交付的板级配置改动，按板级目录直接交付，不新增公共仓库补丁：

@@ -1,0 +1,106 @@
+From ea72aab2a932f1ac3daffc5f4ffdb9c096dcf755 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Thu, 19 Nov 2026 10:58:00 +0800
+Subject: [PATCH 1/2] feat(build): add --fm-reserve to leave PEBs for UBI
+ fastmap
+
+[description ]:
+- Add an optional --fm-reserve N to the spinand UBI image tool. It drops
+  vol_flags=autoresize, writes an explicit vol_size of
+  internal_part_size - N * PEB, and leaves N PEBs free on the volume.
+- Keep the default behaviour unchanged: without the option the volume is
+  still created with autoresize and no explicit vol_size.
+
+[root   cause]:
+- Fastmap needs a pool of free PEBs to write its anchor block into, but
+  the rootfs volume is created with autoresize and grows over every free
+  PEB, so UBI never finds a place for the anchor and logs "could not find
+  any anchor PEB" on every attach.
+- There was no way to express "leave room for fastmap" in the image
+  layout without hand-editing the generated ubinize config.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME
+[chip project]:181x
+[side effects]:
+- No change for existing callers, none of them passes --fm-reserve; the
+  generated ubifs config is byte identical to the previous one when the
+  option is absent.
+- The option is not wired into any board build yet, BF01 keeps the current
+  layout. Verified that the tool still packs the shipping rootfs.spinand
+  when invoked without the option.
+
+[Affected *.ko/*.so/*.a] :none, host packaging tool only
+
+Change-Id: I5c1e0d3a8f47b2694a05ee7e2ab93f6e0f4d7a51
+---
+ tools/common/spinand_tool/mkubiimg.py | 30 +++++++++++++++++++++++----
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/tools/common/spinand_tool/mkubiimg.py b/tools/common/spinand_tool/mkubiimg.py
+index b4ad4a62..51a10e96 100755
+--- a/tools/common/spinand_tool/mkubiimg.py
++++ b/tools/common/spinand_tool/mkubiimg.py
+@@ -56,6 +56,14 @@ def parse_Args():
+ 
+     parser.add_argument("--ubinize", help="path to ubinize", type=str)
+     parser.add_argument("--mkfs", help="path to mkfs.ubifs", type=str)
++    parser.add_argument(
++        "--fm-reserve",
++        help="Leave this many PEBs free so UBI fastmap has a pool to live in. "
++        "Implies dropping vol_flags=autoresize, which would otherwise grow the "
++        "volume over every free PEB and leave fastmap nowhere to write.",
++        type=int,
++        default=0,
++    )
+     parser.add_argument(
+         "--ubionly",
+         help="create ubi image only",
+@@ -93,17 +101,18 @@ def log_subprocess_output(pipe):
+         logging.debug("got line from subprocess: %r", line)
+ 
+ 
+-def create_ubicfg(img_path, part_size, label, output, ubionly=False):
++def create_ubicfg(img_path, part_size, label, output, ubionly=False, autoresize=True):
+     with open(output, "w") as f:
+         f.write("[ubifs]\n")
+         f.write("mode=ubi\n")
+         f.write("image=%s\n" % img_path)
+         f.write("vol_id=0\n")
+-        if not ubionly:
++        if not ubionly or not autoresize:
+             f.write("vol_size=%d\n" % part_size)
+         f.write("vol_type=dynamic\n")
+         f.write("vol_name=%s\n" % label)
+-        f.write("vol_flags=autoresize\n")
++        if autoresize:
++            f.write("vol_flags=autoresize\n")
+ 
+         # Debug message
+         logging.debug("[ubifs]")
+@@ -266,12 +275,25 @@ def main():
+     else:
+         fs_path = args.input_path
+     tmp_cfg_path = path.join(tmpdir, "tmp.cfg")
++    vol_size = internal_part_size
++    autoresize = True
++    if args.fm_reserve:
++        vol_size = internal_part_size - args.fm_reserve * pebsize
++        autoresize = False
++        logging.info(
++            "Reserving %d PEBs for fastmap: vol_size=%d (partition %d)",
++            args.fm_reserve,
++            vol_size,
++            internal_part_size,
++        )
++
+     create_ubicfg(
+         fs_path,
+-        internal_part_size,
++        vol_size,
+         label,
+         tmp_cfg_path,
+         (args.ubionly or part_size == sys.maxsize),
++        autoresize,
+     )
+ 
+     ret = create_ubi(

@@ -1,0 +1,41 @@
+From 5e1dcca512432ef852ad5006104f6b848386b6d9 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Thu, 19 Nov 2026 10:58:30 +0800
+Subject: [PATCH 2/2] docs(build): record why BF01 rootfs packs with gzip
+ instead of lz4
+
+[description ]:
+- Add a comment above ROOTFS_COMP_OPT explaining that lz4 was measured and
+  rejected for the spinand rootfs on BF01.
+
+[root   cause]:
+- The lz4 experiment grew the squashfs from 6.1MB to 8.1MB, and SPI NAND
+  reads at roughly 10MB/s, so the extra read time outweighed the faster
+  decompression. Without the note the choice looks arbitrary and gets
+  retried.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME
+[chip project]:181x
+[side effects]:
+- Comment only, no build behaviour change.
+
+[Affected *.ko/*.so/*.a] :none, comments only
+
+Change-Id: I2b7f6c048d1e3a59ab6f0c2d94e71b3f8a05c6d2
+---
+ Makefile | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/Makefile b/Makefile
+index 922805ec..e6c9c8c7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -684,6 +684,8 @@ ifneq ($(wildcard $(FLASH_PARTITION_XML)),)
+ HAS_CFG := $(shell grep -q 'label="CFG"' $(FLASH_PARTITION_XML) && echo y)
+ endif
+ 
++# gzip, not lz4: measured on BF01, lz4 grew the image from 6.1MB to 8.1MB and
++# the extra NAND read (~10MB/s) cost more than the faster decompression saved.
+ ROOTFS_COMP_OPT := $(if $(findstring y,${CONFIG_ROOTFS_FORMAT_OPTIMIZATION}),-comp gzip,-comp xz)
+ 
+ rootfs-pack:export CROSS_COMPILE_KERNEL=$(patsubst "%",%,$(CONFIG_CROSS_COMPILE_KERNEL))
