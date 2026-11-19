@@ -1,0 +1,124 @@
+From 2bf91a4175da0e5299ad0f5f2d8d5808eb501458 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Thu, 19 Nov 2026 15:19:50 +0800
+Subject: [PATCH] feat(build): let the spinand rootfs image carry a UBI fastmap
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[description ]:
+- Add ROOTFS_UBI_FM_RESERVE (Kconfig, int, default 0) next to the other
+  boot-time options. A non-zero value passes --fm-reserve N to mkubiimg.py
+  for both rootfs and rootfs_b, dropping vol_flags=autoresize so the volume
+  stops short of the partition end.
+- Export the value to the u-boot build so the kernel command line can ask
+  for a fastmap only when the image was packed for one.
+- Have create_automount.py clear /sys/module/ubi/parameters/fm_autoconvert
+  before ubiattach of a NAND mountpoint.
+
+[root   cause]:
+- Attaching the 40 MiB rootfs UBI device reads the EC and VID header of
+  every one of its 319 PEBs, 129ms on this board, on every boot.
+- fm_autoconvert is a global module parameter, so enabling it for rootfs
+  also applies to the autoresize DATA volume, which has no free PEB; there
+  every LEB change retries and fails to write a fastmap, and
+  ubi_wl_get_peb() returns -ENOSPC from the same path, which stretched
+  S10auto_mount from 540ms to 3930ms in an earlier attempt.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME
+[chip project]:181x
+[side effects]:
+- Default 0 keeps every existing board on the current image layout and
+  command line, byte for byte; --fm-reserve is not passed at all.
+- The generated S10auto_mount writes the parameter before attaching DATA;
+  when the kernel has no fastmap support the node is absent and the write
+  is discarded.
+- Verified on cv1815ja_bf01_spinand: second boot reports "attached by
+  fastmap", ubi0 attach 129ms to 47ms, kernel init段 414ms to 376ms,
+  fsbl_start to S00boottime 1269ms to 1231ms, no anchor errors, DATA
+  mounts normally, RTSP live0 4s with no sequence gaps.
+
+[Affected *.ko/*.so/*.a] :none, build scripts and host tooling
+
+Change-Id: I4d8a71c9e05b32f6a7c1d84b0e39f2a5c61b7d03
+---
+ Kconfig                                     | 11 +++++++++++
+ Makefile                                    |  9 +++++++--
+ tools/common/image_tool/create_automount.py |  5 +++++
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/Kconfig b/Kconfig
+index 456f911a..832c238d 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -331,6 +331,17 @@ config ROOTFS_FORMAT_OPTIMIZATION
+ 		Changing the file system compression format from xz to gzip
+ 		Increase rootfs size
+ 
++config ROOTFS_UBI_FM_RESERVE
++	int "Free PEBs reserved in the rootfs UBI volume for fastmap"
++	depends on BOOT_TIME_OPTIMIZATION
++	default 0
++	help
++		Leave this many PEBs unused in the read-only rootfs UBI image so the
++		kernel can write a fastmap (anchor + pool) and attach the device
++		without scanning every block. 0 keeps the autoresize volume and no
++		fastmap. Requires CONFIG_MTD_UBI_FASTMAP in the kernel and
++		ubi.fm_autoconvert=1 on the command line to take effect.
++
+ config SKIP_UBOOT
+ 	bool "OpenSBI jump to Kernel instead of Uboot jump to Kernel"
+ 	depends on FASTBOOT && ARCH=riscv
+diff --git a/Makefile b/Makefile
+index e6c9c8c7..4c0f1839 100644
+--- a/Makefile
++++ b/Makefile
+@@ -165,6 +165,7 @@ u-boo%: export CONFIG_USE_DEFAULT_ENV:=${CONFIG_USE_DEFAULT_ENV}
+ u-boo%: export CONFIG_BUILD_FOR_DEBUG:=${CONFIG_BUILD_FOR_DEBUG}
+ u-boo%: export CONFIG_B_SYSTEM:=${CONFIG_B_SYSTEM}
+ u-boo%: export CONFIG_AB_SYSTEM:=${CONFIG_AB_SYSTEM}
++u-boo%: export CONFIG_ROOTFS_UBI_FM_RESERVE:=${CONFIG_ROOTFS_UBI_FM_RESERVE}
+ u-boo%: export CONFIG_MMC_SKIP_TUNING:=${CONFIG_MMC_SKIP_TUNING}
+ u-boo%: export MULTI_FIP=$(if ${CONFIG_MULTI_FIP},1,0)
+ u-boo%: export CROSS_COMPILE=$(patsubst "%",%,$(CONFIG_CROSS_COMPILE))
+@@ -687,6 +688,10 @@ endif
+ # gzip, not lz4: measured on BF01, lz4 grew the image from 6.1MB to 8.1MB and
+ # the extra NAND read (~10MB/s) cost more than the faster decompression saved.
+ ROOTFS_COMP_OPT := $(if $(findstring y,${CONFIG_ROOTFS_FORMAT_OPTIMIZATION}),-comp gzip,-comp xz)
++# Leave PEBs free for a UBI fastmap when the board asks for it (0 or unset:
++# autoresize volume, no fastmap, same image as before).
++ROOTFS_FM_RESERVE := $(strip $(CONFIG_ROOTFS_UBI_FM_RESERVE))
++ROOTFS_UBI_OPT := $(if $(filter-out 0,$(ROOTFS_FM_RESERVE)),--fm-reserve $(ROOTFS_FM_RESERVE),)
+ 
+ rootfs-pack:export CROSS_COMPILE_KERNEL=$(patsubst "%",%,$(CONFIG_CROSS_COMPILE_KERNEL))
+ rootfs-pack:export CROSS_COMPILE_SDK=$(patsubst "%",%,$(CONFIG_CROSS_COMPILE_SDK))
+@@ -728,9 +733,9 @@ else
+ endif
+ endif
+ ifeq ($(STORAGE_TYPE),spinand)
+-	${Q}python3 $(COMMON_TOOLS_PATH)/spinand_tool/mkubiimg.py --ubionly $(FLASH_PARTITION_XML) $(ROOTFS_LABEL) $(OUTPUT_DIR)/rawimages/rootfs.sqsh $(OUTPUT_DIR)/rawimages/rootfs.spinand -b $(CONFIG_NANDFLASH_BLOCKSIZE) -p $(CONFIG_NANDFLASH_PAGESIZE)
++	${Q}python3 $(COMMON_TOOLS_PATH)/spinand_tool/mkubiimg.py --ubionly $(ROOTFS_UBI_OPT) $(FLASH_PARTITION_XML) $(ROOTFS_LABEL) $(OUTPUT_DIR)/rawimages/rootfs.sqsh $(OUTPUT_DIR)/rawimages/rootfs.spinand -b $(CONFIG_NANDFLASH_BLOCKSIZE) -p $(CONFIG_NANDFLASH_PAGESIZE)
+ ifeq ($(HAS_ROOTFS_B),y)
+-	${Q}python3 $(COMMON_TOOLS_PATH)/spinand_tool/mkubiimg.py --ubionly $(FLASH_PARTITION_XML) rootfs_b $(OUTPUT_DIR)/rawimages/rootfs.sqsh $(OUTPUT_DIR)/rawimages/rootfs_b.spinand -b $(CONFIG_NANDFLASH_BLOCKSIZE) -p $(CONFIG_NANDFLASH_PAGESIZE)
++	${Q}python3 $(COMMON_TOOLS_PATH)/spinand_tool/mkubiimg.py --ubionly $(ROOTFS_UBI_OPT) $(FLASH_PARTITION_XML) rootfs_b $(OUTPUT_DIR)/rawimages/rootfs.sqsh $(OUTPUT_DIR)/rawimages/rootfs_b.spinand -b $(CONFIG_NANDFLASH_BLOCKSIZE) -p $(CONFIG_NANDFLASH_PAGESIZE)
+ endif
+ 	${Q}rm $(OUTPUT_DIR)/rawimages/rootfs.sqsh
+ else
+diff --git a/tools/common/image_tool/create_automount.py b/tools/common/image_tool/create_automount.py
+index ec8a5f1e..d69a4ea6 100755
+--- a/tools/common/image_tool/create_automount.py
++++ b/tools/common/image_tool/create_automount.py
+@@ -37,8 +37,13 @@ nor_format = """
+ """
+ 
+ # 挂载分区到xml中指定的 mountpoint.
++# ubi.fm_autoconvert 是全局模块参数。rootfs 镜像为 fastmap 预留了空闲 PEB，
++# 而这里挂载的 autoresize 卷没有：对它开着 autoconvert 会在每次 LEB 变更时
++# 反复尝试写 fastmap 并失败（"could not find any anchor PEB"），实测把挂载
++# 时间从 0.5s 拖到 3.9s。内核未开 FASTMAP 时该节点不存在，写入静默失败。
+ nand_format = """
+ 	printf "############ Mounting {label} partition #############\\n"
++	echo 0 > /sys/module/ubi/parameters/fm_autoconvert 2>/dev/null
+ 	ubiattach /dev/ubi_ctrl -m {dev_no}
+ 	if [ $? != 0 ]; then
+ 		ubiformat -y /dev/mtd{dev_no}

@@ -460,6 +460,46 @@ SYSTEM尾部缩小512KiB，新建两个256KiB槽，DATA物理位置不变但mtd8
   在 `ROOTFS_COMP_OPT` 上方补注释，记录 BF01 上 lz4 反而更慢的实测数据，
   避免后续被当作"更快的压缩算法"重新尝试。只改注释，不影响构建行为。
 
+## 0055 / 0056：rootfs UBI fastmap
+
+- `0055-build--feat-build-let-the-spinand-rootfs-image-carry-a-UBI-fastm.patch`：
+  `Kconfig` 新增 `ROOTFS_UBI_FM_RESERVE`（int，默认 0），非 0 时把
+  `--fm-reserve N` 传给 `mkubiimg.py`，rootfs 与 rootfs_b 两处打包共用；
+  同时导出给 u-boot 编译。`create_automount.py` 生成的 `S10auto_mount`
+  在 `ubiattach` 前把 `/sys/module/ubi/parameters/fm_autoconvert` 写 0。
+- `0056-u-boot-2021.10--feat-spl-add-the-fastmap-UBI-module-parameter-to-the.patch`：
+  `cvitek.mk` 在 `ROOTFS_UBI_FM_RESERVE` 非 0 时定义
+  `CONFIG_UBI_FASTMAP_AUTOCONVERT`；`cv181x-asic.h` 的 `UBI_FM_ARGS`
+  展开为 `" ubi.fm_autoconvert=1"` 并拼进 `ROOTARGS_FOR()` 三条分支。
+  新宏必须登记到 `scripts/config_whitelist.txt`，否则编译报
+  `Error: You must add new CONFIG options using Kconfig`。
+
+`fm_autoconvert` 是全局模块参数，对 rootfs 打开后同样作用于 DATA。
+DATA 是 autoresize 卷、`avail_eraseblocks` 为 0，每次 LEB 变更都会重试写
+fastmap 失败，`ubi_wl_get_peb()` 从同一路径返回 `-ENOSPC`，实测把
+`S10auto_mount` 从 540ms 拖到 3930ms。所以 `S10auto_mount` 必须在挂载 DATA
+之前把它关掉，只有 rootfs 享有 fastmap。
+
+fastmap 只在第一次启动时写入：`ubi_attach()` 末尾的
+`ubi_notify_all(UBI_VOLUME_ADDED)` 会调用 `ubi_update_fastmap()`，此时空闲树
+尚未擦好，首启仍走完整扫描并可能打印一次 anchor 错误；后续由 UBI 后台线程
+写入。rootfs 只读，写一次即稳定。验证必须测第二次启动。
+
+`--fm-reserve` 实测没有起作用：`ubi_wl_get_fm_peb()` 只从物理空闲树取块，
+不看卷配额，预留的 PEB 被卷本身吸收，attach 后 `avail_eraseblocks` 仍为 0。
+真正生效的是 `fm_autoconvert=1` 加上只读设备没有后续触发点。该参数保留无害，
+命名与实际作用不符，后续可删或改。
+
+板级配套（按板级目录直接交付）：
+
+- `cv1815ja_bf01_spinand_fastboot_defconfig`：`CONFIG_ROOTFS_UBI_FM_RESERVE=24`。
+- `linux/cvitek_cv1815ja_bf01_spinand_defconfig`：`CONFIG_MTD_UBI_FASTMAP=y`。
+
+实测（热重启，`fsbl_start` 固定 11066ms）：`ubi0` attach 129→47ms
+（`attached by fastmap`），内核 init 段 414→376ms，`S00boottime`
+12335→12297ms，区间 1269→1231ms。DATA 完好，RTSP `live0` 拉 4 秒
+62 帧 `seq_gaps=0`，dmesg 无 error。
+
 ## BF01 板级配置：内核内置模块与 rootfs 压缩
 
 随 0048–0052 一起交付的板级配置改动，按板级目录直接交付，不新增公共仓库补丁：
