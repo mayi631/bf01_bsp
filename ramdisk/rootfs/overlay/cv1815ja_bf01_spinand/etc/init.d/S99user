@@ -5,18 +5,40 @@ ${CVI_SHOPTS}
 #
 
 export USERDATAPATH=/mnt/data/
+
+kernel_start_ms() {
+    _w=$(devmem 0x0e000024 32)
+    echo $(( (_w >> 16) & 0xffff ))
+}
+
+uptime_ms() {
+    awk '{printf "%d", $1 * 1000}' /proc/uptime
+}
+
+# Absolute time in ms since power-on, comparable with /tmp/boottime: the SPL
+# records kernel_start in the high half of 0x0E000024 and /proc/uptime counts
+# from the kernel clocksource init.
+boot_ms() {
+    echo $(( $(kernel_start_ms) + $(uptime_ms) ))
+}
+
+boot_log() {
+    echo "$1"
+    echo "S99user: $1" > /dev/kmsg
+}
+
 export SYSTEMPATH=/system/
 
 case "$1" in
   start)
-        if [ -e /run/bf01-preview/early-started ]; then
-                exit 0
-        fi
+        boot_log "enter at $(boot_ms)ms (kernel_start=$(kernel_start_ms)ms)"
         echo "init mpp system..."
         if [ -f $SYSTEMPATH/ko/loadsystemko.sh ]; then
                 sh $SYSTEMPATH/ko/loadsystemko.sh
         fi
+        boot_log "ko loaded at $(boot_ms)ms"
 
+        boot_log "start app at $(boot_ms)ms"
         echo "Starting app..."
         if [ -f $USERDATAPATH/auto.sh ]; then
                 usleep 30000

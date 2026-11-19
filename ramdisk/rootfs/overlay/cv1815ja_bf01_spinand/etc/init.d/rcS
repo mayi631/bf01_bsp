@@ -1,15 +1,48 @@
 #!/bin/sh
-
 ${CVI_SHOPTS}
-for SCRIPT in /etc/init.d/S??*; do
-    [ -f "$SCRIPT" ] || continue
-    if [ -e /run/bf01-preview/early-started ]; then
-        case "$SCRIPT" in
-            */S20network|*/S23ntp|*/S24cvidaemon|*/S50dropbear) continue ;;
-        esac
-    fi
-    case "$SCRIPT" in
-        *.sh) (trap - INT QUIT TSTP; set start; . "$SCRIPT") ;;
-        *) "$SCRIPT" start ;;
+
+# BF01 boot-time probe: rcS timed per script.
+#
+# kernel_start is recorded once by the SPL in the high half of 0x0E000024 and
+# never changes, so read it a single time. /proc/uptime is then read with the
+# shell builtin: computing a timestamp must not fork, or the measurement itself
+# dominates the boot time it is trying to measure (devmem + awk = two forks per
+# call, eight of them before S00boottime).
+_ks=$(( ($(devmem 0x0e000024 32) >> 16) & 0xffff ))
+
+boot_ms() {
+    read -r _u _ < /proc/uptime
+    _i=${_u%%.*}
+    _f=${_u#*.}000
+    _f=${_f%"${_f#???}"}
+    # Strip leading zeros: ash reads 08 as an invalid octal literal, which
+    # aborts the arithmetic and silently breaks every later timestamp.
+    while [ "${_f#0}" != "$_f" ]; do _f=${_f#0}; done
+    [ -n "$_f" ] || _f=0
+    echo $(( _ks + _i * 1000 + _f ))
+}
+
+_rcs_t0=$(boot_ms)
+echo "rcS: enter at ${_rcs_t0}ms"
+echo "rcS: enter at ${_rcs_t0}ms" > /dev/kmsg
+
+for i in /etc/init.d/S??* ;do
+     [ ! -f "$i" ] && continue
+
+     _t0=$(boot_ms)
+     case "$i" in
+	*.sh)
+	    ( trap - INT QUIT TSTP; set start; . $i )
+	    ;;
+	*)
+	    $i start
+	    ;;
     esac
+     _t1=$(boot_ms)
+     echo "rcS: $(basename $i) $(( _t1 - _t0 ))ms (at ${_t1}ms)"
+     echo "rcS: $(basename $i) $(( _t1 - _t0 ))ms (at ${_t1}ms)" > /dev/kmsg
 done
+
+_rcs_t1=$(boot_ms)
+echo "rcS: done at ${_rcs_t1}ms, total $(( _rcs_t1 - _rcs_t0 ))ms"
+echo "rcS: done at ${_rcs_t1}ms, total $(( _rcs_t1 - _rcs_t0 ))ms" > /dev/kmsg

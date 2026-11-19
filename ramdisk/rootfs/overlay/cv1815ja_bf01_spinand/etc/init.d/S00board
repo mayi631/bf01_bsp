@@ -1,0 +1,14 @@
+#! /bin/sh
+#
+# BF01 override of the generic cv181x_32bit S00board. The overlay copy order is
+# SDK_VER -> CHIP -> CUST, and cp -r cannot delete, so this file must exist to
+# keep the generic one (which runs `mdev -s`, ~130ms) out of the boot path.
+# /dev is devtmpfs and already populated; CONFIG_UEVENT_HELPER is not set, so
+# the hotplug sysctl does not exist either.
+
+case $1 in
+  start)
+    # Set RR timeslice
+    echo 20 > /proc/sys/kernel/sched_rr_timeslice_ms
+    ;;
+esac

@@ -1,0 +1,30 @@
+#!/bin/sh
+${CVI_SHOPTS}
+#
+# BF01 fast-boot sysinit.
+#
+# The stock inittab forked one process per sysinit entry (mdev -s, two mkdir,
+# mount -a, hostname); each fork+exec of a shell script costs ~60-70ms here, so
+# they are merged into this single script.
+# `mdev -s` is not run: /dev is a devtmpfs the kernel populates itself.
+# Hotplug is still wired up for devices appearing after boot.
+#
+# Each step writes a mark to /dev/kmsg so the kernel timestamp attributes it
+# (/proc/uptime is not readable before mount -a has run).
+
+mark() {
+    echo "preinit: $1" > /dev/kmsg
+    echo "preinit: $1"
+}
+
+{ read -r _u _ < /proc/uptime; } 2>/dev/null
+mark enter uptime=$_u
+mkdir -p /dev/pts
+mkdir -p /dev/shm
+mark mkdir_done
+mount -a
+mark mount_a_done
+[ -f /etc/hostname ] && hostname -F /etc/hostname
+# CONFIG_UEVENT_HELPER is not set, so /proc/sys/kernel/hotplug does not
+# exist; writing it only produced an error on every boot.
+mark done

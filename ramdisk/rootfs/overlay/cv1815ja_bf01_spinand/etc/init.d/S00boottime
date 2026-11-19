@@ -1,0 +1,35 @@
+#!/bin/sh
+${CVI_SHOPTS}
+#
+# BF01 boot-time mark. Runs as the second rcS script so the gap from kernel
+# init to userland is measurable.
+#
+# This script is on the measured boot path, so it must not fork to measure.
+# devmem runs once (kernel_start never changes after the SPL writes it) and
+# /proc/uptime is read with the shell builtin; the previous version forked
+# devmem + awk on every boot_ms call.
+#
+
+_ks=$(( ($(devmem 0x0e000024 32) >> 16) & 0xffff ))
+
+uptime_ms() {
+    read -r _u _ < /proc/uptime
+    _i=${_u%%.*}
+    _f="${_u#*.}00"
+    _f=${_f%"${_f#???}"}
+    # Strip leading zeros: ash parses 08 as an invalid octal literal and the
+    # arithmetic fails, which silently drops the timestamp on such boots.
+    while [ "${_f#0}" != "$_f" ]; do _f=${_f#0}; done
+    [ -n "$_f" ] || _f=0
+    echo $(( _i * 1000 + _f ))
+}
+
+case "$1" in
+  start)
+        _t=$(( _ks + $(uptime_ms) ))
+        echo "enter at ${_t}ms (kernel_start=${_ks}ms, uptime=$(uptime_ms)ms)"
+        echo "S00boottime: enter at ${_t}ms (kernel_start=${_ks}ms)" > /dev/kmsg
+        ;;
+esac
+
+exit $?
