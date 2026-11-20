@@ -1,0 +1,59 @@
+From 1a7d31d650a01085a68e72567134f298ae879707 Mon Sep 17 00:00:00 2001
+From: "xiu.yang" <xiu.yang@sophgo.com>
+Date: Fri, 20 Nov 2026 15:12:19 +0800
+Subject: [PATCH] feat(cvsnfc): read GD5F2GM7 in 4-bit mode to speed up rootfs
+ cold reads
+
+[description ]:
+- drivers/mtd/nand/raw/cvitek/cvsnfc_spi_ids.c: set
+  FLAGS_SUPPORT_4BIT_READ on the GD5F2GM7UEYIG entry.
+- spi_nand_read_from_cache() already selects the read command from this
+  flag: with the flag it issues 0x6B (READ FROM CACHE x4), without it
+  it falls back to 0x0B (x2). Only the chip table entry was missing.
+- BF01 rootfs is squashfs on UBI over this SPI NAND, so every cold read
+  of busybox, the inittab and the init scripts pays this cost.
+
+[root   cause]:
+- The GD5F2GM7UEYIG entry carried .flags = 0, so the driver always took
+  the x2 branch even though the QE bit is enabled at probe ("Enabling QE
+  bit for GD5F2GM7UEYIG"). QE only permits quad transfers, it does not
+  change the read opcode.
+- At the 93MHz SCK inherited from U-Boot, a 2KB page takes ~88us on two
+  lines and ~44us on four, which halves the transfer part of every page
+  read.
+
+[JIRA      ID]:TBD-BF01-BOOTTIME
+[chip project]:181x
+[side effects]:
+- Affects only boards using the GD5F2GM7UEYIG; other chip entries are
+  unchanged and keep their current mode.
+- Verified on cv1815ja_bf01_spinand: raw /dev/mtd read 9.7 -> 12.9MB/s,
+  Run /sbin/init -> preinit: enter 380 -> 158ms on the same slot.
+- No uncorrectable ECC, no "retry read", mtd ecc_failures stays 0 across
+  repeated boots.
+- The remaining ~115us per page is fixed overhead (tR, DMA setup, ECC
+  status read), so expect ~1.3x, not 2x.
+
+[Affected *.ko/*.so/*.a] :none (source-only change; cvsnfc is built-in)
+
+Change-Id: I1c79c3f8df4002e19e85be3e7b5d0351c8fc5c44
+---
+ drivers/mtd/nand/raw/cvitek/cvsnfc_spi_ids.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/mtd/nand/raw/cvitek/cvsnfc_spi_ids.c b/drivers/mtd/nand/raw/cvitek/cvsnfc_spi_ids.c
+index 2adcf3276945aebb5e1f50b3fa6fb5f632bb7110..ed819a1b97860138fa392cf6ed6b343ee68af18b 100644
+--- a/drivers/mtd/nand/raw/cvitek/cvsnfc_spi_ids.c
++++ b/drivers/mtd/nand/raw/cvitek/cvsnfc_spi_ids.c
+@@ -1092,7 +1092,7 @@ struct cvsnfc_chip_info nand_flash_cvitek_supported_ids[] = {
+ 			.length = 0,
+ 			.locked = 0,
+ 		},
+-		.flags = 0
++		.flags = FLAGS_SUPPORT_4BIT_READ
+ 	},
+ 
+ 	{
+-- 
+2.25.1
+
